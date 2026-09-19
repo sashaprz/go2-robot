@@ -144,6 +144,14 @@ class Robot:
         )
         asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
 
+    def motion_mode(self) -> str:
+        """The dog's current motion controller ('normal' / 'ai' / 'mcf'), as the motion switcher reports it."""
+        import json as _json
+
+        coro = self.c.conn.datachannel.pub_sub.publish_request_new(self._topic["MOTION_SWITCHER"], {"api_id": 1001})
+        resp = asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
+        return str(_json.loads(resp["data"]["data"]).get("name"))
+
     def sport_api(self, api_id: int, param=None) -> None:
         """A sport command by raw numeric id, with an optional parameter (e.g. {"data": True})."""
         req = {"api_id": api_id}
@@ -203,6 +211,9 @@ class FakeRobot:
 
     def sport(self, name: str) -> None:
         self._add(("sport", name))
+
+    def motion_mode(self) -> str:
+        return "fake"
 
     def sport_api(self, api_id: int, param=None):
         self._add(("api", api_id, param))
@@ -354,7 +365,8 @@ class App:
             if self.args.demo or self.is_selftest():
                 r = FakeRobot(self.demo_image)
                 if self.args.selftest_listen:
-                    r.refuse = {2050}                 # this fake dog only knows the older back-leg id: exercises the fallback
+                    # this fake dog only knows the older back-leg id (exercises the fallback); GO2_TEST_REFUSE=2050,1050 = no back legs
+                    r.refuse = {int(x) for x in os.environ.get("GO2_TEST_REFUSE", "2050").split(",") if x}
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
                 if not key:
@@ -365,6 +377,10 @@ class App:
             self.robot = r
             self.state, self.state_color = ("DEMO (fake robot)" if isinstance(r, FakeRobot) else "connected"), GOOD
             self.say("Connected. Keep the area around the dog clear.", GOOD)
+            try:
+                self.say(f"dog motion mode: {r.motion_mode()}")
+            except Exception as e:  # noqa: BLE001
+                self.say(f"couldn't read the dog's motion mode: {e}", WARN)
         except Exception as e:  # noqa: BLE001
             self.state, self.state_color = f"connection failed: {e}", BAD
             self.say(f"Connection failed: {e}", BAD)
@@ -736,6 +752,7 @@ class App:
                 self.robot.sport("BalanceStand")          # start from a balanced stand
                 time.sleep(1.5)
             order = [self.upright_api] + [a for a in (2050, 1050) if a != self.upright_api]
+            tried = []
             for api in (order if on else order[:1]):      # going up tries the other id if the dog refuses the first
                 reply = None
                 try:
@@ -744,19 +761,21 @@ class App:
                 except Exception as e:  # noqa: BLE001
                     code, err = None, e
                 ok = err is None and code in (0, None)
+                tried.append(f"{api}: " + (type(err).__name__ if err else f"code {code}"))
                 self.say(f"back-leg {'stand' if on else 'release'} (api {api}): "
                          + (f"error {type(err).__name__} {err}" if err else f"the dog replied code {code}") + ("" if ok else "  <- refused"),
                          GOOD if ok else WARN)
-                if not ok and reply is not None:
-                    self.say(f"   raw reply: {str(reply)[:200]}", WARN)
                 if ok:
                     self.upright_api = api
                     return
-            raise RuntimeError("the dog refused every back-leg command (this model/firmware may not support it)")
+            raise RuntimeError("the dog refused every back-leg command (" + "; ".join(tried) + "). This model/firmware may not support it")
         except Exception as e:  # noqa: BLE001
             self.say(f"back-leg stand {'on' if on else 'off'} failed: {e}", BAD)
             if on:
                 self.upright = False
+                self.busy_until = time.time()
+                if self.box_step:                          # the dog can't do it: still dance, on four legs
+                    self.say("> box step continues on FOUR legs (the back-leg stand isn't available on this dog)", WARN)
 
     # -- "box step": up on the back legs, then step in a square until "stop" -------------------------------
     def start_box_step(self) -> None:
@@ -931,7 +950,7 @@ class App:
                 else:
                     self.desired = res[1].cmd
                 return
-        if self.box_step and self.box_dancing and self.upright and not manual:
+        if self.box_step and self.box_dancing and not manual:
             if not self.ensure_ready(now):
                 self.desired = (0.0, 0.0, 0.0)
                 return
