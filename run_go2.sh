@@ -9,6 +9,7 @@ while [ $# -gt 0 ]; do
     --selftest) DEMO=1; PASS+=("--selftest") ;;
     --selftest-follow) DEMO=1; PASS+=("--selftest-follow") ;;
     --selftest-voice)  DEMO=1; PASS+=("--selftest-voice") ;;
+    --selftest-objects) DEMO=1; PASS+=("--selftest-objects") ;;
     --fetch-model)     DEMO=1; PASS+=("--fetch-model") ;;   # downloads the person detector; needs internet, not the dog
     --ip)       shift; IP="$1" ;;
     *)          PASS+=("$1") ;;

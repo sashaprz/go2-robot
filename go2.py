@@ -75,11 +75,12 @@ CONFIRM_TRICKS = {
 ROUTINE_KEY = pygame.K_r
 FOLLOW_KEY = pygame.K_t
 VOICE_KEY = pygame.K_v   # hold to talk
+OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 # EDIT FREELY. Timed lists of the sport commands above; each step waits that command's busy time.
 ROUTINES = {"greeting": ["StandUp", "BalanceStand", "Hello", "Content", "WiggleHips", "Sit"]}
 # Deliberately absent: flips, handstand, bound. They can hurt the robot and most aren't supported on an Air.
 
-WIN_W, WIN_H = 1024, 736
+WIN_W, WIN_H = 1024, 760
 VIDEO_H = 576
 BG = (18, 20, 24)
 TXT = (225, 228, 232)
@@ -220,6 +221,16 @@ class FakeSTT:
         return self.lines.pop(0)
 
 
+def _class_color(class_id: int) -> tuple[int, int, int]:
+    """Stable, distinct colour per object class (people are always the same warm orange)."""
+    import colorsys
+
+    if class_id == 0:
+        return (255, 170, 60)
+    r, g, b = colorsys.hsv_to_rgb((class_id * 0.618034) % 1.0, 0.65, 1.0)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
 # ---- the app ----------------------------------------------------------------------------------------------
 class App:
     def __init__(self, args, demo_image=None):
@@ -263,6 +274,10 @@ class App:
         self.voice_q: queue.Queue = queue.Queue()
         self.heard_log: list = []           # (transcript, matched label) - used by the self-test
         self.follow_starts = 0              # how many times follow actually started - self-test
+        # object detection overlay
+        self.objects_on = False
+        self.objects = None                 # (timestamp, [(x1, y1, x2, y2, score, class_id)], frame_shape)
+        self._obj_snapshot = None           # self-test bookkeeping
 
     # -- feedback ---------------------------------------------------------------------------------------
     def say(self, text: str, color=TXT) -> None:
@@ -280,7 +295,8 @@ class App:
     # -- robot plumbing ---------------------------------------------------------------------------------
     def connect_bg(self) -> None:
         try:
-            if self.args.demo or self.args.selftest or self.args.selftest_follow or self.args.selftest_voice:
+            if (self.args.demo or self.args.selftest or self.args.selftest_follow or self.args.selftest_voice
+                    or self.args.selftest_objects):
                 r = FakeRobot(self.demo_image)
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
@@ -339,18 +355,33 @@ class App:
             self.say(f"follow.py couldn't be loaded: {_FOLLOW_ERR}", BAD)
             return False
         if not follow_mod.model_present():
-            self.say("Person detector not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
+            self.say("Object/person detector not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
             return False
         return True
 
     def _load_detector(self) -> None:
         try:
-            self.detector = follow_mod.PersonDetector()
+            self.detector = follow_mod.ObjectDetector()
         except Exception as e:  # noqa: BLE001
             self.say(f"detector failed to load: {e}", BAD)
+            self.objects_on = False
             self.stop_follow("detector unavailable")
         finally:
             self._detector_loading = False
+
+    def ensure_detector(self) -> None:
+        if self.detector is None and not self._detector_loading:
+            self._detector_loading = True
+            threading.Thread(target=self._load_detector, daemon=True).start()
+
+    def toggle_objects(self) -> None:
+        if self.objects_on:
+            self.objects_on, self.objects = False, None
+            self.say("object detection off")
+        elif self.follow_available():
+            self.objects_on = True
+            self.ensure_detector()
+            self.say("object detection on (YOLOX-tiny, 80 everyday object types)", GOOD)
 
     def start_follow(self) -> None:
         cfg = follow_mod.FollowConfig(max_forward=self.args.follow_speed)
@@ -360,9 +391,7 @@ class App:
         self.following = True
         self.follow_starts += 1
         self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
-        if self.detector is None and not self._detector_loading:
-            self._detector_loading = True
-            threading.Thread(target=self._load_detector, daemon=True).start()
+        self.ensure_detector()
 
     def stop_follow(self, reason: str) -> None:
         if not self.following:
@@ -372,23 +401,32 @@ class App:
         self.desired = (0.0, 0.0, 0.0)
         self.say(f"follow stopped: {reason}", WARN)
 
-    def follow_loop(self) -> None:
+    def vision_loop(self) -> None:
+        """One inference per new frame, shared by person-follow and the object overlay."""
         last_seq = -1
         while not self.stop_evt.is_set():
             det = self.detector
-            if not self.following or det is None or self.latest is None or self.frame_seq == last_seq:
+            if not (self.following or self.objects_on) or det is None or self.latest is None or self.frame_seq == last_seq:
                 time.sleep(0.03)
                 continue
             with self.frame_lock:
                 frame, last_seq = self.latest, self.frame_seq
             try:
-                res = self.follower.step(det.detect(frame), frame.shape)
+                dets = det.detect_objects(frame)
+                if self.objects_on:
+                    self.objects = (time.time(), dets, frame.shape)
+                res = None
+                if self.following:
+                    res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape)
             except Exception as e:  # noqa: BLE001
-                self.stop_follow(f"detector error: {e}")
+                self.say(f"detector error: {e}", BAD)
+                self.objects_on = False
+                self.stop_follow("detector error")
                 continue
-            self.follow_res = (time.time(), res, frame.shape)
-            if res.lost:
-                self.stop_follow(res.status)
+            if res is not None:
+                self.follow_res = (time.time(), res, frame.shape)
+                if res.lost:
+                    self.stop_follow(res.status)
 
     # -- voice (push-to-talk) ---------------------------------------------------------------------------
     def voice_ready(self) -> bool:
@@ -538,6 +576,8 @@ class App:
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
         elif key == VOICE_KEY:
             self.start_listening()
+        elif key == OBJECTS_KEY:
+            self.toggle_objects()
         elif key in TRICKS:
             self.run_trick(*TRICKS[key])
         elif key in CONFIRM_TRICKS:
@@ -609,6 +649,26 @@ class App:
             self.text(screen, "NO VIDEO", WIN_W // 2 - 70, VIDEO_H // 2 - 20, BAD, 44)
 
         now = time.time()
+        obj = self.objects
+        if self.objects_on and obj and now - obj[0] < 1.0:  # labelled boxes for everything the detector sees
+            ox, oy, sc = self._xf
+            for x1, y1, x2, y2, score, cid in obj[1]:
+                color = _class_color(cid)
+                pygame.draw.rect(screen, color, (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 2)
+                label = self.font(20).render(f"{follow_mod.COCO_CLASSES[cid]} {score:.0%}", True, (10, 10, 10))
+                lw, lh = label.get_size()
+                tx, ty = ox + x1 * sc, max(36, oy + y1 * sc - lh)
+                pygame.draw.rect(screen, color, (tx, ty, lw + 6, lh))
+                screen.blit(label, (tx + 3, ty))
+            summary = follow_mod.summarize(obj[1]) or "nothing recognised"
+            surf = self.font(24).render("seeing: " + summary, True, TXT)
+            back = pygame.Surface((surf.get_width() + 16, 30), pygame.SRCALPHA)
+            back.fill((0, 0, 0, 165))
+            screen.blit(back, (WIN_W - back.get_width() - 6, VIDEO_H - 36))
+            screen.blit(surf, (WIN_W - surf.get_width() - 14, VIDEO_H - 32))
+        elif self.objects_on:
+            self.text(screen, "object detection: " + ("loading detector ..." if self.detector is None else "no frames yet"),
+                      WIN_W - 330, VIDEO_H - 32, WARN, 24)
         res = self.follow_res
         if self.following and res and res[1].box and now - res[0] < 1.0:  # box around the tracked person
             ox, oy, sc = self._xf
@@ -662,10 +722,11 @@ class App:
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
             "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
             "VOICE   hold V and talk: \"say hello\", \"dance two\", \"sit\", \"stretch\", \"follow me\" (then Y), \"stop\".  Needs internet.",
+            "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
         for i, line in enumerate(lines):
-            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 5 else DIM, 21)
+            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 6 else DIM, 21)
 
     # -- main loop --------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -674,10 +735,12 @@ class App:
         pygame.display.set_caption("Go2 - FPV / drive / tricks / follow")
         threading.Thread(target=self.connect_bg, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
-        threading.Thread(target=self.follow_loop, daemon=True).start()
+        threading.Thread(target=self.vision_loop, daemon=True).start()
         clock = pygame.time.Clock()
-        script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice)
-                  if (self.args.selftest or self.args.selftest_follow or self.args.selftest_voice) else None)
+        script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
+                                       objects=self.args.selftest_objects)
+                  if (self.args.selftest or self.args.selftest_follow or self.args.selftest_voice
+                      or self.args.selftest_objects) else None)
         t0 = time.time()
         try:
             while self.running:
@@ -719,12 +782,18 @@ class App:
             return self.selftest_follow_verdict()
         if self.args.selftest_voice:
             return self.selftest_voice_verdict()
+        if self.args.selftest_objects:
+            return _selftest_objects_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
-    def selftest_script(self, follow: bool = False, voice: bool = False):
+    def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False):
         K = pygame
-        if voice:  # hold V briefly for each canned transcript (see main(): FakeMic / FakeSTT)
+        if objects:  # toggle the overlay on, look at it, toggle it off
+            steps = [(0.5, K.KEYDOWN, K.K_o), (0.7, K.KEYUP, K.K_o), (3.6, K.KEYDOWN, K.K_o), (3.8, K.KEYUP, K.K_o),
+                     (4.6, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 2.6
+        elif voice:  # hold V briefly for each canned transcript (see main(): FakeMic / FakeSTT)
             steps = []
             for i in range(6):
                 steps += [(0.5 + i * 0.7, K.KEYDOWN, K.K_v), (0.8 + i * 0.7, K.KEYUP, K.K_v)]
@@ -755,8 +824,11 @@ class App:
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
             if t >= shot_at and not state["shot"]:
                 state["shot"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest_voice.png" if voice else
+                pygame.image.save(screen, "/tmp/go2_selftest_objects.png" if objects else
+                                  "/tmp/go2_selftest_voice.png" if voice else
                                   "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
+            if objects and t >= 3.0 and self._obj_snapshot is None and self.objects:
+                self._obj_snapshot = list(self.objects[1])   # what the overlay held just before it was switched off
             if follow and t >= 5.0 and not state["marked"] and isinstance(self.robot, FakeRobot):
                 state["marked"] = True  # 0.5 s after Space: nothing should move the dog from here on
                 self._log_len_after_stop = len(self.robot.log)
@@ -823,6 +895,40 @@ def _selftest_voice_verdict(app: "App") -> int:
     return 0 if all(checks.values()) else 1
 
 
+def _selftest_objects_verdict(app: "App") -> int:
+    snap = app._obj_snapshot or []
+    names = {follow_mod.COCO_CLASSES[d[5]] for d in snap}
+    checks = {
+        "overlay produced detections while on (>= 5 boxes)": len(snap) >= 5,
+        "found the tv (people this small in a 16:9 frame are below what YOLOX-tiny reliably sees)": "tv" in names,
+        "found furniture too (chair or dining table)": bool(names & {"chair", "dining table"}),
+        "pressing O again switched it off and cleared the boxes": not app.objects_on and app.objects is None,
+        "objects mode never moved the dog": not any(e[0] in ("move", "sport") for e in getattr(app.robot, "log", [])),
+    }
+    print("\nSELFTEST-OBJECTS saw:", follow_mod.summarize(snap))
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+def _objects_test_canvas() -> np.ndarray | None:
+    """1280x720 frame made from the COCO living-room photo (letterboxed, grey sides)."""
+    import cv2
+
+    path = "/tmp/go2test/000000000139.jpg"
+    if not os.path.exists(path):
+        print(f"missing {path}")
+        return None
+    img = cv2.imread(path)[:, :, ::-1]
+    h, w = img.shape[:2]
+    s = 720 / h
+    big = cv2.resize(img, (int(w * s), 720))
+    canvas = np.full((720, 1280, 3), 60, np.uint8)
+    x0 = (1280 - big.shape[1]) // 2
+    canvas[:, x0 : x0 + big.shape[1]] = big
+    return canvas
+
+
 def _follow_test_canvas() -> np.ndarray | None:
     """A 1280x720 frame with the COCO 'skier' person small and right of centre (err = +0.2, height ~0.23)."""
     import cv2
@@ -845,6 +951,7 @@ def main() -> int:
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-voice", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-objects", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
     p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
@@ -860,6 +967,10 @@ def main() -> int:
     image = None
     if args.selftest_follow:
         image = _follow_test_canvas()
+        if image is None:
+            return 2
+    if args.selftest_objects:
+        image = _objects_test_canvas()
         if image is None:
             return 2
     app = App(args, demo_image=image)

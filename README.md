@@ -41,6 +41,7 @@ Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **cl
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine, each needs a confirming Y within 4 s |
 | T, then **Y** | follow the nearest person (see below); T again / Space / any drive or trick key stops it |
 | V (hold) | push-to-talk voice commands (see below) |
+| O | toggle object-detection overlay (see below) |
 | Esc | quit |
 
 ### Voice commands (hold `V`)
@@ -58,6 +59,14 @@ The window shows what it heard and what it matched.
   dog's Wi-Fi (e.g. USB tethering from a phone) or put the dog on a shared network. Without it the window says
   "can't reach ElevenLabs".
 - **Microphone:** captured through WSLg's PulseAudio (`libpulse-simple`); Windows must allow microphone access.
+
+### Object detection (`O`)
+
+Toggles labelled boxes and a "seeing: ..." summary over the live video for 80 everyday object types (person, chair, cup,
+sports ball, tv, laptop, bottle, dog, ...), using the same YOLOX-tiny model as follow mode (one shared inference, ~25 ms
+per frame on CPU). Detection only: it has no depth or distance, and it doesn't drive anything. It's a small model:
+expect missed small/far objects (a person a few metres away can be missed) and the odd false positive. Needs the model
+from `go2.bat --fetch-model` (see follow mode below).
 
 ### Follow mode (`T`)
 
@@ -120,7 +129,7 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 ## Files
 
 - `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks + follow window (recommended)
-- `follow.py`: person detector and follow controller used by `go2.py`
+- `follow.py`: object/person detector (YOLOX-tiny) and follow controller used by `go2.py`
 - `voice.py`: microphone capture, ElevenLabs speech-to-text client, and phrase matcher used by `go2.py`
 - `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`: save your ElevenLabs API key (hidden prompt)
 - `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
