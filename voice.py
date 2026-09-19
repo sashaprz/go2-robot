@@ -256,18 +256,15 @@ def sane_transcript(text: str, seconds: float) -> str:
 # ---- phrase matcher ---------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Intent:
-    kind: str          # "stop" | "stop_follow" | "follow" | "sport" | "routine" | "move" | "upright" | "music"
-    arg: str = ""      # sport command / routine name; move: forward|back|strafe_*|turn_*; upright: on|off; music: play|pause|resume
+    kind: str          # "stop" | "stop_follow" | "follow" | "sport" | "routine" | "move" | "upright" | "box_step"
+    arg: str = ""      # sport command / routine name; move: forward|back|strafe_*|turn_*; upright: on|off
     label: str = ""    # for the on-screen message
-    text: str = ""     # music play: the track name that was asked for ("" = any)
     amount: float | None = None   # move only: the number that was spoken, if any
     unit: str = ""                # move only: "s" | "m" | "deg" (as spoken; "" = none given)
     scale: float = 1.0            # move only: "a little" = 0.5, "a lot" = 2.0
 
 
 _MOTION = object()  # marks where the movement rules sit in the priority order (see _parse_motion)
-_MUSIC_PLAY = object()  # marks where "play <something>" sits (see _parse_music_play)
-_MUSIC_VOL = object()   # marks where volume phrases sit (see _parse_music_volume)
 
 # Standing on the back legs (Unitree "WalkUpright"). OFF is checked before ON so "stop standing on two legs" comes down.
 # Both sit ahead of the 'stop', 'back' (move) and 'stand' (stand up) rules, which would otherwise swallow them.
@@ -282,23 +279,16 @@ _UP_ON = (r"\b(?:stand|standing|walk|walking|balance|rear|rise|get|go|be|up)\b.*
 _RULES: list = [
     (r"\b(stop|halt|freeze|emergency|abort)\b.*\bfollow|\bfollow\w*\b.*\b(stop|halt|off)\b|\b(don t|do not|quit|cancel) follow",
      Intent("stop_follow", label="stop following")),
-    # "box step" plays a song (Whisper also writes it as box stop/stap/tap, so those count too). Ahead of the 'stop' rule.
-    (r"\bbox\s*-?\s*(?:step|steps|stap|stab|stop|tap)\b|\bboxstep\b", Intent("music", "play", "box step", text="box step")),
+    # "box step" = up on the back legs and step in a square (Whisper also writes it as box stop/stap/tap, so those count too).
+    # Ahead of the 'stop' rule.
+    (r"\bbox\s*-?\s*(?:step|steps|stap|stab|stop|tap)\b|\bboxstep\b", Intent("box_step", label="box step")),
     (_UP_OFF, Intent("upright", "off", "come down to four legs")),
     (_UP_ON, Intent("upright", "on", "stand on the back legs")),
-    # music pause/resume sit ahead of the generic 'stop' so "stop the music" pauses the song and doesn't halt the dog
-    (r"\b(?:stop|pause|turn off|end|kill|cut|mute|silence)\b.*\b(?:music|songs?|tracks?|tunes|audio)\b|\bmusic\s+(?:off|stop)\b"
-     r"|\bno more music\b", Intent("music", "pause", "pause the music")),
-    (r"\b(?:resume|unpause|continue|restart)\b.*\b(?:music|songs?|tracks?|tunes)\b", Intent("music", "resume", "resume the music")),
-    (r"\bwhat (?:songs|music|tracks|tunes)\b|\b(?:list|show)\b.*\b(?:songs|music|tracks)\b|\bwhich (?:songs|tracks)\b|\bwhat can you play\b",
-     Intent("music", "list", "list the songs")),
-    (_MUSIC_VOL, None),
     (r"\b(stop|halt|freeze|emergency|abort|whoa)\b", Intent("stop", label="STOP")),
     # "ready to dance" = the voice command for standing up (alias; "stand up" still works). Before the 'dance' rules.
     (r"\bready (?:to|for) (?:the )?danc\w*\b|\bready to boogie\b", Intent("sport", "StandUp", "Stand up (ready to dance)")),
     (r"\bfollow\w*\b", Intent("follow", label="follow the nearest person")),
     (r"\brecover\w*\b|\bget back up\b", Intent("sport", "RecoveryStand", "Recovery stand")),  # before 'back' = move back
-    (_MUSIC_PLAY, None),
     (_MOTION, None),
     (r"\bdanc\w*\s+(2|two|to|too|second)\b|\bsecond dance\b|\bother dance\b", Intent("sport", "Dance2", "Dance 2")),
     (r"\bdanc\w*\b|\bboogie\b|\bgroove\b|\bshow (me )?(your )?moves\b", Intent("sport", "Dance1", "Dance 1")),
@@ -421,44 +411,9 @@ def parse_command(text: str) -> Intent | None:
             found = _parse_motion(t)
             if found:
                 return found
-        elif pattern is _MUSIC_PLAY:
-            found = _parse_music_play(t)
-            if found:
-                return found
-        elif pattern is _MUSIC_VOL:
-            found = _parse_music_volume(t)
-            if found:
-                return found
         elif re.search(pattern, t):
             return intent
     return None
-
-
-def _parse_music_volume(t: str) -> Intent | None:
-    """'louder', 'turn the music down', 'set the volume to 30 percent', 'volume 50'."""
-    if re.search(r"\b(?:louder|volume up|turn (?:it|the music|the volume) up|raise the volume|increase the volume)\b", t):
-        return Intent("music", "volume", "music louder", text="up")
-    if re.search(r"\b(?:quieter|softer|volume down|turn (?:it|the music|the volume) down|lower the volume|decrease the volume)\b", t):
-        return Intent("music", "volume", "music quieter", text="down")
-    m = re.search(r"\bvolume\b\D*(\d{1,3})\b|\b(\d{1,3})\s*(?:percent)?\s*volume\b", _words_to_digits(t))
-    if m:
-        pct = float(m.group(1) or m.group(2))
-        return Intent("music", "volume", f"volume {pct:.0f}%", text="set", amount=pct)
-    return None
-
-
-_FILLER = {"some", "the", "my", "a", "an", "that", "this", "please", "for", "me", "now", "us", "up", "on", "music", "song",
-           "songs", "track", "tune", "tunes", "something", "anything", "called", "named", "by", "again"}
-
-
-def _parse_music_play(t: str) -> Intent | None:
-    """'play music', 'play some music', 'play thunderstruck', 'put on the dance track', 'music on'."""
-    m = re.search(r"\b(?:play|start|put on|cue up|cue|blast)\b\s*(.*)$", t)
-    if not m:
-        return Intent("music", "play", "play music") if re.search(r"\bmusic on\b|\bmusic please\b|\bgive me (?:some )?music\b", t) else None
-    words = [w for w in m.group(1).split() if w not in _FILLER]
-    name = " ".join(words)
-    return Intent("music", "play", f"play {name}" if name else "play music", text=name)
 
 
 # ---- wake word + always-listening -------------------------------------------------------------------------

@@ -20,7 +20,6 @@ import queue
 import sys
 import threading
 import time
-import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -45,12 +44,6 @@ try:
 except Exception as _ve:  # noqa: BLE001
     voice_mod = None
     _VOICE_ERR = str(_ve)
-
-try:
-    import music as music_mod  # songs through the dog's own speaker (music.py)
-except Exception as _me:  # noqa: BLE001
-    music_mod = None
-    _MUSIC_ERR = str(_me)
 
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
@@ -159,11 +152,6 @@ class Robot:
         coro = self.c.conn.datachannel.pub_sub.publish_request_new(self._topic["SPORT_MOD"], req)
         return asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
 
-    def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
-        """One request to the dog's audio hub / VUI service (used by music.py). Returns the dog's reply."""
-        coro = self.c.conn.datachannel.pub_sub.publish_request_new(topic, {"api_id": api_id, "parameter": parameter})
-        return asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=timeout)
-
     def move(self, vx: float, vy: float, yaw: float) -> None:
         from dimos.msgs.geometry_msgs.Twist import Twist
         from dimos.msgs.geometry_msgs.Vector3 import Vector3
@@ -219,24 +207,6 @@ class FakeRobot:
     def sport_api(self, api_id: int, param=None):
         self._add(("api", api_id, param))
         return {"data": {"header": {"status": {"code": 7 if api_id in self.refuse else 0}}}}
-
-    def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
-        """A tiny fake audio hub: remembers uploaded songs, lists them, records everything else."""
-        import json as _json
-
-        p = _json.loads(parameter) if parameter else {}
-        where = topic.split("/")[-2]
-        files = self.__dict__.setdefault("audio_files", {})
-        if api_id == 2001:
-            if p["current_block_index"] == p["total_block_number"]:
-                files[p["file_name"]] = "uid-" + p["file_name"].replace(" ", "")
-                self._add(("audio", where, api_id, p["file_name"], p["total_block_number"]))
-        elif api_id == 1001 and where == "audiohub":
-            return {"data": {"header": {"status": {"code": 0}},
-                             "data": _json.dumps({"audio_list": [{"CUSTOM_NAME": n, "UNIQUE_ID": u} for n, u in files.items()]})}}
-        else:
-            self._add(("audio", where, api_id, _json.dumps(p, sort_keys=True)))
-        return {"data": {"header": {"status": {"code": 0}}}}
 
     def move(self, vx: float, vy: float, yaw: float) -> None:
         self._add(("move", round(vx, 2), round(vy, 2), round(yaw, 2)))
@@ -350,7 +320,7 @@ class App:
         self.objects_on = False
         self.objects = None                 # (timestamp, [(x1, y1, x2, y2, score, class_id)], frame_shape)
         self._obj_snapshot = None           # self-test bookkeeping
-        # always-listening (wake word), standing on the back legs, music
+        # always-listening (wake word), standing on the back legs
         self.listener = None
         self.wake_until = 0.0               # the wake word ("ernest") alone opens this window
         self.last_heard = None              # (time, text, routing verdict) for the status bar
@@ -358,9 +328,8 @@ class App:
         self.upright = False
         self.upright_api = args.upright_api   # the back-leg command that worked last (or the one to try first)
         self.box_step = False               # True from "box step" until "stop"
-        self.box_dancing = False            # True once it is standing: the box-step square runs while the music loads/plays
+        self.box_dancing = False            # True once it is up on the back legs: the box-step square runs
         self.box_t0 = None                  # when the current box-step square started
-        self.music = None
         self.ambient_log: list = []         # (text, verdict) - self-test
 
     def is_selftest(self) -> bool:
@@ -394,11 +363,6 @@ class App:
             r.on_frame(self.on_frame)
             r.on_battery(lambda soc: setattr(self, "battery", soc))
             self.robot = r
-            if music_mod is not None:
-                self.music = music_mod.MusicController(r.audio_request, self.say, volume_pct=self.args.music_volume,
-                                                       folder=self.args.music_dir)
-                if not self.args.no_music_preload and music_mod.list_tracks(self.args.music_dir):
-                    threading.Thread(target=self.music.preload, daemon=True).start()   # one-time uploads, in the background
             self.state, self.state_color = ("DEMO (fake robot)" if isinstance(r, FakeRobot) else "connected"), GOOD
             self.say("Connected. Keep the area around the dog clear.", GOOD)
         except Exception as e:  # noqa: BLE001
@@ -726,8 +690,8 @@ class App:
                 self.stop_upright("voice")
             else:
                 self.say("already on four legs")
-        elif intent.kind == "music":
-            self.handle_music(intent)
+        elif intent.kind == "box_step":
+            self.start_box_step()
         elif intent.kind == "sport":
             label, wait = self.lookup[intent.arg]
             self.run_trick(label, intent.arg, wait)
@@ -790,25 +754,18 @@ class App:
             if on:
                 self.upright = False
 
-    # -- "box step": stand up, play the song (looping), stay standing until "stop" -----------------------
+    # -- "box step": up on the back legs, then step in a square until "stop" -------------------------------
     def start_box_step(self) -> None:
         if self.robot is None:
             self.say("not connected yet", WARN)
         elif self.box_step:
             self.say("box step is already running (say 'stop' to end it)")
-        elif self.upright:
-            self._begin_box_step()                       # already up on the back legs: no second confirmation
-        else:                                            # the back-leg stand can fall, so it asks first (same as U)
-            self.pending = ("BOX STEP on the BACK LEGS (it can fall: soft floor, clear space, spotter)", self._begin_box_step,
-                            time.time() + CONFIRM_SECS)
-            self.say("box step stands on the back legs: say 'yes' or press Y within 4 s", WARN)
-
-    def _begin_box_step(self) -> None:
-        self.stop_follow("box step")
-        self.voice_move, self.pending = None, None
-        self.box_step, self.box_dancing, self.box_t0 = True, False, None
-        self.say("> box step: up on the back legs, then it steps in a square to the music. Say 'stop' to end it.", GOOD)
-        self.pool.submit(self._box_step_work)
+        else:
+            self.stop_follow("box step")
+            self.voice_move, self.pending = None, None
+            self.box_step, self.box_dancing, self.box_t0 = True, False, None
+            self.say("> box step: up on the back legs, then it steps in a square. Say 'stop' to end it. (It can fall: keep clear.)", WARN)
+            self.pool.submit(self._box_step_work)
 
     def _box_step_work(self) -> None:
         wait = self.args.box_wait
@@ -826,57 +783,9 @@ class App:
                 if not self.box_step:
                     return
                 self.start_upright()                     # onto the back legs; the dance waits out its 5 s busy time
-            self.box_dancing = True                      # start stepping now; the (first-time) upload can take a while
-            if self.music is None:
-                self.say("music isn't available, so it just steps", WARN)
-                return
-            msg = self.music.play("box step", default_ok=True, loop=True)
-            if self.box_step:
-                self.say(f"> {msg}. Stepping until you say 'stop'.", GOOD)
-            else:                                        # 'stop' landed during the (possibly long) first-time upload
-                self._quiet_music()
-        except Exception as e:  # noqa: BLE001 - MusicError or a dropped connection: say so, stay standing
-            self.say(f"box step: {e}", WARN if isinstance(e, music_mod.MusicError) else BAD)
-
-    def _quiet_music(self) -> None:
-        try:
-            self.say("> " + self.music.pause())
-        except Exception as e:  # noqa: BLE001
-            self.say(f"couldn't pause the music: {e}", WARN)
-
-    # -- music ------------------------------------------------------------------------------------------
-    def handle_music(self, intent) -> None:
-        if self.music is None:
-            self.say(f"music isn't available: {globals().get('_MUSIC_ERR', 'not connected')}", WARN)
-            return
-
-        if intent.arg == "play" and intent.text in music_mod.TRIGGER_PHRASES:
-            self.start_box_step()                        # "box step" = stand up, THEN the music, and stay up
-            return
-
-        def work():
-            try:
-                if intent.arg == "list":
-                    self.say(self.music.available())
-                elif intent.arg == "play":
-                    self.say("> " + self.music.play(intent.text, default_ok=intent.text in music_mod.TRIGGER_PHRASES), GOOD)
-                elif intent.arg == "pause":
-                    self.say("> " + self.music.pause())
-                elif intent.arg == "resume":
-                    self.say("> " + self.music.resume())
-                elif intent.arg == "volume":
-                    if intent.text == "up":
-                        self.say("> " + self.music.bump_volume(+20))
-                    elif intent.text == "down":
-                        self.say("> " + self.music.bump_volume(-20))
-                    else:
-                        self.say("> " + self.music.set_volume(intent.amount))
-            except music_mod.MusicError as e:
-                self.say(f"music: {e}", WARN)
-            except Exception as e:  # noqa: BLE001
-                self.say(f"music failed: {e}", BAD)
-
-        self.pool.submit(work)
+            self.box_dancing = True
+        except Exception as e:  # noqa: BLE001 - a dropped connection: say so
+            self.say(f"box step: {e}", BAD)
 
     # -- actions ----------------------------------------------------------------------------------------
     def run_trick(self, label: str, name: str, wait: float) -> None:
@@ -923,11 +832,7 @@ class App:
         self.stop_follow("SPACE")
         self.say("STOP", BAD)
         self.pool.submit(self.send, "StopMove")
-        was_box, self.box_step = self.box_step, False        # 'stop' ends a box-step session: music off, dog stays standing
-        self.box_dancing, self.box_t0 = False, None
-        if self.music is not None:                           # 'stop' also stops the music (even one still uploading)
-            if self.music.cancel() or was_box:
-                self.pool.submit(self._quiet_music)
+        self.box_step, self.box_dancing, self.box_t0 = False, False, None    # 'stop' ends a box-step session (dog stays as it is)
 
     def on_key(self, key: int) -> None:
         now = time.time()
@@ -1099,7 +1004,7 @@ class App:
         d = self.desired
         status = "BUSY" if now < self.busy_until else ("balancing" if self.armed else "will balance on first drive key")
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
-        # second row: the ear (wake word), what it last heard, the back-leg state, music
+        # second row: the ear (wake word), what it last heard, the back-leg state
         if self.ear == "on":
             ear_txt, ear_col = f'ear: ON, say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else ""), GOOD
         elif self.ear == "error":
@@ -1114,8 +1019,6 @@ class App:
             self.text(screen, f'heard: "{lh[1][:56]}"{what}', 330, 34, tone, 22)
         if self.upright:
             self.text(screen, "UPRIGHT", 900, 34, WARN, 24)
-        elif self.music is not None and getattr(self.music, "playing", None):
-            self.text(screen, f"music: {self.music.playing[:14]}", 850, 34, TXT, 22)
 
         banner = None
         if self.voice_state == "listening":
@@ -1125,9 +1028,7 @@ class App:
         elif self.pending and now < self.pending[2]:
             banner = (f"{self.pending[0]}: press Y or say 'yes' ({self.pending[2] - now:.0f}s)", WARN)
         elif self.box_step:
-            playing = getattr(self.music, "playing", None)
-            what = "standing up" if not self.box_dancing else "stepping"
-            banner = ("BOX STEP: " + (f"playing '{playing[:22]}', {what}" if playing else f"{what}, getting the music ready")
+            banner = ("BOX STEP: " + ("getting up on the back legs ..." if not self.box_dancing else "stepping")
                       + "     say 'stop' to end it", GOOD)
         elif self.voice_move:
             vm = self.voice_move
@@ -1365,52 +1266,30 @@ def _selftest_voice_verdict(app: "App") -> int:
 LISTEN_TEST = [  # (seconds, what the always-on mic "heard")
     (0.5, "hello everyone how are you doing today"), (0.9, "sit down"), (1.3, "Ernest sit down"), (2.0, "Ernest"), (2.5, "wave"),
     (3.2, "wave"), (3.6, "Ernest, ready to dance"), (4.2, "Ernest stand on your back legs"), (4.6, "we should get lunch"),
-    (5.0, "yes"), (7.2, "Ernest sit down"), (7.8, "Ernest come down"), (9.0, "Ernest box step"), (9.6, "yes"), (16.0, "Ernest volume 50 percent"),
-    (16.5, "what songs do you have"), (16.9, "Ernest what songs do you have"), (17.5, "stop"),
+    (5.0, "yes"), (7.2, "Ernest sit down"), (7.8, "Ernest come down"), (9.0, "Ernest box step"), (17.5, "stop"),
 ]
-
-
-def _make_test_music() -> str:
-    """A temp songs folder with one 2-second tone called 'box step' (so the box-step trigger has something to play)."""
-    import tempfile
-
-    d = tempfile.mkdtemp(prefix="go2music_")
-    t = np.arange(88200) / 44100
-    pcm = (np.sin(2 * np.pi * 440 * t) * 9000).astype(np.int16)
-    with wave.open(os.path.join(d, "box step.wav"), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(44100)
-        w.writeframes(pcm.tobytes())
-    return d
 
 
 def _selftest_listen_verdict(app: "App") -> int:
     log = app.robot.log if isinstance(app.robot, FakeRobot) else []
     sports = [e[1] for e in log if e[0] == "sport"]
     api = [e[1:] for e in log if e[0] == "api"]
-    audio = [e[1:] for e in log if e[0] == "audio"]
     acts = [a for _, a in app.ambient_log]
     checks = {
         "conversation and bare commands without the wake word were ignored, in order":
             acts == ["ignore", "ignore", "command", "wake", "command", "ignore", "command", "command", "ignore", "confirm", "command",
-                     "command", "command", "confirm", "command", "ignore", "command", "stop"],
+                     "command", "command", "stop"],
         "sport commands: Sit, Hello (wake window), StandUp ('ready to dance'), BalanceStand (back-leg prep), "
-        "then box step (after a spoken 'yes') = StandUp + BalanceStand, and finally StopMove; nothing lay it down":
+        "then 'Ernest box step' (no confirmation) = StandUp + BalanceStand, and finally StopMove; nothing lay it down":
             sports == ["Sit", "Hello", "StandUp", "BalanceStand", "StandUp", "BalanceStand", "StopMove"],
-        "'box step' stood the dog up, balanced it, and put it on the back legs BEFORE any music was uploaded or played":
-            log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][0:3]
-            == [("sport", "StandUp"), ("sport", "BalanceStand"), ("api", 1050, {"data": True})]
-            and log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][3][0] == "audio",
+        "'box step' stood the dog up, balanced it, and put it on the back legs, in that order":
+            log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:3]
+            == [("sport", "StandUp"), ("sport", "BalanceStand"), ("api", 1050, {"data": True})],
         "back legs: 2050 was refused so it fell back to 1050 (up), came down with 1050, and box step went straight to 1050 again":
             api == [(2050, {"data": True}), (1050, {"data": True}), (1050, {"data": False}), (1050, {"data": True})],
         "'sit down' while up on two legs was blocked (Sit only once)": sports.count("Sit") == 1,
-        "'box step' uploaded the song, set volume level 4 (40%), set it to LOOP, and played it":
-            audio[:4] == [("audiohub", 2001, "box step", audio[0][3]), ("vui", 1003, '{"volume": 4}'),
-                          ("audiohub", 1007, '{"play_mode": "single_cycle"}'), ("audiohub", 1002, '{"unique_id": "uid-boxstep"}')],
-        "'volume 50 percent' -> level 5, then the bare 'stop' paused the music (and stopped the dog once)":
-            audio[4:] == [("vui", 1003, '{"volume": 5}'), ("audiohub", 1003, "{}")] and sports.count("StopMove") == 1,
-        "the dog was never told to sit or lie down (stayed standing until 'stop')": "Sit" not in sports[2:] and "StandDown" not in sports,
+        "the dog was never told to sit or lie down (stayed up until 'stop')": "Sit" not in sports[2:] and "StandDown" not in sports,
+        "'stop' halted the dog exactly once": sports.count("StopMove") == 1,
         "the box-step session ended on 'stop' (no more dancing); nothing pending; it stays up until 'come down'":
             not app.box_step and not app.box_dancing and app.upright and app.pending is None,
         "box step actually moved the dog (forward/back and side-to-side velocity commands while upright)":
@@ -1418,7 +1297,6 @@ def _selftest_listen_verdict(app: "App") -> int:
     }
     print("\nSELFTEST-LISTEN ambient:", app.ambient_log)
     print("SELFTEST-LISTEN sports:", sports, " api:", api)
-    print("SELFTEST-LISTEN audio:", audio)
     for name, ok in checks.items():
         print(("  PASS  " if ok else "  FAIL  ") + name)
     return 0 if all(checks.values()) else 1
@@ -1513,10 +1391,6 @@ def main() -> int:
     p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
     p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "2050")),
                    help="back-leg stand id tried first: 2050 BackStand (firmware 1.1.7+, the default) or 1050 (older); the other is the fallback")
-    p.add_argument("--music-volume", type=int, default=40, help="dog speaker volume for songs, percent (default 40)")
-    p.add_argument("--music-dir", default=(music_mod.MUSIC_DIR if music_mod else os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")),
-                   help="folder of songs (wav/mp3/...) to play through the dog")
-    p.add_argument("--no-music-preload", action="store_true", help="don't upload songs to the dog at startup")
     p.add_argument("--box-wait", type=float, default=3.2, help="seconds 'box step' waits for the dog to finish standing up before balancing")
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
@@ -1555,10 +1429,8 @@ def main() -> int:
         if image is None:
             return 2
     if any(k.startswith("selftest") and v for k, v in vars(args).items()):
-        args.no_listen = args.no_music_preload = True          # tests never open the mic or upload songs on their own
+        args.no_listen = True                                   # tests never open the mic
         args.box_wait = 0.4                                     # (and don't wait 3 s for a fake dog to stand)
-        if args.selftest_listen:
-            args.music_dir = _make_test_music()
     app = App(args, demo_image=image)
     if args.selftest_voice:
         app.mic, app.stt = FakeMic(), FakeSTT(VOICE_TEST_LINES)

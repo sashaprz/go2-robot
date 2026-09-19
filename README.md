@@ -1,7 +1,7 @@
 # go2-robot
 
 Control a **Unitree Go2 Air**: live camera, keyboard driving, tricks, person-follow, object detection,
-**voice commands (offline, wake word "ernest")**, standing on the back legs, and **music through the dog's speaker**.
+**voice commands (offline, wake word "ernest")**, and standing on the back legs (**"ernest, box step"**).
 Built on [DimOS](https://github.com/dimensionalOS/dimos).
 
 **Platform support:**
@@ -11,7 +11,7 @@ Built on [DimOS](https://github.com/dimensionalOS/dimos).
 
 > **Read this first: what is and isn't tested.** Everything below was developed and tested **without the robot in the
 > loop**: scripted window tests against a fake dog, generated speech through the real Whisper model, and a fake audio
-> hub. Driving/tricks/follow have been tried on the real dog; the back-leg stand, the music/speaker path, voice on the
+> hub. Driving/tricks/follow have been tried on the real dog; the back-leg stand, voice on the
 > real dog, and always-listening have **not**. Details in [Status and limits](#status-and-limits).
 
 ## One-time setup (per machine)
@@ -69,7 +69,7 @@ Preview mode (no dog needed):
 | Q / E | strafe left / right |
 | A / D | turn left / right |
 | Shift / Ctrl (held) | faster x1.5 / slower x0.5 (base 0.4 m/s, 0.8 rad/s) |
-| Space | **emergency stop** (also stops music, ends box step, aborts routines) |
+| Space | **emergency stop** (also ends box step, aborts routines) |
 | 1 2 3 4 5 6 | stand up, balance, lie down, recovery stand, sit, rise from sit |
 | 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine (each needs a confirming Y within 4 s) |
@@ -104,35 +104,17 @@ The window shows what it heard and how it was handled ("ignored: no wake word", 
 | "walk forward", "go back", "turn left/right", "turn around", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "turn right 45 degrees", "a little" (half), "a lot" (double). Capped at 5 s walking / 8 s turning. |
 | "follow me", "stop following" | person-follow (starts straight away; keyboard `T` still asks for `Y`) |
 | "stand on your back legs" -> "yes" | back-leg stand (asks for a spoken "yes" or Y). "come down" / "four legs" returns |
-| "box step" | **stand up on the back legs (asks "yes" first), step in a square while the song plays, until you say "stop"** (see below) |
-| "play music", "play <song name>", "pause the music", "resume the music" | music |
-| "louder", "quieter", "volume 30 percent" | music volume |
-| "what songs do you have" | lists the songs |
-| **"stop"** | emergency stop: halts the dog, **stops the music (even one still uploading), ends box step**. It stays on its back legs until "come down". |
+| "box step" | **up on the back legs, then step in a square until you say "stop"** (see below). No "yes" needed: it can fall, so clear the space first |
+| **"stop"** | emergency stop: halts the dog and ends box step. It stays on its back legs until "come down". |
 
-"stop the music" only pauses the music (it doesn't halt the dog). "go ahead" is deliberately *not* a walk command.
+"go ahead" is deliberately *not* a walk command.
 
-## Box step and music
+## Box step
 
-Saying **"box step"** asks for a spoken **"yes"** (or Y) within 4 s, because it goes onto the **back legs** and can fall
-(soft floor, clear space, spotter). Then, in order: **StandUp -> BalanceStand -> back-leg stand -> the dog steps in a box
-(forward, right, back, left, ~0.3 m per side, 1.2 s each) while the song loops at the music volume**. It starts stepping
-as soon as it's up, even if the song is still uploading. It keeps going **until you say "stop"** (or press Space), which
-also stops the music; it then stays up on its back legs until "come down" / U. Saying a pose or trick yourself ends the
-sequence. *Whether the dog accepts walk commands while on its back legs is untested.*
-
-- **Songs live in `music/`** (wav/mp3/m4a/ogg/flac). "box step" plays a song named "box step" if you have one, otherwise the
-  **first song** alphabetically. The repo currently has one: *Justin Bieber - Baby (Lyrics).mp3*. That is copyrighted
-  music in a **private** repo: remove it before making the repo public.
-- **Volume:** default **40%** (`--music-volume 40`). It is sent to the dog as level 4 of 10. *The 0-10 scale is an
-  assumption* (same as the LED brightness setting); listen and adjust with "louder"/"quieter" or `--music-volume`.
-- **Upload once:** the dog plays files stored on itself. Each song is shrunk (mono, 22.05 kHz, **first 90 s only**,
-  `GO2_MUSIC_MAX_SECONDS` to change), uploaded in ~4 KB blocks (**~1300 blocks for a 90 s song; upload time is
-  unmeasured, expect a minute or a few**) and remembered by the dog. `go2.bat` uploads up to 3 songs **in the
-  background at startup** so the first "box step" is instant; if you say it before the upload finishes, it waits.
-  `--no-music-preload` disables that.
-- **Untested:** whether an Air has a working speaker / audio hub at all. If it doesn't, the upload will fail or the song
-  won't appear in the dog's list, and the window says so; the dog still stands.
+Saying **"ernest, box step"** (no confirmation, so clear the space first: the back-leg stand **can fall**) does, in order:
+**StandUp -> BalanceStand -> back-leg stand -> steps in a box (forward, right, back, left, ~0.3 m per side, 1.2 s each)**.
+It keeps going **until you say "stop"** (or press Space), then stays up on its back legs until "come down" / U. Saying a pose
+or trick yourself ends it. *Whether the dog accepts walk commands while on its back legs is untested.*
 
 ## Standing on the back legs
 
@@ -174,13 +156,11 @@ Detection only (no distance). It's a small model: expect missed small/far object
 
 ## Status and limits
 
-Verified by tests (no dog): key logic, follow controller, phrase matcher (40+ phrases plus wake-word routing), the music
-upload/play protocol against a fake audio hub, and the whole voice pipeline on **generated** speech through the real
+Verified by tests (no dog): key logic, follow controller, phrase matcher (40+ phrases plus wake-word routing), and the whole voice pipeline on **generated** speech through the real
 Whisper model (32/32 tricks, 40/40 moves, 44/44 wake-word cases, 9/9 utterances cut from a continuous stream).
 
 **Not verified:** real people's voices, accents or noisy rooms; always-listening on the real mic for long periods; the
-back-leg stand; the dog's speaker, the audio-hub reply format and the volume scale; whether the `music/` upload is fast
-enough. Room speech near the mic can trigger a Whisper "decoding loop"; guards discard those, and the wake word means
+back-leg stand; whether the dog accepts walk commands while on its back legs. Room speech near the mic can trigger a Whisper "decoding loop"; guards discard those, and the wake word means
 chatter can't move the dog, but expect to tune after real use. Stay near the dog and keep **Space** and the word **"stop"**
 in mind: they are the emergency stop.
 
@@ -189,8 +169,6 @@ in mind: they are the emergency stop.
 - `go2.bat` / `run_go2.sh` / `go2.py`: the app (window, keys, voice actions, box step)
 - `follow.py`: object/person detector (YOLOX-tiny) and follow controller
 - `voice.py`: microphone capture, wake word + always-listening, local Whisper (and optional ElevenLabs), phrase matcher
-- `music.py`: song conversion/upload/playback and volume through the dog's audio hub
-- `music/`: your songs
 - `dimos-go2.bat` / `run_dimos.sh`, `fetch-aes-key.bat` / `fetch_aes_key.sh`, `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete** (no AES-key support); kept for reference.
 
