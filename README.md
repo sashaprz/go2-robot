@@ -1,150 +1,167 @@
 # go2-robot
 
-Launchers for controlling a **Unitree Go2 Air** from a Windows PC using [DimOS](https://github.com/dimensionalOS/dimos)
-running inside WSL2 (Ubuntu 24.04).
+Control a **Unitree Go2 Air** from a Windows PC: live camera, keyboard driving, tricks, person-follow, object detection,
+**voice commands (offline, wake word "ernest")**, standing on the back legs, and **music through the dog's speaker**.
+It runs inside WSL2 (Ubuntu 24.04) on top of [DimOS](https://github.com/dimensionalOS/dimos)'s connection code.
+
+> **Read this first: what is and isn't tested.** Everything below was developed and tested **without the robot in the
+> loop**: scripted window tests against a fake dog, generated speech through the real Whisper model, and a fake audio
+> hub. Driving/tricks/follow have been tried on the real dog; the back-leg stand, the music/speaker path, voice on the
+> real dog, and always-listening have **not**. Details in [Status and limits](#status-and-limits).
 
 ## One-time setup (per machine)
 
-1. **WSL2 + Ubuntu 24.04**, then install DimOS inside it with the official installer
-   (it creates `~/dimensional-applications` with a venv):
+1. **WSL2 + Ubuntu 24.04**, then install DimOS inside it (creates `~/dimensional-applications` with a venv):
    ```bash
    curl -fsSL https://raw.githubusercontent.com/dimensionalOS/dimos/main/scripts/install.sh | bash
    ```
-   DimOS needs Python 3.12 and supports Ubuntu / macOS only, hence WSL on Windows.
-2. **Get the dog's AES key.** Go2 firmware >= 1.1.15 needs a per-device key to do the LAN handshake.
-   It belongs to the Unitree Go app account the dog is registered to. Either:
-   - run `fetch-aes-key.bat` **on a network with internet** (it prompts for the Unitree account email/password), or
-   - ask whoever owns the dog for the key and put this line in `~/.dimos.env` inside WSL:
-     ```
-     UNITREE_AES_128_KEY=<32 hex characters>
-     ```
-   **Never commit the key.** `.gitignore` excludes `*.env`; keep it that way.
-3. Clone this repo. The `.bat` files call `run_dimos.sh` by an absolute path
-   (`/mnt/c/Users/Sasha/go2-robot/...`); edit the path in `dimos-go2.bat` and `fetch-aes-key.bat`
-   if your clone lives elsewhere or your Windows username differs.
+2. **The dog's AES key.** Go2 firmware >= 1.1.15 needs a per-device key. It belongs to the Unitree Go app account the
+   dog is registered to. Either run `fetch-aes-key.bat` **while online** (prompts for the Unitree account), or put
+   `UNITREE_AES_128_KEY=<32 hex chars>` in `~/.dimos.env` inside WSL. **Never commit the key** (`*.env` is gitignored).
+3. **Download the models once, while online:** `go2.bat --fetch-model` (object detector ~20 MB + Whisper `base.en`
+   ~150 MB, cached under `~/.cache/`). After that, **no internet is needed**.
+4. Clone this repo. The `.bat` files call scripts by absolute path (`/mnt/c/Users/Sasha/go2-robot/...`); edit them if
+   your clone lives elsewhere or your Windows username differs.
 
-## All-in-one: camera + driving + tricks (`go2.bat`)
+## Running it
 
-One window with the dog's live camera (FPV), keyboard driving, and poses/tricks. Needs no internet; join the dog's
-Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **click the window** for keyboard focus.
+1. Power on the dog. **Close the Unitree Go phone app** (the dog accepts one controller at a time).
+2. Join the dog's Wi-Fi: **Go2_61331_29d4be72**, password **88888888**. Windows will say "no internet"; that's fine.
+3. Double-click **`go2.bat`**, then **click inside the window** so it gets keyboard focus.
+
 `go2.bat --demo` previews the window with a fake robot and synthetic video (no dog needed).
 
-| Keys | Action |
-|---|---|
-| W / S | forward / back |
-| Q / E | strafe left / right |
-| A / D | turn left / right |
-| Shift / Ctrl (held) | faster x1.5 / slower x0.5 (base 0.4 m/s, 0.8 rad/s; `--linear` / `--angular` change it) |
-| Space | emergency stop (also aborts a routine) |
-| 1-6 | stand up, balance, lie down, recovery stand, sit, rise from sit |
-| 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
-| N / M, R, then **Y** | dance 1 / dance 2 / greeting routine, each needs a confirming Y within 4 s |
-| T, then **Y** | follow the nearest person (see below); T again / Space / any drive or trick key stops it |
-| V (hold) | push-to-talk voice commands (see below) |
-| O | toggle object-detection overlay (see below) |
-| Esc | quit |
-
-### Voice commands (hold `V`)
-
-Hold **V**, speak, release. Speech is transcribed **offline** by a local Whisper model (faster-whisper `base.en`, CPU), so
-it works on the dog's own Wi-Fi and your audio never leaves the PC. The transcript is matched to actions, and the window
-shows what it heard and what it matched.
-
-- **Tricks and poses:** "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up", "stretch",
-  "wiggle your hips", "make a heart", "good boy", "recover", "greeting".
-- **Walking and turning (timed moves):** "walk forward", "go back", "turn left", "turn right", "turn around",
-  "step left" / "step right" (sideways). Add an amount if you like: "walk forward two seconds", "go forward one meter",
-  "turn right 45 degrees", "go back a little" (half), "walk forward a lot" (double). Defaults: 1.5 s forward/back
-  (~0.6 m at 0.4 m/s), 1 s sideways, 90 degrees for a turn, 180 for "turn around". A spoken move is **capped at 5 s
-  (~2 m)** walking or 8 s turning. A new move replaces the current one.
-- **Follow:** "follow me" starts follow mode straight away (the keyboard `T` still asks for `Y`); "stop following" ends it.
-- **"stop"** (or halt / freeze) is an emergency stop and always wins. Space, or pressing any drive key, also cancels a
-  spoken move.
-
-- **One-time download (needs internet):** `go2.bat --fetch-model` fetches the object detector and the Whisper model
-  (~150 MB, cached in `~/.cache/`). After that no internet is needed.
-- **Measured on the dev PC (12-core ARM, CPU only):** `base.en` understood 32/32 spoken test commands (two synthetic
-  voices) in ~0.4 s each; silence and noise produced no commands. Not yet measured with real people's voices or a noisy
-  room. `small.en` (`--whisper-model small.en`) is slower (~1.5 s) with no gain on those clips.
-- **Optional cloud backend:** `go2.bat --stt elevenlabs` uses ElevenLabs speech-to-text instead (needs internet and an
-  API key: run `set-elevenlabs-key.bat` once; saved to `~/.dimos.env` in WSL, never in the repo). Untested against the
-  real API.
-- **Microphone:** captured through WSLg's PulseAudio (`libpulse-simple`); Windows must allow microphone access.
-  A transcription that takes over 12 s is abandoned with a message.
-
-### Object detection (`O`)
-
-Toggles labelled boxes and a "seeing: ..." summary over the live video for 80 everyday object types (person, chair, cup,
-sports ball, tv, laptop, bottle, dog, ...), using the same YOLOX-tiny model as follow mode (one shared inference, ~25 ms
-per frame on CPU). Detection only: it has no depth or distance, and it doesn't drive anything. It's a small model:
-expect missed small/far objects (a person a few metres away can be missed) and the odd false positive. Needs the model
-from `go2.bat --fetch-model` (see follow mode below).
-
-### Follow mode (`T`)
-
-The dog turns to keep the nearest person centred and walks toward them slowly (max 0.35 m/s, `--follow-speed`),
-stopping when they fill ~60% of the frame height. It gives up after ~1.2 s without seeing them, and Space, `T` again,
-any drive/trick key, or losing window focus cancel it. **It has no obstacle avoidance**: keep the path clear, and stay
-in front of it. The detector is YOLOX-tiny on CPU via onnxruntime (`follow.py`), so it works on the dog's hotspot with
-no cloud or API keys. Fetch the model once while you have internet: `go2.bat --fetch-model` (stored in
-`~/.cache/go2/`, not in the repo). Tests in this repo only used still photos: it has not been run on a real dog.
-
-Driving sends BalanceStand first automatically, and is locked out while a trick is running (Space clears it).
-Losing window focus stops the dog. Flips/handstand are deliberately not included. Which tricks an Air accepts depends
-on model and firmware. `--motion-mode mcf` (DimOS notes that mode is the one that traverses stairs) is an untested opt-in.
-
-## Driving the dog with DimOS instead (`dimos-go2.bat`)
-
-The full DimOS stack: keyboard teleop plus optional mapping/navigation and agent blueprints. It has no camera in the
-keyboard blueprint. `go2.bat` and `dimos-go2.bat` can't run at the same time: the dog accepts one controller.
-
-1. Power on the dog. Close the Unitree Go phone app (only one controller can connect at a time).
-2. Join the dog's Wi-Fi: **Go2_61331_29d4be72**, password **88888888** (Unitree's default). The PC will have
-   no internet while connected; that's expected.
-3. Double-click **`dimos-go2.bat`**. It pings the dog at `192.168.12.1`, then starts the
-   `unitree-go2-webrtc-keyboard-teleop` blueprint.
-4. **Click the small pygame window that opens** so it has keyboard focus. Keys are read from that window, not the terminal.
+## Keys
 
 | Key | Action |
 |---|---|
 | W / S | forward / back |
 | Q / E | strafe left / right |
 | A / D | turn left / right |
-| Space | emergency stop (zero velocity) |
-| Shift / Ctrl (held) | boost x2 / slow x0.5 |
+| Shift / Ctrl (held) | faster x1.5 / slower x0.5 (base 0.4 m/s, 0.8 rad/s) |
+| Space | **emergency stop** (also stops music, ends box step, aborts routines) |
+| 1 2 3 4 5 6 | stand up, balance, lie down, recovery stand, sit, rise from sit |
+| 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
+| N / M, R, then **Y** | dance 1 / dance 2 / greeting routine (each needs a confirming Y within 4 s) |
+| T, then **Y** | follow the nearest person (T again / Space / any drive key stops it) |
+| O | toggle object-detection overlay |
+| U, then **Y** | stand on the **back legs** (U again = come down) |
+| V (hold) | push-to-talk voice command |
+| L | always-listening (the "ernest" ear) on/off |
 | Esc | quit |
 
-Default speed is 0.5 m/s forward and 0.8 rad/s turning (Shift doubles it), so keep the area clear.
-The window shows the live twist being sent, which helps tell "keys not registering" from "dog not responding".
+Driving sends BalanceStand first, is locked out while a trick runs, and stops if the window loses focus.
 
-Other blueprints: `dimos-go2.bat <blueprint> [robot-ip]`
+## Voice
 
-| Blueprint | Notes |
+Two ways to talk to it, both **offline** (local Whisper `base.en`; your audio never leaves the PC):
+
+- **Always-listening ear (on by default).** Say the wake word first: **"ernest, sit down"**. Say just "ernest" and then
+  a command within 6 s also works. Ordinary conversation is ignored. A bare **"stop"** (or "stop following") works
+  **without** the wake word, and a bare **"yes"** answers a pending confirmation. `L` turns the ear off; `--no-listen`
+  starts with it off; `--wake-word rex` changes the word.
+- **Push-to-talk:** hold **V** and speak (no wake word needed).
+
+The window shows what it heard and how it was handled ("ignored: no wake word", etc.).
+
+**What you can say**
+
+| Say | Does |
 |---|---|
-| `unitree-go2-webrtc-keyboard-teleop` | default; keyboard driving |
-| `unitree-go2-basic` | visualization only, **no control** |
-| `unitree-go2-agentic` | natural-language control; needs an LLM key (`OPENAI_API_KEY` in `~/.dimos.env`) and internet |
-| `unitree-go2-agentic-ollama` | natural-language control with a local LLM (Ollama not installed yet) |
+| "ready to dance" (or "stand up") | stand up |
+| "sit", "lie down", "recover", "rise", "balance" | poses |
+| "say hello" / "wave", "stretch", "wiggle your hips", "make a heart", "good boy", "dance", "dance two", "greeting" | tricks |
+| "walk forward", "go back", "turn left/right", "turn around", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "turn right 45 degrees", "a little" (half), "a lot" (double). Capped at 5 s walking / 8 s turning. |
+| "follow me", "stop following" | person-follow (starts straight away; keyboard `T` still asks for `Y`) |
+| "stand on your back legs" -> "yes" | back-leg stand (asks for a spoken "yes" or Y). "come down" / "four legs" returns |
+| "box step" | **stand up, then play the song, and stay standing until you say "stop"** (see below) |
+| "play music", "play <song name>", "pause the music", "resume the music" | music |
+| "louder", "quieter", "volume 30 percent" | music volume |
+| "what songs do you have" | lists the songs |
+| **"stop"** | emergency stop: halts the dog, **stops the music, ends box step**. The dog stays standing. |
 
-List them all with `dimos list` inside WSL. If the dog is on another network (STA mode), pass its IP as the second argument.
+"stop the music" only pauses the music (it doesn't halt the dog). "go ahead" is deliberately *not* a walk command.
+
+## Box step and music
+
+Saying **"box step"** does this, in order: **StandUp -> BalanceStand -> play the song (looping) at the music volume**. The
+dog stays standing (nothing tells it to sit or lie down) and the song keeps looping **until you say "stop"** (or press
+Space). Saying a pose or trick yourself ends the standing sequence.
+
+- **Songs live in `music/`** (wav/mp3/m4a/ogg/flac). "box step" plays a song named "box step" if you have one, otherwise the
+  **first song** alphabetically. The repo currently has one: *Justin Bieber - Baby (Lyrics).mp3*. That is copyrighted
+  music in a **private** repo: remove it before making the repo public.
+- **Volume:** default **20%** (`--music-volume 20`). It is sent to the dog as level 2 of 10. *The 0-10 scale is an
+  assumption* (same as the LED brightness setting); listen and adjust with "louder"/"quieter" or `--music-volume`.
+- **Upload once:** the dog plays files stored on itself. Each song is shrunk (mono, 22.05 kHz, **first 90 s only**,
+  `GO2_MUSIC_MAX_SECONDS` to change), uploaded in ~4 KB blocks (**~1300 blocks for a 90 s song; upload time is
+  unmeasured, expect a minute or a few**) and remembered by the dog. `go2.bat` uploads up to 3 songs **in the
+  background at startup** so the first "box step" is instant; if you say it before the upload finishes, it waits.
+  `--no-music-preload` disables that.
+- **Untested:** whether an Air has a working speaker / audio hub at all. If it doesn't, the upload will fail or the song
+  won't appear in the dog's list, and the window says so; the dog still stands.
+
+## Standing on the back legs
+
+Uses Unitree's `WalkUpright` command. The WebRTC library's older numbering calls it id **1050** (mislabelled "Standup";
+DimOS's own helper sends the same id), the newer SDK numbering is **2050**. The app tries **1050**; if nothing happens on
+your firmware run `go2.bat --upright-api 2050`. It **asks for confirmation**, refuses tricks/follow while up (come down
+first), and **can fall**: use a soft floor, clear space, and a spotter. A steady two-legged balance isn't something the
+firmware exposes beyond this command. `Handstand` (front legs) is deliberately not included; neither are flips.
+
+## Follow mode (`T` or "follow me")
+
+Turns to keep the nearest person centred and walks toward them slowly (max 0.35 m/s), stopping when they fill ~60% of the
+frame height. Gives up after ~1.2 s without seeing them. **No obstacle avoidance**: keep the path clear. The detector is
+YOLOX-tiny on CPU (`follow.py`); no cloud. Tested on still photos and a fake robot only.
+
+## Object detection (`O`)
+
+Labelled boxes and a "seeing: ..." summary for 80 everyday object types, from the same model as follow mode (~25 ms/frame).
+Detection only (no distance). It's a small model: expect missed small/far objects and the odd false positive.
+
+## Other launchers
+
+- **`dimos-go2.bat`**: the full DimOS stack (keyboard teleop, optional mapping/navigation and agent blueprints). It can't
+  run at the same time as `go2.bat`: the dog accepts one controller.
+- **`fetch-aes-key.bat`**: fetch and save the dog's AES key. **`set-elevenlabs-key.bat`**: only for the optional cloud
+  speech backend (`go2.bat --stt elevenlabs`, needs internet, untested against the real API).
 
 ## Troubleshooting
 
-- **`AesKeyRequiredError`**: the AES key is missing or not being loaded. See setup step 2.
-- **`Robot at 192.168.12.1 is not exposing a signaling port`**: the PC isn't on the dog's Wi-Fi, or the dog is off. Windows may
-  hop back to a saved network with internet; re-select the dog's Wi-Fi.
-- **Nothing moves / keys ignored**: you're on `unitree-go2-basic` (view-only, no control), or the pygame window doesn't have focus.
-  Also check no other DimOS run is still holding the dog's connection (`dimos status` / `dimos stop` in WSL); only one client can connect.
-- **Ping works but WebRTC still fails**: WSL2 NAT can break WebRTC. Try mirrored networking
-  (`networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`).
+- **`AesKeyRequiredError`**: the AES key is missing or not loaded (setup step 2).
+- **`Robot at 192.168.12.1 is not exposing a signaling port`**: not on the dog's Wi-Fi, or the dog is off. Windows may hop back
+  to a saved network with internet; re-select the dog's Wi-Fi.
+- **Keys ignored**: click the window (it needs focus), and make sure no other controller (phone app, `dimos-go2.bat`) holds the dog.
+- **"Voice model not downloaded"**: run `go2.bat --fetch-model` while online. **"Object/person detector not downloaded"**: same.
+- **Voice mishears / does nothing**: check the "heard:" line under the status bar. No wake word = ignored (by design). Hold `V` to
+  bypass the wake word. Whisper transcription of room chatter can take 1-4 s.
+- **Back-leg stand does nothing**: try `--upright-api 2050`.
+
+## Status and limits
+
+Verified by tests (no dog): key logic, follow controller, phrase matcher (40+ phrases plus wake-word routing), the music
+upload/play protocol against a fake audio hub, and the whole voice pipeline on **generated** speech through the real
+Whisper model (32/32 tricks, 40/40 moves, 44/44 wake-word cases, 9/9 utterances cut from a continuous stream).
+
+**Not verified:** real people's voices, accents or noisy rooms; always-listening on the real mic for long periods; the
+back-leg stand; the dog's speaker, the audio-hub reply format and the volume scale; whether the `music/` upload is fast
+enough. Room speech near the mic can trigger a Whisper "decoding loop"; guards discard those, and the wake word means
+chatter can't move the dog, but expect to tune after real use. Stay near the dog and keep **Space** and the word **"stop"**
+in mind: they are the emergency stop.
 
 ## Files
 
-- `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks + follow window (recommended)
-- `follow.py`: object/person detector (YOLOX-tiny) and follow controller used by `go2.py`
-- `voice.py`: microphone capture, local Whisper (default) and ElevenLabs speech-to-text, and the phrase matcher used by `go2.py`
-- `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`: save an ElevenLabs API key (only for `--stt elevenlabs`; hidden prompt)
-- `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
-- `fetch-aes-key.bat` / `fetch_aes_key.sh`: fetch and save the AES key
-- `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete**: it uses a library without
-  AES-key support, so it can't connect to current firmware. Kept for reference.
+- `go2.bat` / `run_go2.sh` / `go2.py`: the app (window, keys, voice actions, box step)
+- `follow.py`: object/person detector (YOLOX-tiny) and follow controller
+- `voice.py`: microphone capture, wake word + always-listening, local Whisper (and optional ElevenLabs), phrase matcher
+- `music.py`: song conversion/upload/playback and volume through the dog's audio hub
+- `music/`: your songs
+- `dimos-go2.bat` / `run_dimos.sh`, `fetch-aes-key.bat` / `fetch_aes_key.sh`, `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`
+- `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete** (no AES-key support); kept for reference.
+
+## Developer tests
+
+`run_go2.sh --selftest`, `--selftest-follow`, `--selftest-voice`, `--selftest-voicemove`, `--selftest-objects`,
+`--selftest-listen` run headless scripted checks against the fake robot (inside WSL:
+`wsl -d Ubuntu-24.04 -- bash /mnt/c/Users/Sasha/go2-robot/run_go2.sh --selftest-listen`).
