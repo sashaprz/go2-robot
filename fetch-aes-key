@@ -1,0 +1,5 @@
+#!/bin/bash
+# macOS launcher to fetch and save the Go2 AES key
+# Run this while on a network WITH internet (not the dog's hotspot)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/fetch_aes_key.sh" "$@"

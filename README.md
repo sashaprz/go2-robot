@@ -1,8 +1,13 @@
 # go2-robot
 
-Control a **Unitree Go2 Air** from a Windows PC: live camera, keyboard driving, tricks, person-follow, object detection,
+Control a **Unitree Go2 Air**: live camera, keyboard driving, tricks, person-follow, object detection,
 **voice commands (offline, wake word "ernest")**, standing on the back legs, and **music through the dog's speaker**.
-It runs inside WSL2 (Ubuntu 24.04) on top of [DimOS](https://github.com/dimensionalOS/dimos)'s connection code.
+Built on [DimOS](https://github.com/dimensionalOS/dimos).
+
+**Platform support:**
+- **macOS**: Native support - run scripts directly
+- **Windows**: Requires WSL2 (Ubuntu 24.04) - DimOS runs inside WSL, launched via `.bat` files
+- **Linux**: Native support (Ubuntu 24.04+)
 
 > **Read this first: what is and isn't tested.** Everything below was developed and tested **without the robot in the
 > loop**: scripted window tests against a fake dog, generated speech through the real Whisper model, and a fake audio
@@ -11,25 +16,50 @@ It runs inside WSL2 (Ubuntu 24.04) on top of [DimOS](https://github.com/dimensio
 
 ## One-time setup (per machine)
 
+### macOS / Linux Setup
+
+1. **Install DimOS** (Python 3.12 required):
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/dimensionalOS/dimos/main/scripts/install.sh | bash
+   ```
+   This creates `~/dimensional-applications` with a Python venv.
+
+2. **Get the dog's AES key** (Go2 firmware >= 1.1.15 needs this). Run `./fetch-aes-key` **while online**:
+   ```bash
+   ./fetch-aes-key
+   ```
+   Or manually add to `~/.dimos.env`: `UNITREE_AES_128_KEY=<32 hex chars>`. **Never commit the key**.
+
+3. **Download the models once, while online:** `./go2 --fetch-model` (object detector ~20 MB + Whisper `base.en`
+   ~150 MB, cached under `~/.cache/`). After that, **no internet is needed**.
+
+### Windows Setup
+
 1. **WSL2 + Ubuntu 24.04**, then install DimOS inside it (creates `~/dimensional-applications` with a venv):
    ```bash
    curl -fsSL https://raw.githubusercontent.com/dimensionalOS/dimos/main/scripts/install.sh | bash
    ```
-2. **The dog's AES key.** Go2 firmware >= 1.1.15 needs a per-device key. It belongs to the Unitree Go app account the
-   dog is registered to. Either run `fetch-aes-key.bat` **while online** (prompts for the Unitree account), or put
+
+2. **The dog's AES key.** Run `fetch-aes-key.bat` **while online** (prompts for the Unitree account), or put
    `UNITREE_AES_128_KEY=<32 hex chars>` in `~/.dimos.env` inside WSL. **Never commit the key** (`*.env` is gitignored).
+
 3. **Download the models once, while online:** `go2.bat --fetch-model` (object detector ~20 MB + Whisper `base.en`
    ~150 MB, cached under `~/.cache/`). After that, **no internet is needed**.
+
 4. Clone this repo. The `.bat` files call scripts by absolute path (`/mnt/c/Users/Sasha/go2-robot/...`); edit them if
    your clone lives elsewhere or your Windows username differs.
 
 ## Running it
 
 1. Power on the dog. **Close the Unitree Go phone app** (the dog accepts one controller at a time).
-2. Join the dog's Wi-Fi: **Go2_61331_29d4be72**, password **88888888**. Windows will say "no internet"; that's fine.
-3. Double-click **`go2.bat`**, then **click inside the window** so it gets keyboard focus.
+2. Join the dog's Wi-Fi: **Go2_61331_29d4be72**, password **88888888**. Your system will say "no internet"; that's fine.
+3. Launch:
+   - **macOS/Linux**: `./go2` then **click inside the window** for keyboard focus
+   - **Windows**: Double-click **`go2.bat`** then **click inside the window** for keyboard focus
 
-`go2.bat --demo` previews the window with a fake robot and synthetic video (no dog needed).
+Preview mode (no dog needed):
+- **macOS/Linux**: `./go2 --demo`
+- **Windows**: `go2.bat --demo`
 
 ## Keys
 

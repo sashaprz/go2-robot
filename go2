@@ -1,0 +1,5 @@
+#!/bin/bash
+# macOS launcher for the all-in-one Go2 window (FPV + drive + tricks)
+# usage: ./go2 [--demo] [--ip <dog-ip>] [other flags]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/run_go2.sh" "$@"
