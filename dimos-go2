@@ -1,0 +1,5 @@
+#!/bin/bash
+# macOS launcher for DimOS blueprints
+# usage: ./dimos-go2 [blueprint] [robot-ip]
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/run_dimos.sh" "$@"

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the all-in-one Go2 window (FPV + drive + tricks). Runs inside WSL (Ubuntu-24.04).
+# Launch the all-in-one Go2 window (FPV + drive + tricks). Works on macOS or inside WSL (Ubuntu-24.04).
 # usage: run_go2.sh [--demo] [--ip <dog-ip>] [other go2.py flags]
 #   --demo   fake robot + synthetic video: preview the window without the dog
 DEMO=0; IP="192.168.12.1"; PASS=()
@@ -11,6 +11,7 @@ while [ $# -gt 0 ]; do
     --selftest-voice)  DEMO=1; PASS+=("--selftest-voice") ;;
     --selftest-objects) DEMO=1; PASS+=("--selftest-objects") ;;
     --selftest-voicemove) DEMO=1; PASS+=("--selftest-voicemove") ;;
+    --selftest-listen) DEMO=1; PASS+=("--selftest-listen") ;;
     --fetch-model)     DEMO=1; PASS+=("--fetch-model") ;;   # downloads the person detector; needs internet, not the dog
     --ip)       shift; IP="$1" ;;
     *)          PASS+=("$1") ;;
@@ -37,4 +38,6 @@ if [ "$DEMO" = 0 ]; then
   fi
 fi
 
-exec python /mnt/c/Users/Sasha/go2-robot/go2.py "${PASS[@]}"
+# Get the directory where this script lives, resolve symlinks
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")")" && pwd)"
+exec python "$SCRIPT_DIR/go2.py" "${PASS[@]}"

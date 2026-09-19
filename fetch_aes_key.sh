@@ -23,6 +23,11 @@ if ! [[ "$KEY" =~ ^[0-9a-fA-F]{32}$ ]]; then
 fi
 
 touch ~/.dimos.env && chmod 600 ~/.dimos.env
-sed -i '/^UNITREE_AES_128_KEY=/d' ~/.dimos.env
+# Remove existing key line (compatible with both macOS BSD sed and Linux GNU sed)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+  sed -i '' '/^UNITREE_AES_128_KEY=/d' ~/.dimos.env
+else
+  sed -i '/^UNITREE_AES_128_KEY=/d' ~/.dimos.env
+fi
 echo "UNITREE_AES_128_KEY=$KEY" >> ~/.dimos.env
-echo "Saved to ~/.dimos.env. Now switch to the dog's Wi-Fi and run dimos-go2.bat."
+echo "Saved to ~/.dimos.env. Now switch to the dog's Wi-Fi and run ./run_go2.sh or ./run_dimos.sh"
