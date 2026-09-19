@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
 import queue
 import sys
@@ -87,6 +88,17 @@ OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
 LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
 WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
+BOX_BEAT = 1.2            # seconds per side of the box-step square
+BOX_SPEED = 0.6           # box-step speed as a fraction of --linear (0.6 x 0.4 m/s = ~0.3 m per side)
+
+
+def box_step_cmd(t: float, speed: float) -> tuple[float, float, float]:
+    """Velocity (vx, vy, vyaw) for the box step, t seconds after it began: forward, right, back, left, repeat.
+    Each side eases in and out (sin) so the dog steps rather than lurches; the four sides cancel out."""
+    beat, frac = divmod(max(t, 0.0) / BOX_BEAT, 1.0)
+    v = speed * (math.pi / 2) * math.sin(math.pi * frac)
+    return [(v, 0.0, 0.0), (0.0, -v, 0.0), (-v, 0.0, 0.0), (0.0, v, 0.0)][int(beat) % 4]
+
 # EDIT FREELY. Timed lists of the sport commands above; each step waits that command's busy time.
 ROUTINES = {"greeting": ["StandUp", "BalanceStand", "Hello", "Content", "WiggleHips", "Sit"]}
 # Deliberately absent: flips, handstand, bound. They can hurt the robot and most aren't supported on an Air.
@@ -333,6 +345,8 @@ class App:
         self.ear = "off"                    # "off" | "on" | "error"
         self.upright = False
         self.box_step = False               # True from "box step" until "stop"
+        self.box_dancing = False            # True once it is standing: the box-step square runs while the music loads/plays
+        self.box_t0 = None                  # when the current box-step square started
         self.music = None
         self.ambient_log: list = []         # (text, verdict) - self-test
 
@@ -731,6 +745,7 @@ class App:
         if not self.upright:
             return
         self.upright, self.armed = False, False
+        self.box_step = self.box_dancing = False           # coming down ends a box-step session
         self.voice_move, self.desired = None, (0.0, 0.0, 0.0)
         self.busy_until = time.time() + 5.0
         self.say("> coming down to four legs" + (f" ({why})" if why else ""), WARN)
@@ -751,37 +766,45 @@ class App:
     def start_box_step(self) -> None:
         if self.robot is None:
             self.say("not connected yet", WARN)
-        elif self.upright:
-            self.say("come down to four legs first (U / say 'come down'), then box step", WARN)
         elif self.box_step:
             self.say("box step is already running (say 'stop' to end it)")
-        else:
-            self.stop_follow("box step")
-            self.voice_move, self.pending = None, None
-            self.box_step = True
-            self.say("> box step: standing up, then the music. It stays standing until you say 'stop'.", GOOD)
-            self.pool.submit(self._box_step_work)
+        elif self.upright:
+            self._begin_box_step()                       # already up on the back legs: no second confirmation
+        else:                                            # the back-leg stand can fall, so it asks first (same as U)
+            self.pending = ("BOX STEP on the BACK LEGS (it can fall: soft floor, clear space, spotter)", self._begin_box_step,
+                            time.time() + CONFIRM_SECS)
+            self.say("box step stands on the back legs: say 'yes' or press Y within 4 s", WARN)
+
+    def _begin_box_step(self) -> None:
+        self.stop_follow("box step")
+        self.voice_move, self.pending = None, None
+        self.box_step, self.box_dancing, self.box_t0 = True, False, None
+        self.say("> box step: up on the back legs, then it steps in a square to the music. Say 'stop' to end it.", GOOD)
+        self.pool.submit(self._box_step_work)
 
     def _box_step_work(self) -> None:
         wait = self.args.box_wait
         try:
-            self.armed = False
-            self.busy_until = time.time() + wait + 1.5
-            self.send("StandUp")
-            time.sleep(wait)
-            if not self.box_step:                        # 'stop' arrived while it was getting up
-                return
-            self.send("BalanceStand")
-            self.armed = True
-            time.sleep(min(1.0, wait))
-            if not self.box_step:
-                return
+            if not self.upright:
+                self.armed = False
+                self.busy_until = time.time() + wait + 1.5
+                self.send("StandUp")
+                time.sleep(wait)
+                if not self.box_step:                    # 'stop' arrived while it was getting up
+                    return
+                self.send("BalanceStand")
+                self.armed = True
+                time.sleep(min(1.0, wait))
+                if not self.box_step:
+                    return
+                self.start_upright()                     # onto the back legs; the dance waits out its 5 s busy time
+            self.box_dancing = True                      # start stepping now; the (first-time) upload can take a while
             if self.music is None:
-                self.say("music isn't available, so it just stands", WARN)
+                self.say("music isn't available, so it just steps", WARN)
                 return
             msg = self.music.play("box step", default_ok=True, loop=True)
             if self.box_step:
-                self.say(f"> {msg}. Standing until you say 'stop'.", GOOD)
+                self.say(f"> {msg}. Stepping until you say 'stop'.", GOOD)
             else:                                        # 'stop' landed during the (possibly long) first-time upload
                 self._quiet_music()
         except Exception as e:  # noqa: BLE001 - MusicError or a dropped connection: say so, stay standing
@@ -833,7 +856,7 @@ class App:
             self.say(f"not while standing on the back legs: come down first (U / say 'come down'), then {label}", WARN)
             return
         self.voice_move = None
-        self.box_step = False    # a pose/trick you asked for beats an unfinished box-step standing sequence
+        self.box_step = self.box_dancing = False    # a pose/trick you asked for beats an unfinished box-step sequence
         self.stop_follow(f"{label} pressed")
         self.say(f"> {label}")
         self.busy_until = time.time() + wait
@@ -873,8 +896,10 @@ class App:
         self.say("STOP", BAD)
         self.pool.submit(self.send, "StopMove")
         was_box, self.box_step = self.box_step, False        # 'stop' ends a box-step session: music off, dog stays standing
-        if self.music is not None and (was_box or getattr(self.music, "playing", None)):
-            self.pool.submit(self._quiet_music)
+        self.box_dancing, self.box_t0 = False, None
+        if self.music is not None:                           # 'stop' also stops the music (even one still uploading)
+            if self.music.cancel() or was_box:
+                self.pool.submit(self._quiet_music)
 
     def on_key(self, key: int) -> None:
         now = time.time()
@@ -969,6 +994,14 @@ class App:
                 else:
                     self.desired = res[1].cmd
                 return
+        if self.box_step and self.box_dancing and self.upright and not manual:
+            if not self.ensure_ready(now):
+                self.desired = (0.0, 0.0, 0.0)
+                return
+            if self.box_t0 is None:
+                self.box_t0 = now
+            self.desired = box_step_cmd(now - self.box_t0, self.args.linear * BOX_SPEED)
+            return
         if not manual or not self.ensure_ready(now):
             self.desired = (0.0, 0.0, 0.0)
             return
@@ -1065,7 +1098,8 @@ class App:
             banner = (f"{self.pending[0]}: press Y or say 'yes' ({self.pending[2] - now:.0f}s)", WARN)
         elif self.box_step:
             playing = getattr(self.music, "playing", None)
-            banner = ("BOX STEP: " + (f"playing '{playing[:22]}', standing" if playing else "standing up, getting the music ready")
+            what = "standing up" if not self.box_dancing else "stepping"
+            banner = ("BOX STEP: " + (f"playing '{playing[:22]}', {what}" if playing else f"{what}, getting the music ready")
                       + "     say 'stop' to end it", GOOD)
         elif self.voice_move:
             vm = self.voice_move
@@ -1179,8 +1213,8 @@ class App:
                         listen: bool = False):
         K = pygame
         if listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
-            steps = [(14.8, K.KEYDOWN, K.K_ESCAPE)]
-            shot_at = 11.0
+            steps = [(19.3, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 15.0
         elif voicemove:  # six push-to-talk presses, one per canned transcript; 'stop' lands mid-step
             steps = []
             for t in (0.5, 2.6, 3.6, 4.7, 6.6, 7.2):
@@ -1303,8 +1337,8 @@ def _selftest_voice_verdict(app: "App") -> int:
 LISTEN_TEST = [  # (seconds, what the always-on mic "heard")
     (0.5, "hello everyone how are you doing today"), (0.9, "sit down"), (1.3, "Ernest sit down"), (2.0, "Ernest"), (2.5, "wave"),
     (3.2, "wave"), (3.6, "Ernest, ready to dance"), (4.2, "Ernest stand on your back legs"), (4.6, "we should get lunch"),
-    (5.0, "yes"), (7.2, "Ernest sit down"), (7.8, "Ernest come down"), (9.0, "Ernest box step"), (11.5, "Ernest volume 50 percent"),
-    (12.0, "what songs do you have"), (12.4, "Ernest what songs do you have"), (13.0, "stop"),
+    (5.0, "yes"), (7.2, "Ernest sit down"), (7.8, "Ernest come down"), (9.0, "Ernest box step"), (9.6, "yes"), (16.0, "Ernest volume 50 percent"),
+    (16.5, "what songs do you have"), (16.9, "Ernest what songs do you have"), (17.5, "stop"),
 ]
 
 
@@ -1332,24 +1366,27 @@ def _selftest_listen_verdict(app: "App") -> int:
     checks = {
         "conversation and bare commands without the wake word were ignored, in order":
             acts == ["ignore", "ignore", "command", "wake", "command", "ignore", "command", "command", "ignore", "confirm", "command",
-                     "command", "command", "command", "ignore", "command", "stop"],
+                     "command", "command", "confirm", "command", "ignore", "command", "stop"],
         "sport commands: Sit, Hello (wake window), StandUp ('ready to dance'), BalanceStand (back-leg prep), "
-        "then box step = StandUp + BalanceStand, and finally StopMove; nothing lay it down":
+        "then box step (after a spoken 'yes') = StandUp + BalanceStand, and finally StopMove; nothing lay it down":
             sports == ["Sit", "Hello", "StandUp", "BalanceStand", "StandUp", "BalanceStand", "StopMove"],
-        "'box step' stood the dog up and balanced it BEFORE any music was uploaded or played":
-            log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][0:2] == [("sport", "StandUp"), ("sport", "BalanceStand")]
-            and log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][2][0] == "audio",
-        "back legs: asked, confirmed by a spoken 'yes', went up (api 1050 True), later came down (api 1050 False)":
-            api == [(1050, {"data": True}), (1050, {"data": False})],
+        "'box step' stood the dog up, balanced it, and put it on the back legs BEFORE any music was uploaded or played":
+            log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][0:3]
+            == [("sport", "StandUp"), ("sport", "BalanceStand"), ("api", 1050, {"data": True})]
+            and log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][3][0] == "audio",
+        "back legs: asked, confirmed by a spoken 'yes', went up (api 1050 True), came down on 'come down', and box step went up again":
+            api == [(1050, {"data": True}), (1050, {"data": False}), (1050, {"data": True})],
         "'sit down' while up on two legs was blocked (Sit only once)": sports.count("Sit") == 1,
-        "'box step' uploaded the song, set volume level 2 (20%), set it to LOOP, and played it":
-            audio[:4] == [("audiohub", 2001, "box step", audio[0][3]), ("vui", 1003, '{"volume": 2}'),
+        "'box step' uploaded the song, set volume level 4 (40%), set it to LOOP, and played it":
+            audio[:4] == [("audiohub", 2001, "box step", audio[0][3]), ("vui", 1003, '{"volume": 4}'),
                           ("audiohub", 1007, '{"play_mode": "single_cycle"}'), ("audiohub", 1002, '{"unique_id": "uid-boxstep"}')],
         "'volume 50 percent' -> level 5, then the bare 'stop' paused the music (and stopped the dog once)":
             audio[4:] == [("vui", 1003, '{"volume": 5}'), ("audiohub", 1003, "{}")] and sports.count("StopMove") == 1,
         "the dog was never told to sit or lie down (stayed standing until 'stop')": "Sit" not in sports[2:] and "StandDown" not in sports,
-        "the box-step session ended on 'stop'; ended on four legs with nothing pending":
-            not app.box_step and not app.upright and app.pending is None,
+        "the box-step session ended on 'stop' (no more dancing); nothing pending; it stays up until 'come down'":
+            not app.box_step and not app.box_dancing and app.upright and app.pending is None,
+        "box step actually moved the dog (forward/back and side-to-side velocity commands while upright)":
+            len({(e[1], e[2]) for e in log if e[0] == "move" and (e[1] or e[2])}) >= 2,
     }
     print("\nSELFTEST-LISTEN ambient:", app.ambient_log)
     print("SELFTEST-LISTEN sports:", sports, " api:", api)
@@ -1448,7 +1485,7 @@ def main() -> int:
     p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
     p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "1050")),
                    help="Unitree WalkUpright id: 1050 (older numbering, what DimOS uses) or 2050 (newer); try the other if nothing happens")
-    p.add_argument("--music-volume", type=int, default=20, help="dog speaker volume for songs, percent (default 20)")
+    p.add_argument("--music-volume", type=int, default=40, help="dog speaker volume for songs, percent (default 40)")
     p.add_argument("--music-dir", default=(music_mod.MUSIC_DIR if music_mod else os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")),
                    help="folder of songs (wav/mp3/...) to play through the dog")
     p.add_argument("--no-music-preload", action="store_true", help="don't upload songs to the dog at startup")

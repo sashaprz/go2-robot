@@ -7,7 +7,7 @@ How it works (Unitree's audio hub, over the same WebRTC data channel as everythi
   * play / pause / resume use the audio hub; volume uses the VUI service (api 1003).
 
 Untested on a real dog: whether an Air has a working speaker, and the exact volume scale (assumed 0-10 like the
-LED brightness, so 20% = level 2). The chunked-upload format follows unitree_webrtc_connect's own uploader.
+LED brightness, so 40% = level 4). The chunked-upload format follows unitree_webrtc_connect's own uploader.
 """
 from __future__ import annotations
 
@@ -136,12 +136,20 @@ def reply_ok(response) -> bool:
 class MusicController:
     """`request(topic, api_id, parameter_json, timeout)` sends one request to the dog and returns its reply."""
 
-    def __init__(self, request, say=print, volume_pct: int = 20, folder: str = MUSIC_DIR):
+    def __init__(self, request, say=print, volume_pct: int = 40, folder: str = MUSIC_DIR):
         self.request, self.say, self.folder = request, say, folder
         self.volume_pct = max(0, min(100, int(volume_pct)))
         self._remote: dict[str, str] = {}
         self._lock = threading.Lock()
         self.playing: str | None = None
+        self._gen = 0              # bumped by cancel(): a play() that was still uploading when 'stop' came must not start
+        self._starting = False     # True while play() is uploading / starting a song
+
+    def cancel(self) -> bool:
+        """'stop' pressed: True if music was playing or on its way; a play() still uploading will now not start."""
+        active = self.playing is not None or self._starting
+        self._gen += 1
+        return active
 
     # -- volume -----------------------------------------------------------------------------------------
     @staticmethod
@@ -222,7 +230,16 @@ class MusicController:
     def play(self, query: str = "", default_ok: bool = False, loop: bool = False) -> str:
         """Play a song. loop=True repeats it until pause() (used by 'box step': music runs until you say stop)."""
         f = self.choose(query, default_ok)
-        uid = self.ensure_uploaded(f)
+        gen, self._starting = self._gen, True
+        try:
+            uid = self.ensure_uploaded(f)
+            if gen != self._gen:                                   # 'stop' arrived during the upload: keep the file, don't play
+                return "stopped before it started playing"
+            return self._start(f, uid, loop)
+        finally:
+            self._starting = False
+
+    def _start(self, f: str, uid: str, loop: bool) -> str:
         self.set_volume()                                          # always start at the configured volume
         mode = "single_cycle" if loop else "no_cycle"
         self.request(TOPIC_AUDIO, API_MODE, json.dumps({"play_mode": mode}), 8)

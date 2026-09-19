@@ -104,24 +104,27 @@ The window shows what it heard and how it was handled ("ignored: no wake word", 
 | "walk forward", "go back", "turn left/right", "turn around", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "turn right 45 degrees", "a little" (half), "a lot" (double). Capped at 5 s walking / 8 s turning. |
 | "follow me", "stop following" | person-follow (starts straight away; keyboard `T` still asks for `Y`) |
 | "stand on your back legs" -> "yes" | back-leg stand (asks for a spoken "yes" or Y). "come down" / "four legs" returns |
-| "box step" | **stand up, then play the song, and stay standing until you say "stop"** (see below) |
+| "box step" | **stand up on the back legs (asks "yes" first), step in a square while the song plays, until you say "stop"** (see below) |
 | "play music", "play <song name>", "pause the music", "resume the music" | music |
 | "louder", "quieter", "volume 30 percent" | music volume |
 | "what songs do you have" | lists the songs |
-| **"stop"** | emergency stop: halts the dog, **stops the music, ends box step**. The dog stays standing. |
+| **"stop"** | emergency stop: halts the dog, **stops the music (even one still uploading), ends box step**. It stays on its back legs until "come down". |
 
 "stop the music" only pauses the music (it doesn't halt the dog). "go ahead" is deliberately *not* a walk command.
 
 ## Box step and music
 
-Saying **"box step"** does this, in order: **StandUp -> BalanceStand -> play the song (looping) at the music volume**. The
-dog stays standing (nothing tells it to sit or lie down) and the song keeps looping **until you say "stop"** (or press
-Space). Saying a pose or trick yourself ends the standing sequence.
+Saying **"box step"** asks for a spoken **"yes"** (or Y) within 4 s, because it goes onto the **back legs** and can fall
+(soft floor, clear space, spotter). Then, in order: **StandUp -> BalanceStand -> back-leg stand -> the dog steps in a box
+(forward, right, back, left, ~0.3 m per side, 1.2 s each) while the song loops at the music volume**. It starts stepping
+as soon as it's up, even if the song is still uploading. It keeps going **until you say "stop"** (or press Space), which
+also stops the music; it then stays up on its back legs until "come down" / U. Saying a pose or trick yourself ends the
+sequence. *Whether the dog accepts walk commands while on its back legs is untested.*
 
 - **Songs live in `music/`** (wav/mp3/m4a/ogg/flac). "box step" plays a song named "box step" if you have one, otherwise the
   **first song** alphabetically. The repo currently has one: *Justin Bieber - Baby (Lyrics).mp3*. That is copyrighted
   music in a **private** repo: remove it before making the repo public.
-- **Volume:** default **20%** (`--music-volume 20`). It is sent to the dog as level 2 of 10. *The 0-10 scale is an
+- **Volume:** default **40%** (`--music-volume 40`). It is sent to the dog as level 4 of 10. *The 0-10 scale is an
   assumption* (same as the LED brightness setting); listen and adjust with "louder"/"quieter" or `--music-volume`.
 - **Upload once:** the dog plays files stored on itself. Each song is shrunk (mono, 22.05 kHz, **first 90 s only**,
   `GO2_MUSIC_MAX_SECONDS` to change), uploaded in ~4 KB blocks (**~1300 blocks for a 90 s song; upload time is
