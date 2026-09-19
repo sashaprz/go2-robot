@@ -88,6 +88,16 @@ OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
 LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
 WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
+
+
+def _reply_code(reply):
+    """The status code in a dog reply (0 = accepted), or None when there is no recognisable code (fake robot, odd shape)."""
+    try:
+        return int(reply["data"]["header"]["status"]["code"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 BOX_BEAT = 1.2            # seconds per side of the box-step square
 BOX_SPEED = 0.6           # box-step speed as a fraction of --linear (0.6 x 0.4 m/s = ~0.3 m per side)
 
@@ -147,7 +157,7 @@ class Robot:
         if param is not None:
             req["parameter"] = param
         coro = self.c.conn.datachannel.pub_sub.publish_request_new(self._topic["SPORT_MOD"], req)
-        asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
+        return asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
 
     def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
         """One request to the dog's audio hub / VUI service (used by music.py). Returns the dog's reply."""
@@ -197,6 +207,7 @@ class FakeRobot:
         self.log: list[tuple] = []
         self._halt = threading.Event()
         self.image = image
+        self.refuse: set[int] = set()       # sport api ids this fake dog answers with an error code (tests the fallbacks)
 
     def _add(self, entry: tuple) -> None:
         if not self.log or self.log[-1] != entry:  # collapse the 20 Hz repeats
@@ -205,8 +216,9 @@ class FakeRobot:
     def sport(self, name: str) -> None:
         self._add(("sport", name))
 
-    def sport_api(self, api_id: int, param=None) -> None:
+    def sport_api(self, api_id: int, param=None):
         self._add(("api", api_id, param))
+        return {"data": {"header": {"status": {"code": 7 if api_id in self.refuse else 0}}}}
 
     def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
         """A tiny fake audio hub: remembers uploaded songs, lists them, records everything else."""
@@ -344,6 +356,7 @@ class App:
         self.last_heard = None              # (time, text, routing verdict) for the status bar
         self.ear = "off"                    # "off" | "on" | "error"
         self.upright = False
+        self.upright_api = args.upright_api   # the back-leg command that worked last (or the one to try first)
         self.box_step = False               # True from "box step" until "stop"
         self.box_dancing = False            # True once it is standing: the box-step square runs while the music loads/plays
         self.box_t0 = None                  # when the current box-step square started
@@ -371,6 +384,8 @@ class App:
         try:
             if self.args.demo or self.is_selftest():
                 r = FakeRobot(self.demo_image)
+                if self.args.selftest_listen:
+                    r.refuse = {2050}                 # this fake dog only knows the older back-leg id: exercises the fallback
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
                 if not key:
@@ -756,7 +771,20 @@ class App:
             if on and not was_armed:
                 self.robot.sport("BalanceStand")          # start from a balanced stand
                 time.sleep(1.5)
-            self.robot.sport_api(self.args.upright_api, {"data": on})
+            order = [self.upright_api] + [a for a in (2050, 1050) if a != self.upright_api]
+            for api in (order if on else order[:1]):      # going up tries the other id if the dog refuses the first
+                try:
+                    code, err = _reply_code(self.robot.sport_api(api, {"data": on})), None
+                except Exception as e:  # noqa: BLE001
+                    code, err = None, e
+                ok = err is None and code in (0, None)
+                self.say(f"back-leg {'stand' if on else 'release'} (api {api}): "
+                         + (f"error {err}" if err else f"the dog replied code {code}") + ("" if ok else "  <- refused"),
+                         GOOD if ok else WARN)
+                if ok:
+                    self.upright_api = api
+                    return
+            raise RuntimeError("the dog refused every back-leg command (this model/firmware may not support it)")
         except Exception as e:  # noqa: BLE001
             self.say(f"back-leg stand {'on' if on else 'off'} failed: {e}", BAD)
             if on:
@@ -1374,8 +1402,8 @@ def _selftest_listen_verdict(app: "App") -> int:
             log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][0:3]
             == [("sport", "StandUp"), ("sport", "BalanceStand"), ("api", 1050, {"data": True})]
             and log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][3][0] == "audio",
-        "back legs: asked, confirmed by a spoken 'yes', went up (api 1050 True), came down on 'come down', and box step went up again":
-            api == [(1050, {"data": True}), (1050, {"data": False}), (1050, {"data": True})],
+        "back legs: 2050 was refused so it fell back to 1050 (up), came down with 1050, and box step went straight to 1050 again":
+            api == [(2050, {"data": True}), (1050, {"data": True}), (1050, {"data": False}), (1050, {"data": True})],
         "'sit down' while up on two legs was blocked (Sit only once)": sports.count("Sit") == 1,
         "'box step' uploaded the song, set volume level 4 (40%), set it to LOOP, and played it":
             audio[:4] == [("audiohub", 2001, "box step", audio[0][3]), ("vui", 1003, '{"volume": 4}'),
@@ -1483,8 +1511,8 @@ def main() -> int:
     p.add_argument("--wake-word", default=os.environ.get("GO2_WAKE_WORD", "ernest"),
                    help="always-listening wake word: say it first ('ernest, sit down'); a bare 'stop' works without it")
     p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
-    p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "1050")),
-                   help="Unitree WalkUpright id: 1050 (older numbering, what DimOS uses) or 2050 (newer); try the other if nothing happens")
+    p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "2050")),
+                   help="back-leg stand id tried first: 2050 BackStand (firmware 1.1.7+, the default) or 1050 (older); the other is the fallback")
     p.add_argument("--music-volume", type=int, default=40, help="dog speaker volume for songs, percent (default 40)")
     p.add_argument("--music-dir", default=(music_mod.MUSIC_DIR if music_mod else os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")),
                    help="folder of songs (wav/mp3/...) to play through the dog")

@@ -136,9 +136,9 @@ sequence. *Whether the dog accepts walk commands while on its back legs is untes
 
 ## Standing on the back legs
 
-Uses Unitree's `WalkUpright` command. The WebRTC library's older numbering calls it id **1050** (mislabelled "Standup";
-DimOS's own helper sends the same id), the newer SDK numbering is **2050**. The app tries **1050**; if nothing happens on
-your firmware run `go2.bat --upright-api 2050`. It **asks for confirmation**, refuses tricks/follow while up (come down
+Uses Unitree's back-leg stand. The WebRTC library lists it as **`BackStand` = 2050** (firmware 1.1.7+ numbering) and, in the
+older numbering, id **1050** (mislabelled "Standup"; DimOS's helper sends that one). The app tries **2050** first and falls back
+to **1050** if the dog refuses it (`--upright-api 1050` flips the order); the window prints the dog's reply to each attempt. It **asks for confirmation**, refuses tricks/follow while up (come down
 first), and **can fall**: use a soft floor, clear space, and a spotter. A steady two-legged balance isn't something the
 firmware exposes beyond this command. `Handstand` (front legs) is deliberately not included; neither are flips.
 
@@ -169,7 +169,8 @@ Detection only (no distance). It's a small model: expect missed small/far object
 - **"Voice model not downloaded"**: run `go2.bat --fetch-model` while online. **"Object/person detector not downloaded"**: same.
 - **Voice mishears / does nothing**: check the "heard:" line under the status bar. No wake word = ignored (by design). Hold `V` to
   bypass the wake word. Whisper transcription of room chatter can take 1-4 s.
-- **Back-leg stand does nothing**: try `--upright-api 2050`.
+- **Back-leg stand does nothing**: the window prints the dog's reply to each attempt (2050 BackStand first, then 1050). "Code 0" only
+  means the dog accepted the command; if it says "refused" for both, this model/firmware may not support it.
 
 ## Status and limits
 
