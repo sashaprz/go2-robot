@@ -7,7 +7,7 @@ The dog accepts ONE controller at a time: don't run this alongside dimos-go2.bat
 
   python go2.py                connect to the real dog
   python go2.py --demo         same window with a FAKE robot and synthetic video (no dog needed)
-  python go2.py --fetch-model  download the person detector (one time, needs internet), then exit
+  python go2.py --fetch-model  download the object detector + offline voice model (one time, needs internet)
   python go2.py --selftest / --selftest-follow   headless scripted tests (used during development)
 """
 from __future__ import annotations
@@ -52,6 +52,7 @@ SLOW = 0.5        # Ctrl multiplier
 CONTROL_HZ = 20   # velocity command rate (the connection also self-stops 0.2 s after the last command)
 CONFIRM_SECS = 4  # how long a dance/routine/follow waits for the confirm key
 FOLLOW_STALE = 0.7  # ignore a follow command older than this many seconds (detector stalled): stand still
+VOICE_TIMEOUT = 12  # give up on a transcription after this many seconds
 
 # key -> (label, sport command, seconds the dog is busy afterwards; driving is locked out meanwhile)
 TRICKS = {
@@ -272,6 +273,8 @@ class App:
         self.stt = None
         self.voice_state = ""       # "" | "listening" | "transcribing"
         self.voice_q: queue.Queue = queue.Queue()
+        self._voice_gen = 0                 # bumped per transcription so a timed-out one can be ignored
+        self._voice_deadline = 0.0
         self.heard_log: list = []           # (transcript, matched label) - used by the self-test
         self.follow_starts = 0              # how many times follow actually started - self-test
         # object detection overlay
@@ -435,12 +438,28 @@ class App:
         if voice_mod is None:
             self.say(f"voice.py couldn't be loaded: {_VOICE_ERR}", BAD)
             return False
-        key = os.environ.get("ELEVENLABS_API_KEY")
-        if not key:
-            self.say("No ELEVENLABS_API_KEY. Run set-elevenlabs-key.bat, then restart go2.bat", WARN)
+        if self.args.stt == "elevenlabs":
+            key = os.environ.get("ELEVENLABS_API_KEY")
+            if not key:
+                self.say("No ELEVENLABS_API_KEY. Run set-elevenlabs-key.bat, then restart go2.bat", WARN)
+                return False
+            self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.ElevenLabsSTT(key)
+            return True
+        if voice_mod.whisper_model_path(self.args.whisper_model) is None:
+            self.say("Voice model not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
             return False
-        self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.ElevenLabsSTT(key)
+        self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.LocalWhisperSTT(self.args.whisper_model)
         return True
+
+    def _prepare_voice(self) -> None:
+        """Load the local Whisper model in the background at startup so the first V press is quick."""
+        try:
+            if voice_mod is not None and self.args.stt == "local" and voice_mod.whisper_model_path(self.args.whisper_model):
+                if self.voice_ready():
+                    self.stt.load()
+                    self.say("voice model ready (offline Whisper)", GOOD)
+        except Exception as e:  # noqa: BLE001
+            self.say(f"voice model failed to load: {e}", BAD)
 
     def start_listening(self) -> None:
         if self.voice_state or not self.voice_ready():
@@ -461,7 +480,9 @@ class App:
             self.say("too short: hold V the whole time you speak", WARN)
             return
         self.voice_state = "transcribing"
-        threading.Thread(target=self._transcribe, args=(pcm,), daemon=True).start()
+        self._voice_gen += 1
+        self._voice_deadline = time.time() + VOICE_TIMEOUT
+        threading.Thread(target=self._transcribe, args=(pcm, self._voice_gen), daemon=True).start()
 
     def cancel_listening(self) -> None:
         if self.voice_state == "listening":
@@ -472,20 +493,27 @@ class App:
             self.voice_state = ""
             self.say("voice cancelled (window lost focus)", WARN)
 
-    def _transcribe(self, pcm: bytes) -> None:
+    def _transcribe(self, pcm: bytes, gen: int) -> None:
         try:
-            self.voice_q.put(("heard", self.stt.transcribe(pcm)))
+            self.voice_q.put(("heard", self.stt.transcribe(pcm), gen))
         except Exception as e:  # noqa: BLE001 - VoiceError or anything else: show it, never crash the window
-            self.voice_q.put(("error", str(e)))
+            self.voice_q.put(("error", str(e), gen))
         finally:
-            self.voice_state = ""
+            if gen == self._voice_gen:
+                self.voice_state = ""
 
     def drain_voice(self) -> None:
+        if self.voice_state == "transcribing" and time.time() > self._voice_deadline:
+            self._voice_gen += 1      # abandon the slow transcription; its late result will be ignored
+            self.voice_state = ""
+            self.say("voice: transcription timed out, try again", BAD)
         while True:
             try:
-                kind, payload = self.voice_q.get_nowait()
+                kind, payload, gen = self.voice_q.get_nowait()
             except queue.Empty:
                 return
+            if gen != self._voice_gen:
+                continue              # a result from a transcription that already timed out
             if kind == "error":
                 self.say(f"voice: {payload}", BAD)
             else:
@@ -721,7 +749,8 @@ class App:
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
             "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
-            "VOICE   hold V and talk: \"say hello\", \"dance two\", \"sit\", \"stretch\", \"follow me\" (then Y), \"stop\".  Needs internet.",
+            "VOICE   hold V and talk: \"say hello\", \"dance two\", \"sit\", \"stretch\", \"follow me\" (then Y), \"stop\".  "
+            + ("Offline (local Whisper)." if self.args.stt == "local" else "Needs internet (ElevenLabs)."),
             "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
@@ -736,6 +765,8 @@ class App:
         threading.Thread(target=self.connect_bg, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
         threading.Thread(target=self.vision_loop, daemon=True).start()
+        if not _SELFTEST:
+            threading.Thread(target=self._prepare_voice, daemon=True).start()
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
                                        objects=self.args.selftest_objects)
@@ -947,7 +978,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ip", default=os.environ.get("ROBOT_IP", "192.168.12.1"))
     p.add_argument("--demo", action="store_true", help="fake robot + synthetic video, no dog needed")
-    p.add_argument("--fetch-model", action="store_true", help="download the person detector (needs internet), then exit")
+    p.add_argument("--fetch-model", action="store_true", help="download the object detector and voice model (needs internet), then exit")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-voice", action="store_true", help=argparse.SUPPRESS)
@@ -955,15 +986,30 @@ def main() -> int:
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
     p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
+    p.add_argument("--stt", choices=["local", "elevenlabs"], default=os.environ.get("GO2_STT", "local"),
+                   help="speech-to-text for the V key: 'local' = offline Whisper (default), 'elevenlabs' = cloud (needs internet + key)")
+    p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "base.en"),
+                   help="local Whisper model (base.en is fast and accurate for short commands; small.en is slower)")
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
     args = p.parse_args()
-    if args.fetch_model:
+    if args.fetch_model:  # everything that needs the internet, done once, so the dog's Wi-Fi is enough afterwards
+        rc = 0
         if follow_mod is None:
             print(f"follow.py couldn't be loaded: {_FOLLOW_ERR}")
-            return 1
-        follow_mod.fetch_model()
-        return 0
+            rc = 1
+        elif follow_mod.model_present():
+            print("object/person detector: already downloaded")
+        else:
+            follow_mod.fetch_model()
+        if voice_mod is None:
+            print(f"voice.py couldn't be loaded: {_VOICE_ERR}")
+            rc = 1
+        elif voice_mod.whisper_model_path(args.whisper_model):
+            print(f"voice model '{args.whisper_model}': already downloaded")
+        else:
+            voice_mod.fetch_whisper_model(args.whisper_model)
+        return rc
     image = None
     if args.selftest_follow:
         image = _follow_test_canvas()

@@ -46,19 +46,22 @@ Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **cl
 
 ### Voice commands (hold `V`)
 
-Hold **V**, speak, release. The audio is sent to ElevenLabs speech-to-text **only while V is held**, and the transcript is
-matched to the same actions as the keys: "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up",
+Hold **V**, speak, release. Speech is transcribed **offline** by a local Whisper model (faster-whisper `base.en`, CPU), so
+it works on the dog's own Wi-Fi and your audio never leaves the PC. The transcript is matched to the same actions as the keys: "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up",
 "stretch", "wiggle your hips", "make a heart", "good boy", "recover", "greeting", and **"stop"** (emergency stop, always
 wins). "Follow me" only *offers* to follow: you still press **Y** to confirm, because that is autonomous walking.
 The window shows what it heard and what it matched.
 
-- **API key:** run `set-elevenlabs-key.bat` once (hidden prompt; saved to `~/.dimos.env` in WSL, never in the repo).
-  The key needs the speech-to-text permission. Model is `scribe_v2` (override with `ELEVENLABS_STT_MODEL`), language
-  `en` (`ELEVENLABS_STT_LANG`).
-- **Needs internet.** The dog's own Wi-Fi has none. Give the PC a second connection with internet while it is on the
-  dog's Wi-Fi (e.g. USB tethering from a phone) or put the dog on a shared network. Without it the window says
-  "can't reach ElevenLabs".
+- **One-time download (needs internet):** `go2.bat --fetch-model` fetches the object detector and the Whisper model
+  (~150 MB, cached in `~/.cache/`). After that no internet is needed.
+- **Measured on the dev PC (12-core ARM, CPU only):** `base.en` understood 32/32 spoken test commands (two synthetic
+  voices) in ~0.4 s each; silence and noise produced no commands. Not yet measured with real people's voices or a noisy
+  room. `small.en` (`--whisper-model small.en`) is slower (~1.5 s) with no gain on those clips.
+- **Optional cloud backend:** `go2.bat --stt elevenlabs` uses ElevenLabs speech-to-text instead (needs internet and an
+  API key: run `set-elevenlabs-key.bat` once; saved to `~/.dimos.env` in WSL, never in the repo). Untested against the
+  real API.
 - **Microphone:** captured through WSLg's PulseAudio (`libpulse-simple`); Windows must allow microphone access.
+  A transcription that takes over 12 s is abandoned with a message.
 
 ### Object detection (`O`)
 
@@ -130,8 +133,8 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 
 - `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks + follow window (recommended)
 - `follow.py`: object/person detector (YOLOX-tiny) and follow controller used by `go2.py`
-- `voice.py`: microphone capture, ElevenLabs speech-to-text client, and phrase matcher used by `go2.py`
-- `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`: save your ElevenLabs API key (hidden prompt)
+- `voice.py`: microphone capture, local Whisper (default) and ElevenLabs speech-to-text, and the phrase matcher used by `go2.py`
+- `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`: save an ElevenLabs API key (only for `--stt elevenlabs`; hidden prompt)
 - `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
 - `fetch-aes-key.bat` / `fetch_aes_key.sh`: fetch and save the AES key
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete**: it uses a library without

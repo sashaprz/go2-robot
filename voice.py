@@ -1,11 +1,13 @@
 """Push-to-talk voice commands for go2.py.
 
-Microphone (WSLg PulseAudio, via libpulse-simple: no apt packages needed) -> ElevenLabs speech-to-text ->
-phrase matcher -> an Intent that go2.py turns into the same actions the keys trigger.
+Microphone (WSLg PulseAudio, via libpulse-simple: no apt packages needed) -> speech-to-text -> phrase matcher ->
+an Intent that go2.py turns into the same actions the keys trigger.
 
-Audio only leaves the machine while the push-to-talk key is held. The API key lives in ~/.dimos.env as
-ELEVENLABS_API_KEY (see set-elevenlabs-key.bat). It is never stored in the repo.
-Needs INTERNET: the dog's own Wi-Fi has none, so use a second connection (see README).
+Two speech-to-text backends:
+  * LocalWhisperSTT (default): faster-whisper on CPU. Fully offline, so it works on the dog's own Wi-Fi. Audio never
+    leaves the machine. Fetch the model once while online: go2.bat --fetch-model
+  * ElevenLabsSTT (--stt elevenlabs): cloud; needs internet and ELEVENLABS_API_KEY in ~/.dimos.env
+    (see set-elevenlabs-key.bat). Audio is sent only while the push-to-talk key is held.
 """
 from __future__ import annotations
 
@@ -146,6 +148,66 @@ class ElevenLabsSTT:
         if "transcripts" in j:                          # multichannel shape
             return " ".join(t.get("text", "") for t in j["transcripts"]).strip()
         return (j.get("text") or "").strip()
+
+
+# ---- local Whisper speech-to-text (offline) ---------------------------------------------------------------
+WHISPER_MODEL = os.environ.get("GO2_WHISPER_MODEL", "base.en")   # measured: 32/32 commands, ~0.4 s per clip on CPU
+
+
+def whisper_model_path(name: str = WHISPER_MODEL) -> str | None:
+    """Folder of the cached model, or None if it hasn't been downloaded (never touches the network)."""
+    try:
+        from faster_whisper.utils import download_model
+
+        return download_model(name, local_files_only=True)
+    except Exception:  # noqa: BLE001 - not cached / faster-whisper missing
+        return None
+
+
+def fetch_whisper_model(name: str = WHISPER_MODEL) -> str:
+    """Download the model into the Hugging Face cache. Needs internet, once."""
+    from faster_whisper.utils import download_model
+
+    print(f"Downloading the Whisper '{name}' speech model ...", flush=True)
+    path = download_model(name)
+    print(f"done: {path}", flush=True)
+    return path
+
+
+class LocalWhisperSTT:
+    """faster-whisper on CPU. Loads lazily (or call load() early); transcribe() never touches the network.
+
+    Tuned for short push-to-talk commands: greedy decoding, a single temperature (no fallback re-decodes, which
+    can take 20+ s on noise), no vocabulary prompt (measured to make noise slower, not the results better).
+    """
+
+    def __init__(self, model_name: str = WHISPER_MODEL):
+        self.model_name = model_name
+        self._model = None
+        self._lock = threading.Lock()
+
+    def load(self) -> None:
+        with self._lock:
+            if self._model is not None:
+                return
+            path = whisper_model_path(self.model_name)
+            if path is None:
+                raise VoiceError("Voice model not downloaded. While ONLINE run: go2.bat --fetch-model")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as e:
+                raise VoiceError(f"faster-whisper isn't installed: {e}") from e
+            self._model = WhisperModel(path, device="cpu", compute_type="int8", cpu_threads=max(1, min(8, os.cpu_count() or 4)))
+
+    def transcribe(self, pcm: bytes) -> str:
+        import numpy as np
+
+        self.load()
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        segments, _ = self._model.transcribe(audio, language="en", beam_size=1, temperature=0.0,
+                                             condition_on_previous_text=False, vad_filter=False)
+        return " ".join(s.text for s in segments).strip()
 
 
 # ---- phrase matcher ---------------------------------------------------------------------------------------
