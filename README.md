@@ -35,11 +35,14 @@ running inside WSL2 (Ubuntu 24.04).
 | Key | Action |
 |---|---|
 | W / S | forward / back |
-| A / D | strafe left / right |
-| Y / H | turn (yaw) |
+| Q / E | strafe left / right |
+| A / D | turn left / right |
+| Space | emergency stop (zero velocity) |
+| Shift / Ctrl (held) | boost x2 / slow x0.5 |
 | Esc | quit |
 
-(The keyboard module is shared with arm teleop, so Q/E/R/F/T/G do nothing useful on the dog.)
+Default speed is 0.5 m/s forward and 0.8 rad/s turning (Shift doubles it), so keep the area clear.
+The window shows the live twist being sent, which helps tell "keys not registering" from "dog not responding".
 
 Other blueprints: `dimos-go2.bat <blueprint> [robot-ip]`
 
@@ -57,8 +60,8 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 - **`AesKeyRequiredError`**: the AES key is missing or not being loaded. See setup step 2.
 - **`Robot at 192.168.12.1 is not exposing a signaling port`**: the PC isn't on the dog's Wi-Fi, or the dog is off. Windows may
   hop back to a saved network with internet; re-select the dog's Wi-Fi.
-- **Nothing moves / WASD ignored**: you're on `unitree-go2-basic` (no control), or the pygame window doesn't have focus.
-  The default speed is very low (about 5 cm/s), so motion can be subtle.
+- **Nothing moves / keys ignored**: you're on `unitree-go2-basic` (view-only, no control), or the pygame window doesn't have focus.
+  Also check no other DimOS run is still holding the dog's connection (`dimos status` / `dimos stop` in WSL); only one client can connect.
 - **Ping works but WebRTC still fails**: WSL2 NAT can break WebRTC. Try mirrored networking
   (`networkingMode=mirrored` under `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`).
 

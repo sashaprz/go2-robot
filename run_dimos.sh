@@ -20,6 +20,12 @@ fi
 cd ~/dimensional-applications || { echo "DimOS install not found"; exit 1; }
 source .venv/bin/activate
 
+# The dog accepts one controller at a time: stop any DimOS run left over from earlier.
+if dimos status 2>&1 | grep -q "Run ID"; then
+  echo "Stopping a previous DimOS run that is still active ..."
+  dimos stop || true
+fi
+
 # Optional API keys (e.g. OPENAI_API_KEY=...) for the agentic blueprints live here, not in this script.
 if [ -f ~/.dimos.env ]; then set -a; . ~/.dimos.env; set +a; fi
 
