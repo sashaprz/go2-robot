@@ -1,0 +1,10 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+wheel_tmp/
+
+# Secrets - the Go2 AES key and any API keys must NEVER be committed
+.env
+*.env
+.dimos.env
