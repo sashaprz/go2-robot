@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Go2 all-in-one: live camera (FPV) + keyboard driving + poses/tricks in ONE window.
+"""Go2 all-in-one: live camera (FPV) + keyboard driving + poses/tricks + person-follow in ONE window.
 
 Run via go2.bat (after joining the dog's Wi-Fi). Needs no internet. The window must have keyboard focus.
 Reuses DimOS's own connection class, so the per-device AES key works exactly like dimos-go2.bat.
 The dog accepts ONE controller at a time: don't run this alongside dimos-go2.bat / the phone app.
 
-  python go2.py            connect to the real dog
-  python go2.py --demo     same window with a FAKE robot and synthetic video (no dog needed)
-  python go2.py --selftest headless scripted test of the key logic (used during development)
+  python go2.py                connect to the real dog
+  python go2.py --demo         same window with a FAKE robot and synthetic video (no dog needed)
+  python go2.py --fetch-model  download the person detector (one time, needs internet), then exit
+  python go2.py --selftest / --selftest-follow   headless scripted tests (used during development)
 """
 from __future__ import annotations
 
@@ -20,7 +21,8 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-if "--selftest" in sys.argv:
+_SELFTEST = any(a.startswith("--selftest") for a in sys.argv)
+if _SELFTEST:
     os.environ["SDL_VIDEODRIVER"] = "dummy"
 elif sys.platform.startswith("linux"):
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")  # WSLg; same driver DimOS's keyboard window forces
@@ -29,13 +31,20 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import numpy as np
 import pygame
 
+try:
+    import follow as follow_mod  # person detector + follow controller (follow.py, next to this file)
+except Exception as _e:  # noqa: BLE001 - go2.py must still run without it
+    follow_mod = None
+    _FOLLOW_ERR = str(_e)
+
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
 ANGULAR = 0.8     # rad/s turning
 BOOST = 1.5       # Shift multiplier
 SLOW = 0.5        # Ctrl multiplier
 CONTROL_HZ = 20   # velocity command rate (the connection also self-stops 0.2 s after the last command)
-CONFIRM_SECS = 4  # how long a dance/routine waits for the confirm key
+CONFIRM_SECS = 4  # how long a dance/routine/follow waits for the confirm key
+FOLLOW_STALE = 0.7  # ignore a follow command older than this many seconds (detector stalled): stand still
 
 # key -> (label, sport command, seconds the dog is busy afterwards; driving is locked out meanwhile)
 TRICKS = {
@@ -57,11 +66,12 @@ CONFIRM_TRICKS = {
     pygame.K_m: ("Dance 2", "Dance2", 20.0),
 }
 ROUTINE_KEY = pygame.K_r
+FOLLOW_KEY = pygame.K_t
 # EDIT FREELY. Timed lists of the sport commands above; each step waits that command's busy time.
 ROUTINES = {"greeting": ["StandUp", "BalanceStand", "Hello", "Content", "WiggleHips", "Sit"]}
 # Deliberately absent: flips, handstand, bound. They can hurt the robot and most aren't supported on an Air.
 
-WIN_W, WIN_H = 1024, 680
+WIN_W, WIN_H = 1024, 712
 VIDEO_H = 576
 BG = (18, 20, 24)
 TXT = (225, 228, 232)
@@ -136,11 +146,12 @@ class Robot:
 
 
 class FakeRobot:
-    """No dog: records commands and streams synthetic video (for --demo and --selftest)."""
+    """No dog: records commands and streams synthetic (or a supplied still) video, for --demo and selftests."""
 
-    def __init__(self):
+    def __init__(self, image: np.ndarray | None = None):
         self.log: list[tuple] = []
         self._halt = threading.Event()
+        self.image = image
 
     def _add(self, entry: tuple) -> None:
         if not self.log or self.log[-1] != entry:  # collapse the 20 Hz repeats
@@ -163,9 +174,12 @@ class FakeRobot:
             base[..., 2] = np.clip(base[..., 2].astype(int) + 40, 0, 255).astype(np.uint8)
             t0 = time.time()
             while not self._halt.is_set():
-                f = base.copy()
-                x = int(((time.time() - t0) * 200) % (w - 200))
-                f[300:420, x : x + 200] = (255, 190, 60)
+                if self.image is not None:
+                    f = self.image
+                else:
+                    f = base.copy()
+                    x = int(((time.time() - t0) * 200) % (w - 200))
+                    f[300:420, x : x + 200] = (255, 190, 60)
                 cb(f)
                 time.sleep(1 / 15)
 
@@ -180,8 +194,9 @@ class FakeRobot:
 
 # ---- the app ----------------------------------------------------------------------------------------------
 class App:
-    def __init__(self, args):
+    def __init__(self, args, demo_image=None):
         self.args = args
+        self.demo_image = demo_image
         self.robot = None
         self.state = "connecting ..."
         self.state_color = WARN
@@ -198,12 +213,21 @@ class App:
         self.frame_lock = threading.Lock()
         self.latest = None
         self.frame_new = False
+        self.frame_seq = 0
         self.frame_times: deque = deque(maxlen=40)
         self.last_frame_at = 0.0
         self.battery = None
         self._fonts: dict = {}
         self._scaled = None
+        self._xf = (0, 0, 1.0)      # (x offset, y offset, scale) from frame pixels to window pixels
         self.running = True
+        # person-follow
+        self.following = False
+        self.follower = None
+        self.detector = None
+        self._detector_loading = False
+        self.follow_res = None      # (timestamp, FollowResult, frame_shape)
+        self._log_len_after_stop = None  # selftest bookkeeping
 
     # -- feedback ---------------------------------------------------------------------------------------
     def say(self, text: str, color=TXT) -> None:
@@ -221,8 +245,8 @@ class App:
     # -- robot plumbing ---------------------------------------------------------------------------------
     def connect_bg(self) -> None:
         try:
-            if self.args.demo or self.args.selftest:
-                r = FakeRobot()
+            if self.args.demo or self.args.selftest or self.args.selftest_follow:
+                r = FakeRobot(self.demo_image)
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
                 if not key:
@@ -242,6 +266,7 @@ class App:
         with self.frame_lock:
             self.latest = arr
             self.frame_new = True
+            self.frame_seq += 1
         now = time.time()
         self.last_frame_at = now
         self.frame_times.append(now)
@@ -273,8 +298,65 @@ class App:
             self.say(f"{name} failed: {e}", BAD)
             return False
 
+    # -- person following -------------------------------------------------------------------------------
+    def follow_available(self) -> bool:
+        if follow_mod is None:
+            self.say(f"follow.py couldn't be loaded: {_FOLLOW_ERR}", BAD)
+            return False
+        if not follow_mod.model_present():
+            self.say("Person detector not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
+            return False
+        return True
+
+    def _load_detector(self) -> None:
+        try:
+            self.detector = follow_mod.PersonDetector()
+        except Exception as e:  # noqa: BLE001
+            self.say(f"detector failed to load: {e}", BAD)
+            self.stop_follow("detector unavailable")
+        finally:
+            self._detector_loading = False
+
+    def start_follow(self) -> None:
+        cfg = follow_mod.FollowConfig(max_forward=self.args.follow_speed)
+        self.follower = follow_mod.Follower(cfg)
+        self.follower.reset()
+        self.follow_res = None
+        self.following = True
+        self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
+        if self.detector is None and not self._detector_loading:
+            self._detector_loading = True
+            threading.Thread(target=self._load_detector, daemon=True).start()
+
+    def stop_follow(self, reason: str) -> None:
+        if not self.following:
+            return
+        self.following = False
+        self.follow_res = None
+        self.desired = (0.0, 0.0, 0.0)
+        self.say(f"follow stopped: {reason}", WARN)
+
+    def follow_loop(self) -> None:
+        last_seq = -1
+        while not self.stop_evt.is_set():
+            det = self.detector
+            if not self.following or det is None or self.latest is None or self.frame_seq == last_seq:
+                time.sleep(0.03)
+                continue
+            with self.frame_lock:
+                frame, last_seq = self.latest, self.frame_seq
+            try:
+                res = self.follower.step(det.detect(frame), frame.shape)
+            except Exception as e:  # noqa: BLE001
+                self.stop_follow(f"detector error: {e}")
+                continue
+            self.follow_res = (time.time(), res, frame.shape)
+            if res.lost:
+                self.stop_follow(res.status)
+
     # -- actions ----------------------------------------------------------------------------------------
     def run_trick(self, label: str, name: str, wait: float) -> None:
+        self.stop_follow(f"{label} pressed")
         self.say(f"> {label}")
         self.busy_until = time.time() + wait
         self.armed = name == "BalanceStand"  # after any other pose/trick, re-balance before driving
@@ -282,6 +364,7 @@ class App:
 
     def run_routine(self, rname: str) -> None:
         self.abort.clear()
+        self.stop_follow("routine started")
 
         def work():
             for step in ROUTINES[rname]:
@@ -304,6 +387,7 @@ class App:
         self.pending = None
         self.busy_until = 0.0
         self.desired = (0.0, 0.0, 0.0)
+        self.stop_follow("SPACE")
         self.say("STOP", BAD)
         self.pool.submit(self.send, "StopMove")
 
@@ -323,7 +407,12 @@ class App:
                 action()
                 return
             self.say(f"cancelled: {label}")
-        if key in TRICKS:
+        if key == FOLLOW_KEY:
+            if self.following:
+                self.stop_follow("T pressed")
+            elif self.follow_available():
+                self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key in TRICKS:
             self.run_trick(*TRICKS[key])
         elif key in CONFIRM_TRICKS:
             t = CONFIRM_TRICKS[key]
@@ -332,22 +421,39 @@ class App:
             rname = next(iter(ROUTINES))
             self.pending = (f"routine '{rname}'", lambda: self.run_routine(rname), now + CONFIRM_SECS)
 
+    def ensure_ready(self, now: float) -> bool:
+        """True when the dog is balanced and not busy. Sends BalanceStand first if needed (wireless-controller
+        velocity only works in BalanceStand)."""
+        if now < self.busy_until:
+            return False
+        if not self.armed:
+            self.armed = True
+            self.busy_until = now + 1.0
+            self.say("> balancing before driving ...")
+            self.pool.submit(self.send, "BalanceStand")
+            return False
+        return True
+
     def update_velocity(self) -> None:
         now, h = time.time(), self.held
         fwd = (pygame.K_w in h) - (pygame.K_s in h)
         side = (pygame.K_q in h) - (pygame.K_e in h)      # Q = left, E = right
         turn = (pygame.K_a in h) - (pygame.K_d in h)      # A = turn left, D = turn right
-        if not (fwd or side or turn) or self.robot is None:
+        manual = bool(fwd or side or turn)
+        if self.robot is None:
             self.desired = (0.0, 0.0, 0.0)
             return
-        if now < self.busy_until:
-            self.desired = (0.0, 0.0, 0.0)
-            return
-        if not self.armed:  # wireless-controller velocity only works in BalanceStand
-            self.armed = True
-            self.busy_until = now + 1.0
-            self.say("> balancing before driving ...")
-            self.pool.submit(self.send, "BalanceStand")
+        if self.following:
+            if manual:
+                self.stop_follow("manual drive key")      # the human always wins; carry on as manual below
+            else:
+                res = self.follow_res
+                if not self.ensure_ready(now) or res is None or now - res[0] > FOLLOW_STALE:
+                    self.desired = (0.0, 0.0, 0.0)        # not ready / no fresh detection: stand still
+                else:
+                    self.desired = res[1].cmd
+                return
+        if not manual or not self.ensure_ready(now):
             self.desired = (0.0, 0.0, 0.0)
             return
         scale = 1.0
@@ -368,14 +474,22 @@ class App:
             surf = pygame.surfarray.make_surface(np.ascontiguousarray(frame.swapaxes(0, 1)))
             s = min(WIN_W / surf.get_width(), VIDEO_H / surf.get_height())
             self._scaled = pygame.transform.smoothscale(surf, (int(surf.get_width() * s), int(surf.get_height() * s)))
+            self._xf = ((WIN_W - self._scaled.get_width()) // 2, (VIDEO_H - self._scaled.get_height()) // 2, s)
         if self._scaled is not None:
-            screen.blit(self._scaled, ((WIN_W - self._scaled.get_width()) // 2, (VIDEO_H - self._scaled.get_height()) // 2))
+            screen.blit(self._scaled, self._xf[:2])
         else:
             self.text(screen, "waiting for video ...", WIN_W // 2 - 110, VIDEO_H // 2, DIM, 32)
         if self.last_frame_at and time.time() - self.last_frame_at > 3:
             self.text(screen, "NO VIDEO", WIN_W // 2 - 70, VIDEO_H // 2 - 20, BAD, 44)
 
         now = time.time()
+        res = self.follow_res
+        if self.following and res and res[1].box and now - res[0] < 1.0:  # box around the tracked person
+            ox, oy, sc = self._xf
+            x1, y1, x2, y2 = res[1].box[:4]
+            pygame.draw.rect(screen, GOOD if res[1].status != "close enough" else WARN,
+                             (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 3)
+
         fps = 0.0
         if len(self.frame_times) > 2 and now - self.frame_times[-1] < 2:
             fps = (len(self.frame_times) - 1) / max(self.frame_times[-1] - self.frame_times[0], 1e-3)
@@ -389,12 +503,22 @@ class App:
         status = "BUSY" if now < self.busy_until else ("balancing" if self.armed else "will balance on first drive key")
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
 
+        banner = None
         if self.pending and now < self.pending[2]:
-            self.text(screen, f"{self.pending[0]}: press Y to confirm ({self.pending[2] - now:.0f}s)", 12, 44, WARN, 34)
+            banner = (f"{self.pending[0]}: press Y to confirm ({self.pending[2] - now:.0f}s)", WARN)
+        elif self.following:
+            st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
+            banner = (f"FOLLOWING: {st}    (Space / T / any drive key stops)", GOOD)
+        if banner:
+            back = pygame.Surface((WIN_W, 40), pygame.SRCALPHA)
+            back.fill((0, 0, 0, 150))
+            screen.blit(back, (0, 36))
+            self.text(screen, banner[0], 12, 44, banner[1], 30)
+
         recent = [(msg, color) for t, msg, color in self.messages if now - t < 8]
         if recent:
             y = VIDEO_H - 26 * len(recent) - 10
-            backing = pygame.Surface((520, 26 * len(recent) + 8), pygame.SRCALPHA)
+            backing = pygame.Surface((620, 26 * len(recent) + 8), pygame.SRCALPHA)
             backing.fill((0, 0, 0, 165))  # readable even over a bright camera frame
             screen.blit(backing, (6, y - 4))
             for msg, color in recent:
@@ -406,20 +530,22 @@ class App:
             "DRIVE   W/S forward/back    Q/E strafe left/right    A/D turn left/right    Shift fast   Ctrl slow   SPACE = STOP",
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
+            "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
         for i, line in enumerate(lines):
-            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 3 else DIM, 21)
+            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 4 else DIM, 21)
 
     # -- main loop --------------------------------------------------------------------------------------
     def run(self) -> int:
         pygame.init()
         screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.SWSURFACE)
-        pygame.display.set_caption("Go2 - FPV / drive / tricks")
+        pygame.display.set_caption("Go2 - FPV / drive / tricks / follow")
         threading.Thread(target=self.connect_bg, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
+        threading.Thread(target=self.follow_loop, daemon=True).start()
         clock = pygame.time.Clock()
-        script = self.selftest_script() if self.args.selftest else None
+        script = self.selftest_script(follow=self.args.selftest_follow) if (self.args.selftest or self.args.selftest_follow) else None
         t0 = time.time()
         try:
             while self.running:
@@ -434,6 +560,7 @@ class App:
                         self.held.discard(ev.key)
                     elif ev.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
                         self.held.clear()  # KEYUPs never arrive once focus is lost: don't keep walking
+                        self.stop_follow("window lost focus")
                         self.say("window lost focus: stopped", WARN)
                 self.update_velocity()
                 self.draw(screen)
@@ -443,6 +570,7 @@ class App:
             print("Stopping and disconnecting ...", flush=True)
             self.stop_evt.set()
             self.abort.set()
+            self.following = False
             self.desired = (0.0, 0.0, 0.0)
             if self.robot is not None:
                 try:
@@ -451,31 +579,42 @@ class App:
                     pass
                 self.robot.close()
             pygame.quit()
+        if self.args.selftest_follow:
+            return self.selftest_follow_verdict()
         return self.selftest_verdict() if self.args.selftest else 0
 
-    # -- headless self-test (development only) ----------------------------------------------------------
-    def selftest_script(self):
+    # -- headless self-tests (development only) ---------------------------------------------------------
+    def selftest_script(self, follow: bool = False):
         K = pygame
-        steps = [  # (seconds, event type, key)
-            (0.6, K.KEYDOWN, K.K_w), (2.2, K.KEYUP, K.K_w),          # arms, then drives forward
-            (2.5, K.KEYDOWN, K.K_n), (2.7, K.KEYDOWN, K.K_w), (2.9, K.KEYUP, K.K_w),  # dance pending, cancelled by W
-            (3.1, K.KEYDOWN, K.K_n), (3.3, K.KEYDOWN, K.K_y),        # dance confirmed
-            (3.5, K.KEYDOWN, K.K_q), (3.7, K.KEYUP, K.K_q),          # driving locked out while dancing
-            (3.9, K.KEYDOWN, K.K_SPACE),                              # e-stop clears the lockout
-            (4.1, K.KEYDOWN, K.K_a), (5.6, K.KEYUP, K.K_a),          # re-arms, turns left
-            (6.2, K.KEYDOWN, K.K_ESCAPE),
-        ]
+        if follow:
+            steps = [(0.5, K.KEYDOWN, K.K_t), (0.7, K.KEYUP, K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
+                     (4.5, K.KEYDOWN, K.K_SPACE), (7.0, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 3.5
+        else:
+            steps = [  # (seconds, event type, key)
+                (0.6, K.KEYDOWN, K.K_w), (2.2, K.KEYUP, K.K_w),          # arms, then drives forward
+                (2.5, K.KEYDOWN, K.K_n), (2.7, K.KEYDOWN, K.K_w), (2.9, K.KEYUP, K.K_w),  # dance pending, cancelled by W
+                (3.1, K.KEYDOWN, K.K_n), (3.3, K.KEYDOWN, K.K_y),        # dance confirmed
+                (3.5, K.KEYDOWN, K.K_q), (3.7, K.KEYUP, K.K_q),          # driving locked out while dancing
+                (3.9, K.KEYDOWN, K.K_SPACE),                              # e-stop clears the lockout
+                (4.1, K.KEYDOWN, K.K_a), (5.6, K.KEYUP, K.K_a),          # re-arms, turns left
+                (6.2, K.KEYDOWN, K.K_ESCAPE),
+            ]
+            shot_at = 5.0
         done = set()
-        shot = {"taken": False}
+        state = {"shot": False, "marked": False}
 
         def script(t, screen):
             for i, (when, typ, key) in enumerate(steps):
                 if t >= when and i not in done:
                     done.add(i)
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
-            if t >= 5.0 and not shot["taken"]:
-                shot["taken"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest.png")
+            if t >= shot_at and not state["shot"]:
+                state["shot"] = True
+                pygame.image.save(screen, "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
+            if follow and t >= 5.0 and not state["marked"] and isinstance(self.robot, FakeRobot):
+                state["marked"] = True  # 0.5 s after Space: nothing should move the dog from here on
+                self._log_len_after_stop = len(self.robot.log)
 
         return script
 
@@ -495,17 +634,64 @@ class App:
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
 
+    def selftest_follow_verdict(self) -> int:
+        log = self.robot.log if isinstance(self.robot, FakeRobot) else []
+        sports = [e[1] for e in log if e[0] == "sport"]
+        moves = [e for e in log if e[0] == "move"]
+        after = log[self._log_len_after_stop:] if self._log_len_after_stop is not None else None
+        checks = {
+            "balanced first, then e-stop (BalanceStand, StopMove)": sports == ["BalanceStand", "StopMove"],
+            "walked toward the person (vx > 0.3)": any(m[1] > 0.3 for m in moves),
+            "turned RIGHT toward a person who is right of centre (yaw < 0)": any(m[3] < -0.3 for m in moves),
+            "never strafed": all(m[2] == 0 for m in moves),
+            "no walking after Space": after is not None and not any(e[0] == "move" for e in after),
+            "follow ended": not self.following,
+        }
+        print("\nSELFTEST-FOLLOW command log:", log)
+        for name, ok in checks.items():
+            print(("  PASS  " if ok else "  FAIL  ") + name)
+        return 0 if all(checks.values()) else 1
+
+
+def _follow_test_canvas() -> np.ndarray | None:
+    """A 1280x720 frame with the COCO 'skier' person small and right of centre (err = +0.2, height ~0.23)."""
+    import cv2
+
+    path = "/tmp/go2test/000000000785.jpg"
+    if not os.path.exists(path):
+        print(f"missing {path}")
+        return None
+    small = cv2.resize(cv2.imread(path)[:, :, ::-1], (320, 212))
+    canvas = np.full((720, 1280, 3), 200, np.uint8)
+    canvas[300:512, 701:1021] = small
+    return canvas
+
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ip", default=os.environ.get("ROBOT_IP", "192.168.12.1"))
     p.add_argument("--demo", action="store_true", help="fake robot + synthetic video, no dog needed")
+    p.add_argument("--fetch-model", action="store_true", help="download the person detector (needs internet), then exit")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
+    p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
-    return App(p.parse_args()).run()
+    args = p.parse_args()
+    if args.fetch_model:
+        if follow_mod is None:
+            print(f"follow.py couldn't be loaded: {_FOLLOW_ERR}")
+            return 1
+        follow_mod.fetch_model()
+        return 0
+    image = None
+    if args.selftest_follow:
+        image = _follow_test_canvas()
+        if image is None:
+            return 2
+    return App(args, demo_image=image).run()
 
 
 if __name__ == "__main__":

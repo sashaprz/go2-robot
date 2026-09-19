@@ -39,7 +39,17 @@ Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **cl
 | 1-6 | stand up, balance, lie down, recovery stand, sit, rise from sit |
 | 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine, each needs a confirming Y within 4 s |
+| T, then **Y** | follow the nearest person (see below); T again / Space / any drive or trick key stops it |
 | Esc | quit |
+
+### Follow mode (`T`)
+
+The dog turns to keep the nearest person centred and walks toward them slowly (max 0.35 m/s, `--follow-speed`),
+stopping when they fill ~60% of the frame height. It gives up after ~1.2 s without seeing them, and Space, `T` again,
+any drive/trick key, or losing window focus cancel it. **It has no obstacle avoidance**: keep the path clear, and stay
+in front of it. The detector is YOLOX-tiny on CPU via onnxruntime (`follow.py`), so it works on the dog's hotspot with
+no cloud or API keys. Fetch the model once while you have internet: `go2.bat --fetch-model` (stored in
+`~/.cache/go2/`, not in the repo). Tests in this repo only used still photos: it has not been run on a real dog.
 
 Driving sends BalanceStand first automatically, and is locked out while a trick is running (Space clears it).
 Losing window focus stops the dog. Flips/handstand are deliberately not included. Which tricks an Air accepts depends
@@ -92,7 +102,8 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 
 ## Files
 
-- `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks window (recommended)
+- `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks + follow window (recommended)
+- `follow.py`: person detector and follow controller used by `go2.py`
 - `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
 - `fetch-aes-key.bat` / `fetch_aes_key.sh`: fetch and save the AES key
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete**: it uses a library without
