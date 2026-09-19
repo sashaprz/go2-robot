@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
-"""Go2 all-in-one: live camera (FPV) + keyboard driving + poses/tricks in ONE window.
+"""Go2 all-in-one: live camera (FPV) + keyboard driving + poses/tricks + person-follow in ONE window.
 
 Run via go2.bat (after joining the dog's Wi-Fi). Needs no internet. The window must have keyboard focus.
 Reuses DimOS's own connection class, so the per-device AES key works exactly like dimos-go2.bat.
 The dog accepts ONE controller at a time: don't run this alongside dimos-go2.bat / the phone app.
 
-  python go2.py            connect to the real dog
-  python go2.py --demo     same window with a FAKE robot and synthetic video (no dog needed)
-  python go2.py --selftest headless scripted test of the key logic (used during development)
+  python go2.py                connect to the real dog
+  python go2.py --demo         same window with a FAKE robot and synthetic video (no dog needed)
+  python go2.py --fetch-model  download the object detector + offline voice model (one time, needs internet)
+  python go2.py --selftest / --selftest-follow   headless scripted tests (used during development)
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import os
+import queue
 import sys
 import threading
 import time
+import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
-if "--selftest" in sys.argv:
+_SELFTEST = any(a.startswith("--selftest") for a in sys.argv)
+if _SELFTEST:
     os.environ["SDL_VIDEODRIVER"] = "dummy"
 elif sys.platform.startswith("linux"):
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")  # WSLg; same driver DimOS's keyboard window forces
@@ -29,13 +33,33 @@ os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import numpy as np
 import pygame
 
+try:
+    import follow as follow_mod  # person detector + follow controller (follow.py, next to this file)
+except Exception as _e:  # noqa: BLE001 - go2.py must still run without it
+    follow_mod = None
+    _FOLLOW_ERR = str(_e)
+
+try:
+    import voice as voice_mod  # push-to-talk mic + ElevenLabs speech-to-text + phrase matcher (voice.py)
+except Exception as _ve:  # noqa: BLE001
+    voice_mod = None
+    _VOICE_ERR = str(_ve)
+
+try:
+    import music as music_mod  # songs through the dog's own speaker (music.py)
+except Exception as _me:  # noqa: BLE001
+    music_mod = None
+    _MUSIC_ERR = str(_me)
+
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
 ANGULAR = 0.8     # rad/s turning
 BOOST = 1.5       # Shift multiplier
 SLOW = 0.5        # Ctrl multiplier
 CONTROL_HZ = 20   # velocity command rate (the connection also self-stops 0.2 s after the last command)
-CONFIRM_SECS = 4  # how long a dance/routine waits for the confirm key
+CONFIRM_SECS = 4  # how long a dance/routine/follow waits for the confirm key
+FOLLOW_STALE = 0.7  # ignore a follow command older than this many seconds (detector stalled): stand still
+VOICE_TIMEOUT = 12  # give up on a transcription after this many seconds
 
 # key -> (label, sport command, seconds the dog is busy afterwards; driving is locked out meanwhile)
 TRICKS = {
@@ -57,11 +81,17 @@ CONFIRM_TRICKS = {
     pygame.K_m: ("Dance 2", "Dance2", 20.0),
 }
 ROUTINE_KEY = pygame.K_r
+FOLLOW_KEY = pygame.K_t
+VOICE_KEY = pygame.K_v   # hold to talk
+OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
+UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
+LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
+WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
 # EDIT FREELY. Timed lists of the sport commands above; each step waits that command's busy time.
 ROUTINES = {"greeting": ["StandUp", "BalanceStand", "Hello", "Content", "WiggleHips", "Sit"]}
 # Deliberately absent: flips, handstand, bound. They can hurt the robot and most aren't supported on an Air.
 
-WIN_W, WIN_H = 1024, 680
+WIN_W, WIN_H = 1024, 800
 VIDEO_H = 576
 BG = (18, 20, 24)
 TXT = (225, 228, 232)
@@ -98,6 +128,19 @@ class Robot:
             self._topic["SPORT_MOD"], {"api_id": self._cmd[name]}
         )
         asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
+
+    def sport_api(self, api_id: int, param=None) -> None:
+        """A sport command by raw numeric id, with an optional parameter (e.g. {"data": True})."""
+        req = {"api_id": api_id}
+        if param is not None:
+            req["parameter"] = param
+        coro = self.c.conn.datachannel.pub_sub.publish_request_new(self._topic["SPORT_MOD"], req)
+        asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=8)
+
+    def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
+        """One request to the dog's audio hub / VUI service (used by music.py). Returns the dog's reply."""
+        coro = self.c.conn.datachannel.pub_sub.publish_request_new(topic, {"api_id": api_id, "parameter": parameter})
+        return asyncio.run_coroutine_threadsafe(coro, self.c.loop).result(timeout=timeout)
 
     def move(self, vx: float, vy: float, yaw: float) -> None:
         from dimos.msgs.geometry_msgs.Twist import Twist
@@ -136,11 +179,12 @@ class Robot:
 
 
 class FakeRobot:
-    """No dog: records commands and streams synthetic video (for --demo and --selftest)."""
+    """No dog: records commands and streams synthetic (or a supplied still) video, for --demo and selftests."""
 
-    def __init__(self):
+    def __init__(self, image: np.ndarray | None = None):
         self.log: list[tuple] = []
         self._halt = threading.Event()
+        self.image = image
 
     def _add(self, entry: tuple) -> None:
         if not self.log or self.log[-1] != entry:  # collapse the 20 Hz repeats
@@ -148,6 +192,27 @@ class FakeRobot:
 
     def sport(self, name: str) -> None:
         self._add(("sport", name))
+
+    def sport_api(self, api_id: int, param=None) -> None:
+        self._add(("api", api_id, param))
+
+    def audio_request(self, topic: str, api_id: int, parameter: str, timeout: float = 10):
+        """A tiny fake audio hub: remembers uploaded songs, lists them, records everything else."""
+        import json as _json
+
+        p = _json.loads(parameter) if parameter else {}
+        where = topic.split("/")[-2]
+        files = self.__dict__.setdefault("audio_files", {})
+        if api_id == 2001:
+            if p["current_block_index"] == p["total_block_number"]:
+                files[p["file_name"]] = "uid-" + p["file_name"].replace(" ", "")
+                self._add(("audio", where, api_id, p["file_name"], p["total_block_number"]))
+        elif api_id == 1001 and where == "audiohub":
+            return {"data": {"header": {"status": {"code": 0}},
+                             "data": _json.dumps({"audio_list": [{"CUSTOM_NAME": n, "UNIQUE_ID": u} for n, u in files.items()]})}}
+        else:
+            self._add(("audio", where, api_id, _json.dumps(p, sort_keys=True)))
+        return {"data": {"header": {"status": {"code": 0}}}}
 
     def move(self, vx: float, vy: float, yaw: float) -> None:
         self._add(("move", round(vx, 2), round(vy, 2), round(yaw, 2)))
@@ -163,9 +228,12 @@ class FakeRobot:
             base[..., 2] = np.clip(base[..., 2].astype(int) + 40, 0, 255).astype(np.uint8)
             t0 = time.time()
             while not self._halt.is_set():
-                f = base.copy()
-                x = int(((time.time() - t0) * 200) % (w - 200))
-                f[300:420, x : x + 200] = (255, 190, 60)
+                if self.image is not None:
+                    f = self.image
+                else:
+                    f = base.copy()
+                    x = int(((time.time() - t0) * 200) % (w - 200))
+                    f[300:420, x : x + 200] = (255, 190, 60)
                 cb(f)
                 time.sleep(1 / 15)
 
@@ -178,10 +246,41 @@ class FakeRobot:
         self._halt.set()
 
 
+class FakeMic:
+    """Self-test stand-in for voice.MicRecorder: 'records' one second of silence."""
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> bytes:
+        return b"\x01\x00" * 16000
+
+
+class FakeSTT:
+    """Self-test stand-in for voice.ElevenLabsSTT: returns canned transcripts in order."""
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    def transcribe(self, pcm: bytes) -> str:
+        return self.lines.pop(0)
+
+
+def _class_color(class_id: int) -> tuple[int, int, int]:
+    """Stable, distinct colour per object class (people are always the same warm orange)."""
+    import colorsys
+
+    if class_id == 0:
+        return (255, 170, 60)
+    r, g, b = colorsys.hsv_to_rgb((class_id * 0.618034) % 1.0, 0.65, 1.0)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
 # ---- the app ----------------------------------------------------------------------------------------------
 class App:
-    def __init__(self, args):
+    def __init__(self, args, demo_image=None):
         self.args = args
+        self.demo_image = demo_image
         self.robot = None
         self.state = "connecting ..."
         self.state_color = WARN
@@ -198,12 +297,47 @@ class App:
         self.frame_lock = threading.Lock()
         self.latest = None
         self.frame_new = False
+        self.frame_seq = 0
         self.frame_times: deque = deque(maxlen=40)
         self.last_frame_at = 0.0
         self.battery = None
         self._fonts: dict = {}
         self._scaled = None
+        self._xf = (0, 0, 1.0)      # (x offset, y offset, scale) from frame pixels to window pixels
         self.running = True
+        # person-follow
+        self.following = False
+        self.follower = None
+        self.detector = None
+        self._detector_loading = False
+        self.follow_res = None      # (timestamp, FollowResult, frame_shape)
+        self._log_len_after_stop = None  # selftest bookkeeping
+        # voice (push-to-talk)
+        self.mic = None
+        self.stt = None
+        self.voice_state = ""       # "" | "listening" | "transcribing"
+        self.voice_q: queue.Queue = queue.Queue()
+        self.voice_move = None              # {"cmd", "dur", "start", "created", "label"} while a spoken move runs
+        self._voice_gen = 0                 # bumped per transcription so a timed-out one can be ignored
+        self._voice_deadline = 0.0
+        self.heard_log: list = []           # (transcript, matched label) - used by the self-test
+        self.follow_starts = 0              # how many times follow actually started - self-test
+        # object detection overlay
+        self.objects_on = False
+        self.objects = None                 # (timestamp, [(x1, y1, x2, y2, score, class_id)], frame_shape)
+        self._obj_snapshot = None           # self-test bookkeeping
+        # always-listening (wake word), standing on the back legs, music
+        self.listener = None
+        self.wake_until = 0.0               # the wake word ("ernest") alone opens this window
+        self.last_heard = None              # (time, text, routing verdict) for the status bar
+        self.ear = "off"                    # "off" | "on" | "error"
+        self.upright = False
+        self.box_step = False               # True from "box step" until "stop"
+        self.music = None
+        self.ambient_log: list = []         # (text, verdict) - self-test
+
+    def is_selftest(self) -> bool:
+        return any(k.startswith("selftest") and v for k, v in vars(self.args).items())
 
     # -- feedback ---------------------------------------------------------------------------------------
     def say(self, text: str, color=TXT) -> None:
@@ -221,8 +355,8 @@ class App:
     # -- robot plumbing ---------------------------------------------------------------------------------
     def connect_bg(self) -> None:
         try:
-            if self.args.demo or self.args.selftest:
-                r = FakeRobot()
+            if self.args.demo or self.is_selftest():
+                r = FakeRobot(self.demo_image)
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
                 if not key:
@@ -231,6 +365,11 @@ class App:
             r.on_frame(self.on_frame)
             r.on_battery(lambda soc: setattr(self, "battery", soc))
             self.robot = r
+            if music_mod is not None:
+                self.music = music_mod.MusicController(r.audio_request, self.say, volume_pct=self.args.music_volume,
+                                                       folder=self.args.music_dir)
+                if not self.args.no_music_preload and music_mod.list_tracks(self.args.music_dir):
+                    threading.Thread(target=self.music.preload, daemon=True).start()   # one-time uploads, in the background
             self.state, self.state_color = ("DEMO (fake robot)" if isinstance(r, FakeRobot) else "connected"), GOOD
             self.say("Connected. Keep the area around the dog clear.", GOOD)
         except Exception as e:  # noqa: BLE001
@@ -242,6 +381,7 @@ class App:
         with self.frame_lock:
             self.latest = arr
             self.frame_new = True
+            self.frame_seq += 1
         now = time.time()
         self.last_frame_at = now
         self.frame_times.append(now)
@@ -273,15 +413,439 @@ class App:
             self.say(f"{name} failed: {e}", BAD)
             return False
 
+    # -- person following -------------------------------------------------------------------------------
+    def follow_available(self) -> bool:
+        if follow_mod is None:
+            self.say(f"follow.py couldn't be loaded: {_FOLLOW_ERR}", BAD)
+            return False
+        if not follow_mod.model_present():
+            self.say("Object/person detector not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
+            return False
+        return True
+
+    def _load_detector(self) -> None:
+        try:
+            self.detector = follow_mod.ObjectDetector()
+        except Exception as e:  # noqa: BLE001
+            self.say(f"detector failed to load: {e}", BAD)
+            self.objects_on = False
+            self.stop_follow("detector unavailable")
+        finally:
+            self._detector_loading = False
+
+    def ensure_detector(self) -> None:
+        if self.detector is None and not self._detector_loading:
+            self._detector_loading = True
+            threading.Thread(target=self._load_detector, daemon=True).start()
+
+    def toggle_objects(self) -> None:
+        if self.objects_on:
+            self.objects_on, self.objects = False, None
+            self.say("object detection off")
+        elif self.follow_available():
+            self.objects_on = True
+            self.ensure_detector()
+            self.say("object detection on (YOLOX-tiny, 80 everyday object types)", GOOD)
+
+    def start_follow(self) -> None:
+        if self.upright:
+            self.say("come down to four legs first (U / say 'come down')", WARN)
+            return
+        cfg = follow_mod.FollowConfig(max_forward=self.args.follow_speed)
+        self.follower = follow_mod.Follower(cfg)
+        self.follower.reset()
+        self.follow_res = None
+        self.voice_move = None
+        self.following = True
+        self.follow_starts += 1
+        self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
+        self.ensure_detector()
+
+    def stop_follow(self, reason: str) -> None:
+        if not self.following:
+            return
+        self.following = False
+        self.follow_res = None
+        self.desired = (0.0, 0.0, 0.0)
+        self.say(f"follow stopped: {reason}", WARN)
+
+    def vision_loop(self) -> None:
+        """One inference per new frame, shared by person-follow and the object overlay."""
+        last_seq = -1
+        while not self.stop_evt.is_set():
+            det = self.detector
+            if not (self.following or self.objects_on) or det is None or self.latest is None or self.frame_seq == last_seq:
+                time.sleep(0.03)
+                continue
+            with self.frame_lock:
+                frame, last_seq = self.latest, self.frame_seq
+            try:
+                dets = det.detect_objects(frame)
+                if self.objects_on:
+                    self.objects = (time.time(), dets, frame.shape)
+                res = None
+                if self.following:
+                    res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape)
+            except Exception as e:  # noqa: BLE001
+                self.say(f"detector error: {e}", BAD)
+                self.objects_on = False
+                self.stop_follow("detector error")
+                continue
+            if res is not None:
+                self.follow_res = (time.time(), res, frame.shape)
+                if res.lost:
+                    self.stop_follow(res.status)
+
+    # -- voice (push-to-talk) ---------------------------------------------------------------------------
+    def voice_ready(self) -> bool:
+        if self.mic is not None and self.stt is not None:  # (self-tests inject fakes)
+            return True
+        if voice_mod is None:
+            self.say(f"voice.py couldn't be loaded: {_VOICE_ERR}", BAD)
+            return False
+        if self.args.stt == "elevenlabs":
+            key = os.environ.get("ELEVENLABS_API_KEY")
+            if not key:
+                self.say("No ELEVENLABS_API_KEY. Run set-elevenlabs-key.bat, then restart go2.bat", WARN)
+                return False
+            self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.ElevenLabsSTT(key)
+            return True
+        if voice_mod.whisper_model_path(self.args.whisper_model) is None:
+            self.say("Voice model not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
+            return False
+        self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.LocalWhisperSTT(self.args.whisper_model)
+        return True
+
+    def _prepare_voice(self) -> None:
+        """Load the local Whisper model in the background at startup so the first V press is quick."""
+        try:
+            if voice_mod is not None and self.args.stt == "local" and voice_mod.whisper_model_path(self.args.whisper_model):
+                if self.voice_ready():
+                    self.stt.load()
+                    self.say("voice model ready (offline Whisper)", GOOD)
+                    if not self.args.no_listen:
+                        self.start_listener()
+        except Exception as e:  # noqa: BLE001
+            self.say(f"voice model failed to load: {e}", BAD)
+
+    # -- always-listening (wake word) -------------------------------------------------------------------
+    def start_listener(self) -> None:
+        if self.listener is not None:
+            return
+        if voice_mod is None or self.stt is None or self.args.stt != "local":
+            self.say("always-listening needs the offline model (default --stt local)", WARN)
+            return
+        try:
+            self.listener = voice_mod.AlwaysListener(self.stt, lambda t: self.voice_q.put(("ambient", t, -1)),
+                                                     on_error=self._ear_error)
+            self.listener.start()
+        except Exception as e:  # noqa: BLE001
+            self.listener, self.ear = None, "error"
+            self.say(f"always-listening unavailable: {e}", WARN)
+            return
+        self.ear = "on"
+        self.say(f'always listening: say "{self.args.wake_word}" + a command. A bare "stop" works without it.', GOOD)
+
+    def _ear_error(self, msg: str) -> None:
+        self.ear = "error"
+        self.say(f"ear: {msg}", BAD)
+
+    def stop_listener(self) -> None:
+        if self.listener is not None:
+            self.listener.stop()
+            self.listener = None
+        self.ear = "off"
+
+    def toggle_listener(self) -> None:
+        if self.listener is not None:
+            self.stop_listener()
+            self.say("always-listening OFF (hold V to talk)", WARN)
+        elif self.voice_ready():
+            self.start_listener()
+
+    def handle_ambient(self, text: str) -> None:
+        """An utterance from the always-on mic. Only acts on the wake word (+ command), a bare 'stop', or a bare
+        'yes' while something waits for confirmation. Everything else is conversation and is ignored."""
+        now = time.time()
+        pending = bool(self.pending and now < self.pending[2])
+        action, rest = voice_mod.route_utterance(text, self.args.wake_word, wake_active=now < self.wake_until,
+                                                 confirm_pending=pending)
+        self.ambient_log.append((text, action))
+        self.last_heard = (now, text, action)
+        if action == "ignore":
+            return
+        if action == "wake":
+            self.wake_until = now + WAKE_WINDOW
+            self.say(f'{self.args.wake_word}: yes? say a command', GOOD)
+            return
+        self.wake_until = 0.0
+        if action == "confirm":
+            self.confirm_pending()
+        else:                                   # "command" or a bare "stop"
+            self.handle_heard(rest)
+
+    def confirm_pending(self) -> None:
+        if not self.pending:
+            return
+        label, action, deadline = self.pending
+        self.pending = None
+        if time.time() < deadline:
+            action()
+        else:
+            self.say(f"confirmation for {label} timed out", WARN)
+
+    def start_listening(self) -> None:
+        if self.voice_state or not self.voice_ready():
+            return
+        try:
+            self.mic.start()
+        except Exception as e:  # noqa: BLE001
+            self.say(f"voice: {e}", BAD)
+            return
+        self.voice_state = "listening"
+
+    def stop_listening(self) -> None:
+        if self.voice_state != "listening":
+            return
+        pcm = self.mic.stop()
+        if voice_mod is not None and voice_mod.too_short(pcm):
+            self.voice_state = ""
+            self.say("too short: hold V the whole time you speak", WARN)
+            return
+        self.voice_state = "transcribing"
+        self._voice_gen += 1
+        self._voice_deadline = time.time() + VOICE_TIMEOUT
+        threading.Thread(target=self._transcribe, args=(pcm, self._voice_gen), daemon=True).start()
+
+    def cancel_listening(self) -> None:
+        if self.voice_state == "listening":
+            try:
+                self.mic.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.voice_state = ""
+            self.say("voice cancelled (window lost focus)", WARN)
+
+    def _transcribe(self, pcm: bytes, gen: int) -> None:
+        try:
+            self.voice_q.put(("heard", self.stt.transcribe(pcm), gen))
+        except Exception as e:  # noqa: BLE001 - VoiceError or anything else: show it, never crash the window
+            self.voice_q.put(("error", str(e), gen))
+        finally:
+            if gen == self._voice_gen:
+                self.voice_state = ""
+
+    def drain_voice(self) -> None:
+        if self.voice_state == "transcribing" and time.time() > self._voice_deadline:
+            self._voice_gen += 1      # abandon the slow transcription; its late result will be ignored
+            self.voice_state = ""
+            self.say("voice: transcription timed out, try again", BAD)
+        while True:
+            try:
+                kind, payload, gen = self.voice_q.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "ambient":
+                self.handle_ambient(payload)
+                continue
+            if gen != self._voice_gen:
+                continue              # a result from a transcription that already timed out
+            if kind == "error":
+                self.say(f"voice: {payload}", BAD)
+            else:
+                self.handle_heard(payload)
+
+    def start_voice_move(self, intent) -> None:
+        """'walk forward', 'turn left 90 degrees', ...: a short timed move. Spoken amounts are capped (see voice.py)."""
+        cmd, secs = voice_mod.plan_motion(intent, self.args.linear, self.args.angular)
+        self.stop_follow("voice move")
+        self.abort.set()   # a running routine must not keep issuing tricks while we walk
+        self.pending = None
+        self.voice_move = {"cmd": cmd, "dur": secs, "start": None, "created": time.time(), "label": intent.label}
+        self.say(f"> {intent.label} for {secs:.1f} s   (say 'stop' / Space / any key cancels)")
+
+    def handle_heard(self, text: str) -> None:
+        """Turn a transcript into the same actions the keys trigger. Voice is push-to-talk, so it is deliberate:
+        tricks, timed moves and FOLLOW all start directly. 'stop' always wins."""
+        if self.pending and text and voice_mod.is_confirm(text) and len(text.split()) <= 3:
+            self.confirm_pending()                       # a spoken "yes" answers a pending confirmation
+            return
+        intent = voice_mod.parse_command(text) if text else None
+        self.heard_log.append((text, intent.label if intent else None))
+        if not text:
+            self.say("heard nothing", WARN)
+            return
+        if intent is None:
+            self.say(f'heard: "{text}"  (no command matched)', WARN)
+            return
+        self.say(f'heard: "{text}"  ->  {intent.label}', GOOD)
+        if intent.kind == "stop":
+            self.emergency_stop()
+        elif intent.kind == "stop_follow":
+            self.stop_follow("voice")
+        elif intent.kind == "follow":
+            if not self.following and self.follow_available():
+                self.pending = None
+                self.voice_move = None
+                self.start_follow()
+        elif intent.kind == "move":
+            self.start_voice_move(intent)
+        elif intent.kind == "upright":
+            if intent.arg == "on":
+                self.request_upright()                   # asks for a spoken "yes" (or Y): this one can fall
+            elif self.upright:
+                self.stop_upright("voice")
+            else:
+                self.say("already on four legs")
+        elif intent.kind == "music":
+            self.handle_music(intent)
+        elif intent.kind == "sport":
+            label, wait = self.lookup[intent.arg]
+            self.run_trick(label, intent.arg, wait)
+        elif intent.kind == "routine":
+            self.run_routine(intent.arg)
+
+    # -- standing on the back legs (Unitree "WalkUpright") ----------------------------------------------
+    def request_upright(self) -> None:
+        if self.upright:
+            self.say("already standing on the back legs")
+        elif self.robot is None:
+            self.say("not connected yet", WARN)
+        else:
+            self.pending = ("Stand on the BACK LEGS (it can fall: soft floor, clear space, spotter)", self.start_upright,
+                            time.time() + CONFIRM_SECS)
+            self.say("stand on the back legs? say 'yes' or press Y within 4 s", WARN)
+
+    def start_upright(self) -> None:
+        if self.upright or self.robot is None:
+            return
+        self.stop_follow("back-leg stand")
+        self.voice_move = None
+        was_armed = self.armed
+        self.upright, self.armed = True, True             # (never send BalanceStand while up: it could drop the dog)
+        self.busy_until = time.time() + 5.0
+        self.say("> standing on the back legs. Say 'come down' / press U to return to four legs", WARN)
+        self.pool.submit(self._upright_send, True, was_armed)
+
+    def stop_upright(self, why: str = "") -> None:
+        if not self.upright:
+            return
+        self.upright, self.armed = False, False
+        self.voice_move, self.desired = None, (0.0, 0.0, 0.0)
+        self.busy_until = time.time() + 5.0
+        self.say("> coming down to four legs" + (f" ({why})" if why else ""), WARN)
+        self.pool.submit(self._upright_send, False, True)
+
+    def _upright_send(self, on: bool, was_armed: bool) -> None:
+        try:
+            if on and not was_armed:
+                self.robot.sport("BalanceStand")          # start from a balanced stand
+                time.sleep(1.5)
+            self.robot.sport_api(self.args.upright_api, {"data": on})
+        except Exception as e:  # noqa: BLE001
+            self.say(f"back-leg stand {'on' if on else 'off'} failed: {e}", BAD)
+            if on:
+                self.upright = False
+
+    # -- "box step": stand up, play the song (looping), stay standing until "stop" -----------------------
+    def start_box_step(self) -> None:
+        if self.robot is None:
+            self.say("not connected yet", WARN)
+        elif self.upright:
+            self.say("come down to four legs first (U / say 'come down'), then box step", WARN)
+        elif self.box_step:
+            self.say("box step is already running (say 'stop' to end it)")
+        else:
+            self.stop_follow("box step")
+            self.voice_move, self.pending = None, None
+            self.box_step = True
+            self.say("> box step: standing up, then the music. It stays standing until you say 'stop'.", GOOD)
+            self.pool.submit(self._box_step_work)
+
+    def _box_step_work(self) -> None:
+        wait = self.args.box_wait
+        try:
+            self.armed = False
+            self.busy_until = time.time() + wait + 1.5
+            self.send("StandUp")
+            time.sleep(wait)
+            if not self.box_step:                        # 'stop' arrived while it was getting up
+                return
+            self.send("BalanceStand")
+            self.armed = True
+            time.sleep(min(1.0, wait))
+            if not self.box_step:
+                return
+            if self.music is None:
+                self.say("music isn't available, so it just stands", WARN)
+                return
+            msg = self.music.play("box step", default_ok=True, loop=True)
+            if self.box_step:
+                self.say(f"> {msg}. Standing until you say 'stop'.", GOOD)
+            else:                                        # 'stop' landed during the (possibly long) first-time upload
+                self._quiet_music()
+        except Exception as e:  # noqa: BLE001 - MusicError or a dropped connection: say so, stay standing
+            self.say(f"box step: {e}", WARN if isinstance(e, music_mod.MusicError) else BAD)
+
+    def _quiet_music(self) -> None:
+        try:
+            self.say("> " + self.music.pause())
+        except Exception as e:  # noqa: BLE001
+            self.say(f"couldn't pause the music: {e}", WARN)
+
+    # -- music ------------------------------------------------------------------------------------------
+    def handle_music(self, intent) -> None:
+        if self.music is None:
+            self.say(f"music isn't available: {globals().get('_MUSIC_ERR', 'not connected')}", WARN)
+            return
+
+        if intent.arg == "play" and intent.text in music_mod.TRIGGER_PHRASES:
+            self.start_box_step()                        # "box step" = stand up, THEN the music, and stay up
+            return
+
+        def work():
+            try:
+                if intent.arg == "list":
+                    self.say(self.music.available())
+                elif intent.arg == "play":
+                    self.say("> " + self.music.play(intent.text, default_ok=intent.text in music_mod.TRIGGER_PHRASES), GOOD)
+                elif intent.arg == "pause":
+                    self.say("> " + self.music.pause())
+                elif intent.arg == "resume":
+                    self.say("> " + self.music.resume())
+                elif intent.arg == "volume":
+                    if intent.text == "up":
+                        self.say("> " + self.music.bump_volume(+20))
+                    elif intent.text == "down":
+                        self.say("> " + self.music.bump_volume(-20))
+                    else:
+                        self.say("> " + self.music.set_volume(intent.amount))
+            except music_mod.MusicError as e:
+                self.say(f"music: {e}", WARN)
+            except Exception as e:  # noqa: BLE001
+                self.say(f"music failed: {e}", BAD)
+
+        self.pool.submit(work)
+
     # -- actions ----------------------------------------------------------------------------------------
     def run_trick(self, label: str, name: str, wait: float) -> None:
+        if self.upright:  # poses/tricks while balanced on two legs are undefined: make the human come down first
+            self.say(f"not while standing on the back legs: come down first (U / say 'come down'), then {label}", WARN)
+            return
+        self.voice_move = None
+        self.box_step = False    # a pose/trick you asked for beats an unfinished box-step standing sequence
+        self.stop_follow(f"{label} pressed")
         self.say(f"> {label}")
         self.busy_until = time.time() + wait
         self.armed = name == "BalanceStand"  # after any other pose/trick, re-balance before driving
         self.pool.submit(self.send, name)
 
     def run_routine(self, rname: str) -> None:
+        if self.upright:
+            self.say("not while standing on the back legs: come down first (U / say 'come down')", WARN)
+            return
         self.abort.clear()
+        self.stop_follow("routine started")
 
         def work():
             for step in ROUTINES[rname]:
@@ -302,10 +866,15 @@ class App:
     def emergency_stop(self) -> None:
         self.abort.set()
         self.pending = None
+        self.voice_move = None
         self.busy_until = 0.0
         self.desired = (0.0, 0.0, 0.0)
+        self.stop_follow("SPACE")
         self.say("STOP", BAD)
         self.pool.submit(self.send, "StopMove")
+        was_box, self.box_step = self.box_step, False        # 'stop' ends a box-step session: music off, dog stays standing
+        if self.music is not None and (was_box or getattr(self.music, "playing", None)):
+            self.pool.submit(self._quiet_music)
 
     def on_key(self, key: int) -> None:
         now = time.time()
@@ -323,7 +892,20 @@ class App:
                 action()
                 return
             self.say(f"cancelled: {label}")
-        if key in TRICKS:
+        if key == FOLLOW_KEY:
+            if self.following:
+                self.stop_follow("T pressed")
+            elif self.follow_available():
+                self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key == VOICE_KEY:
+            self.start_listening()
+        elif key == OBJECTS_KEY:
+            self.toggle_objects()
+        elif key == UPRIGHT_KEY:
+            self.stop_upright("U pressed") if self.upright else self.request_upright()
+        elif key == LISTEN_KEY:
+            self.toggle_listener()
+        elif key in TRICKS:
             self.run_trick(*TRICKS[key])
         elif key in CONFIRM_TRICKS:
             t = CONFIRM_TRICKS[key]
@@ -332,22 +914,62 @@ class App:
             rname = next(iter(ROUTINES))
             self.pending = (f"routine '{rname}'", lambda: self.run_routine(rname), now + CONFIRM_SECS)
 
+    def ensure_ready(self, now: float) -> bool:
+        """True when the dog is balanced and not busy. Sends BalanceStand first if needed (wireless-controller
+        velocity only works in BalanceStand)."""
+        if now < self.busy_until:
+            return False
+        if not self.armed:
+            self.armed = True
+            self.busy_until = now + 1.0
+            self.say("> balancing before driving ...")
+            self.pool.submit(self.send, "BalanceStand")
+            return False
+        return True
+
     def update_velocity(self) -> None:
         now, h = time.time(), self.held
         fwd = (pygame.K_w in h) - (pygame.K_s in h)
         side = (pygame.K_q in h) - (pygame.K_e in h)      # Q = left, E = right
         turn = (pygame.K_a in h) - (pygame.K_d in h)      # A = turn left, D = turn right
-        if not (fwd or side or turn) or self.robot is None:
+        manual = bool(fwd or side or turn)
+        if self.robot is None:
             self.desired = (0.0, 0.0, 0.0)
             return
-        if now < self.busy_until:
-            self.desired = (0.0, 0.0, 0.0)
-            return
-        if not self.armed:  # wireless-controller velocity only works in BalanceStand
-            self.armed = True
-            self.busy_until = now + 1.0
-            self.say("> balancing before driving ...")
-            self.pool.submit(self.send, "BalanceStand")
+        if self.voice_move:
+            vm = self.voice_move
+            if manual:
+                self.voice_move = None            # the human always wins; carry on as manual below
+                self.say("voice move cancelled (key pressed)", WARN)
+            else:
+                if vm["start"] is None and now - vm["created"] > 10:
+                    self.voice_move = None
+                    self.desired = (0.0, 0.0, 0.0)
+                    self.say("voice move dropped: the dog was busy for over 10 s", WARN)
+                    return
+                if not self.ensure_ready(now):
+                    self.desired = (0.0, 0.0, 0.0)
+                    return
+                if vm["start"] is None:
+                    vm["start"] = now
+                if now - vm["start"] >= vm["dur"]:
+                    self.voice_move = None
+                    self.desired = (0.0, 0.0, 0.0)
+                    self.say(f"{vm['label']}: done")
+                    return
+                self.desired = vm["cmd"]
+                return
+        if self.following:
+            if manual:
+                self.stop_follow("manual drive key")      # the human always wins; carry on as manual below
+            else:
+                res = self.follow_res
+                if not self.ensure_ready(now) or res is None or now - res[0] > FOLLOW_STALE:
+                    self.desired = (0.0, 0.0, 0.0)        # not ready / no fresh detection: stand still
+                else:
+                    self.desired = res[1].cmd
+                return
+        if not manual or not self.ensure_ready(now):
             self.desired = (0.0, 0.0, 0.0)
             return
         scale = 1.0
@@ -368,18 +990,46 @@ class App:
             surf = pygame.surfarray.make_surface(np.ascontiguousarray(frame.swapaxes(0, 1)))
             s = min(WIN_W / surf.get_width(), VIDEO_H / surf.get_height())
             self._scaled = pygame.transform.smoothscale(surf, (int(surf.get_width() * s), int(surf.get_height() * s)))
+            self._xf = ((WIN_W - self._scaled.get_width()) // 2, (VIDEO_H - self._scaled.get_height()) // 2, s)
         if self._scaled is not None:
-            screen.blit(self._scaled, ((WIN_W - self._scaled.get_width()) // 2, (VIDEO_H - self._scaled.get_height()) // 2))
+            screen.blit(self._scaled, self._xf[:2])
         else:
             self.text(screen, "waiting for video ...", WIN_W // 2 - 110, VIDEO_H // 2, DIM, 32)
         if self.last_frame_at and time.time() - self.last_frame_at > 3:
             self.text(screen, "NO VIDEO", WIN_W // 2 - 70, VIDEO_H // 2 - 20, BAD, 44)
 
         now = time.time()
+        obj = self.objects
+        if self.objects_on and obj and now - obj[0] < 1.0:  # labelled boxes for everything the detector sees
+            ox, oy, sc = self._xf
+            for x1, y1, x2, y2, score, cid in obj[1]:
+                color = _class_color(cid)
+                pygame.draw.rect(screen, color, (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 2)
+                label = self.font(20).render(f"{follow_mod.COCO_CLASSES[cid]} {score:.0%}", True, (10, 10, 10))
+                lw, lh = label.get_size()
+                tx, ty = ox + x1 * sc, max(60, oy + y1 * sc - lh)
+                pygame.draw.rect(screen, color, (tx, ty, lw + 6, lh))
+                screen.blit(label, (tx + 3, ty))
+            summary = follow_mod.summarize(obj[1]) or "nothing recognised"
+            surf = self.font(24).render("seeing: " + summary, True, TXT)
+            back = pygame.Surface((surf.get_width() + 16, 30), pygame.SRCALPHA)
+            back.fill((0, 0, 0, 165))
+            screen.blit(back, (WIN_W - back.get_width() - 6, VIDEO_H - 36))
+            screen.blit(surf, (WIN_W - surf.get_width() - 14, VIDEO_H - 32))
+        elif self.objects_on:
+            self.text(screen, "object detection: " + ("loading detector ..." if self.detector is None else "no frames yet"),
+                      WIN_W - 330, VIDEO_H - 32, WARN, 24)
+        res = self.follow_res
+        if self.following and res and res[1].box and now - res[0] < 1.0:  # box around the tracked person
+            ox, oy, sc = self._xf
+            x1, y1, x2, y2 = res[1].box[:4]
+            pygame.draw.rect(screen, GOOD if res[1].status != "close enough" else WARN,
+                             (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 3)
+
         fps = 0.0
         if len(self.frame_times) > 2 and now - self.frame_times[-1] < 2:
             fps = (len(self.frame_times) - 1) / max(self.frame_times[-1] - self.frame_times[0], 1e-3)
-        bar = pygame.Surface((WIN_W, 34), pygame.SRCALPHA)
+        bar = pygame.Surface((WIN_W, 58), pygame.SRCALPHA)
         bar.fill((0, 0, 0, 150))
         screen.blit(bar, (0, 0))
         bat = f"{self.battery}%" if self.battery is not None else "?"
@@ -388,13 +1038,52 @@ class App:
         d = self.desired
         status = "BUSY" if now < self.busy_until else ("balancing" if self.armed else "will balance on first drive key")
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
+        # second row: the ear (wake word), what it last heard, the back-leg state, music
+        if self.ear == "on":
+            ear_txt, ear_col = f'ear: ON, say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else ""), GOOD
+        elif self.ear == "error":
+            ear_txt, ear_col = "ear: ERROR (press L to retry)", BAD
+        else:
+            ear_txt, ear_col = "ear: off (L to turn on, V to talk)", DIM
+        self.text(screen, ear_txt, 12, 34, ear_col, 22)
+        lh = self.last_heard
+        if lh and now - lh[0] < 12:
+            tone = {"ignore": DIM, "wake": GOOD, "command": GOOD, "stop": WARN, "confirm": GOOD}.get(lh[2], TXT)
+            what = {"ignore": " (ignored: no wake word)", "wake": " (wake word)", "command": "", "stop": " (stop)", "confirm": " (yes)"}.get(lh[2], "")
+            self.text(screen, f'heard: "{lh[1][:56]}"{what}', 330, 34, tone, 22)
+        if self.upright:
+            self.text(screen, "UPRIGHT", 900, 34, WARN, 24)
+        elif self.music is not None and getattr(self.music, "playing", None):
+            self.text(screen, f"music: {self.music.playing[:14]}", 850, 34, TXT, 22)
 
-        if self.pending and now < self.pending[2]:
-            self.text(screen, f"{self.pending[0]}: press Y to confirm ({self.pending[2] - now:.0f}s)", 12, 44, WARN, 34)
+        banner = None
+        if self.voice_state == "listening":
+            banner = ("LISTENING ...  release V to send", BAD)
+        elif self.voice_state == "transcribing":
+            banner = ("transcribing ...", WARN)
+        elif self.pending and now < self.pending[2]:
+            banner = (f"{self.pending[0]}: press Y or say 'yes' ({self.pending[2] - now:.0f}s)", WARN)
+        elif self.box_step:
+            playing = getattr(self.music, "playing", None)
+            banner = ("BOX STEP: " + (f"playing '{playing[:22]}', standing" if playing else "standing up, getting the music ready")
+                      + "     say 'stop' to end it", GOOD)
+        elif self.voice_move:
+            vm = self.voice_move
+            banner = (f"VOICE MOVE: {vm['label']}" + ("" if vm["start"] else "  (getting ready ...)")
+                      + "     say 'stop' / Space / any key cancels", GOOD)
+        elif self.following:
+            st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
+            banner = (f"FOLLOWING: {st}    (Space / T / any drive key stops)", GOOD)
+        if banner:
+            back = pygame.Surface((WIN_W, 40), pygame.SRCALPHA)
+            back.fill((0, 0, 0, 150))
+            screen.blit(back, (0, 60))
+            self.text(screen, banner[0], 12, 68, banner[1], 30)
+
         recent = [(msg, color) for t, msg, color in self.messages if now - t < 8]
         if recent:
             y = VIDEO_H - 26 * len(recent) - 10
-            backing = pygame.Surface((520, 26 * len(recent) + 8), pygame.SRCALPHA)
+            backing = pygame.Surface((620, 26 * len(recent) + 8), pygame.SRCALPHA)
             backing.fill((0, 0, 0, 165))  # readable even over a bright camera frame
             screen.blit(backing, (6, y - 4))
             for msg, color in recent:
@@ -406,20 +1095,32 @@ class App:
             "DRIVE   W/S forward/back    Q/E strafe left/right    A/D turn left/right    Shift fast   Ctrl slow   SPACE = STOP",
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
+            "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
+            f"VOICE   say \"{self.args.wake_word}, <command>\" or hold V: \"ready to dance\" (stand up), \"sit\", \"dance two\", \"walk forward\", "
+            "\"follow me\", \"box step\".  \"stop\" always works."
+            + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
+            "BACK LEGS  U (then Y), or \"" + self.args.wake_word + ", stand on your back legs\" then \"yes\".  U / \"come down\" returns to four legs.  Can fall: soft floor!",
+            "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
         for i, line in enumerate(lines):
-            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 3 else DIM, 21)
+            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 7 else DIM, 21)
 
     # -- main loop --------------------------------------------------------------------------------------
     def run(self) -> int:
         pygame.init()
         screen = pygame.display.set_mode((WIN_W, WIN_H), pygame.SWSURFACE)
-        pygame.display.set_caption("Go2 - FPV / drive / tricks")
+        pygame.display.set_caption("Go2 - FPV / drive / tricks / follow")
         threading.Thread(target=self.connect_bg, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
+        threading.Thread(target=self.vision_loop, daemon=True).start()
+        if not _SELFTEST:
+            threading.Thread(target=self._prepare_voice, daemon=True).start()
         clock = pygame.time.Clock()
-        script = self.selftest_script() if self.args.selftest else None
+        script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
+                                       objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove,
+                                       listen=self.args.selftest_listen)
+                  if self.is_selftest() else None)
         t0 = time.time()
         try:
             while self.running:
@@ -432,17 +1133,27 @@ class App:
                         self.on_key(ev.key)
                     elif ev.type == pygame.KEYUP:
                         self.held.discard(ev.key)
+                        if ev.key == VOICE_KEY:
+                            self.stop_listening()
                     elif ev.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
                         self.held.clear()  # KEYUPs never arrive once focus is lost: don't keep walking
+                        self.voice_move = None
+                        self.cancel_listening()
+                        self.stop_follow("window lost focus")
                         self.say("window lost focus: stopped", WARN)
+                if self.listener is not None:
+                    self.listener.paused = bool(self.voice_state)   # hold-V push-to-talk takes priority over the ear
+                self.drain_voice()
                 self.update_velocity()
                 self.draw(screen)
                 pygame.display.flip()
                 clock.tick(30)
         finally:
             print("Stopping and disconnecting ...", flush=True)
+            self.stop_listener()
             self.stop_evt.set()
             self.abort.set()
+            self.following = False
             self.desired = (0.0, 0.0, 0.0)
             if self.robot is not None:
                 try:
@@ -451,31 +1162,82 @@ class App:
                     pass
                 self.robot.close()
             pygame.quit()
+        if self.args.selftest_follow:
+            return self.selftest_follow_verdict()
+        if self.args.selftest_voice:
+            return self.selftest_voice_verdict()
+        if self.args.selftest_objects:
+            return _selftest_objects_verdict(self)
+        if self.args.selftest_voicemove:
+            return _selftest_voicemove_verdict(self)
+        if self.args.selftest_listen:
+            return _selftest_listen_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
-    # -- headless self-test (development only) ----------------------------------------------------------
-    def selftest_script(self):
+    # -- headless self-tests (development only) ---------------------------------------------------------
+    def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False, voicemove: bool = False,
+                        listen: bool = False):
         K = pygame
-        steps = [  # (seconds, event type, key)
-            (0.6, K.KEYDOWN, K.K_w), (2.2, K.KEYUP, K.K_w),          # arms, then drives forward
-            (2.5, K.KEYDOWN, K.K_n), (2.7, K.KEYDOWN, K.K_w), (2.9, K.KEYUP, K.K_w),  # dance pending, cancelled by W
-            (3.1, K.KEYDOWN, K.K_n), (3.3, K.KEYDOWN, K.K_y),        # dance confirmed
-            (3.5, K.KEYDOWN, K.K_q), (3.7, K.KEYUP, K.K_q),          # driving locked out while dancing
-            (3.9, K.KEYDOWN, K.K_SPACE),                              # e-stop clears the lockout
-            (4.1, K.KEYDOWN, K.K_a), (5.6, K.KEYUP, K.K_a),          # re-arms, turns left
-            (6.2, K.KEYDOWN, K.K_ESCAPE),
-        ]
+        if listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
+            steps = [(14.8, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 11.0
+        elif voicemove:  # six push-to-talk presses, one per canned transcript; 'stop' lands mid-step
+            steps = []
+            for t in (0.5, 2.6, 3.6, 4.7, 6.6, 7.2):
+                steps += [(t, K.KEYDOWN, K.K_v), (t + 0.3, K.KEYUP, K.K_v)]
+            steps.append((9.0, K.KEYDOWN, K.K_ESCAPE))
+            shot_at = 4.3
+        elif objects:  # toggle the overlay on, look at it, toggle it off
+            steps = [(0.5, K.KEYDOWN, K.K_o), (0.7, K.KEYUP, K.K_o), (3.6, K.KEYDOWN, K.K_o), (3.8, K.KEYUP, K.K_o),
+                     (4.6, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 2.6
+        elif voice:  # hold V briefly for each canned transcript (see main(): FakeMic / FakeSTT)
+            steps = []
+            for i in range(6):
+                steps += [(0.5 + i * 0.7, K.KEYDOWN, K.K_v), (0.8 + i * 0.7, K.KEYUP, K.K_v)]
+            steps.append((5.8, K.KEYDOWN, K.K_ESCAPE))
+            shot_at = 3.6
+        elif follow:
+            steps = [(0.5, K.KEYDOWN, K.K_t), (0.7, K.KEYUP, K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
+                     (4.5, K.KEYDOWN, K.K_SPACE), (7.0, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 3.5
+        else:
+            steps = [  # (seconds, event type, key)
+                (0.6, K.KEYDOWN, K.K_w), (2.2, K.KEYUP, K.K_w),          # arms, then drives forward
+                (2.5, K.KEYDOWN, K.K_n), (2.7, K.KEYDOWN, K.K_w), (2.9, K.KEYUP, K.K_w),  # dance pending, cancelled by W
+                (3.1, K.KEYDOWN, K.K_n), (3.3, K.KEYDOWN, K.K_y),        # dance confirmed
+                (3.5, K.KEYDOWN, K.K_q), (3.7, K.KEYUP, K.K_q),          # driving locked out while dancing
+                (3.9, K.KEYDOWN, K.K_SPACE),                              # e-stop clears the lockout
+                (4.1, K.KEYDOWN, K.K_a), (5.6, K.KEYUP, K.K_a),          # re-arms, turns left
+                (6.2, K.KEYDOWN, K.K_ESCAPE),
+            ]
+            shot_at = 5.0
         done = set()
-        shot = {"taken": False}
+        state = {"shot": False, "marked": False}
 
         def script(t, screen):
+            if listen:
+                for i, (when, text) in enumerate(LISTEN_TEST):
+                    if t >= when and ("amb", i) not in done:
+                        done.add(("amb", i))
+                        self.voice_q.put(("ambient", text, -1))
             for i, (when, typ, key) in enumerate(steps):
                 if t >= when and i not in done:
                     done.add(i)
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
-            if t >= 5.0 and not shot["taken"]:
-                shot["taken"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest.png")
+            if t >= shot_at and not state["shot"]:
+                state["shot"] = True
+                pygame.image.save(screen, "/tmp/go2_selftest_listen.png" if listen else
+                                  "/tmp/go2_selftest_voicemove.png" if voicemove else
+                                  "/tmp/go2_selftest_objects.png" if objects else
+                                  "/tmp/go2_selftest_voice.png" if voice else
+                                  "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
+            if objects and t >= 3.0 and self._obj_snapshot is None and self.objects:
+                self._obj_snapshot = list(self.objects[1])   # what the overlay held just before it was switched off
+            mark_at = 5.0 if follow else 8.0 if voicemove else None
+            if mark_at and t >= mark_at and not state["marked"] and isinstance(self.robot, FakeRobot):
+                state["marked"] = True  # 0.5 s after Space / 'stop': nothing should move the dog from here on
+                self._log_len_after_stop = len(self.robot.log)
 
         return script
 
@@ -495,17 +1257,249 @@ class App:
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
 
+    def selftest_voice_verdict(self) -> int:
+        return _selftest_voice_verdict(self)
+
+    def selftest_follow_verdict(self) -> int:
+        log = self.robot.log if isinstance(self.robot, FakeRobot) else []
+        sports = [e[1] for e in log if e[0] == "sport"]
+        moves = [e for e in log if e[0] == "move"]
+        after = log[self._log_len_after_stop:] if self._log_len_after_stop is not None else None
+        checks = {
+            "balanced first, then e-stop (BalanceStand, StopMove)": sports == ["BalanceStand", "StopMove"],
+            "walked toward the person (vx > 0.3)": any(m[1] > 0.3 for m in moves),
+            "turned RIGHT toward a person who is right of centre (yaw < 0)": any(m[3] < -0.3 for m in moves),
+            "never strafed": all(m[2] == 0 for m in moves),
+            "no walking after Space": after is not None and not any(e[0] == "move" for e in after),
+            "follow ended": not self.following,
+        }
+        print("\nSELFTEST-FOLLOW command log:", log)
+        for name, ok in checks.items():
+            print(("  PASS  " if ok else "  FAIL  ") + name)
+        return 0 if all(checks.values()) else 1
+
+
+VOICE_TEST_LINES = ["say hello", "dance two", "follow me", "stop", "what is the weather", "stop following"]
+
+
+def _selftest_voice_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    sports = [e[1] for e in log if e[0] == "sport"]
+    labels = [lab for _, lab in app.heard_log]
+    checks = {
+        "'say hello' -> Hello, 'dance two' -> Dance2, 'stop' -> StopMove (and nothing else)": sports == ["Hello", "Dance2", "StopMove"],
+        "'follow me' started following directly (no Y needed)": app.follow_starts == 1,
+        "'what is the weather' matched nothing": labels[4] is None,
+        "every transcript was handled": labels == ["Hello", "Dance 2", "follow the nearest person", "STOP", None, "stop following"],
+        "'stop' ended the follow it had started": not app.following and app.pending is None,
+    }
+    print("\nSELFTEST-VOICE heard:", app.heard_log)
+    print("SELFTEST-VOICE command log:", log)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+LISTEN_TEST = [  # (seconds, what the always-on mic "heard")
+    (0.5, "hello everyone how are you doing today"), (0.9, "sit down"), (1.3, "Ernest sit down"), (2.0, "Ernest"), (2.5, "wave"),
+    (3.2, "wave"), (3.6, "Ernest, ready to dance"), (4.2, "Ernest stand on your back legs"), (4.6, "we should get lunch"),
+    (5.0, "yes"), (7.2, "Ernest sit down"), (7.8, "Ernest come down"), (9.0, "Ernest box step"), (11.5, "Ernest volume 50 percent"),
+    (12.0, "what songs do you have"), (12.4, "Ernest what songs do you have"), (13.0, "stop"),
+]
+
+
+def _make_test_music() -> str:
+    """A temp songs folder with one 2-second tone called 'box step' (so the box-step trigger has something to play)."""
+    import tempfile
+
+    d = tempfile.mkdtemp(prefix="go2music_")
+    t = np.arange(88200) / 44100
+    pcm = (np.sin(2 * np.pi * 440 * t) * 9000).astype(np.int16)
+    with wave.open(os.path.join(d, "box step.wav"), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(44100)
+        w.writeframes(pcm.tobytes())
+    return d
+
+
+def _selftest_listen_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    sports = [e[1] for e in log if e[0] == "sport"]
+    api = [e[1:] for e in log if e[0] == "api"]
+    audio = [e[1:] for e in log if e[0] == "audio"]
+    acts = [a for _, a in app.ambient_log]
+    checks = {
+        "conversation and bare commands without the wake word were ignored, in order":
+            acts == ["ignore", "ignore", "command", "wake", "command", "ignore", "command", "command", "ignore", "confirm", "command",
+                     "command", "command", "command", "ignore", "command", "stop"],
+        "sport commands: Sit, Hello (wake window), StandUp ('ready to dance'), BalanceStand (back-leg prep), "
+        "then box step = StandUp + BalanceStand, and finally StopMove; nothing lay it down":
+            sports == ["Sit", "Hello", "StandUp", "BalanceStand", "StandUp", "BalanceStand", "StopMove"],
+        "'box step' stood the dog up and balanced it BEFORE any music was uploaded or played":
+            log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][0:2] == [("sport", "StandUp"), ("sport", "BalanceStand")]
+            and log[max(i for i, e in enumerate(log) if e == ("sport", "StandUp")):][:4][2][0] == "audio",
+        "back legs: asked, confirmed by a spoken 'yes', went up (api 1050 True), later came down (api 1050 False)":
+            api == [(1050, {"data": True}), (1050, {"data": False})],
+        "'sit down' while up on two legs was blocked (Sit only once)": sports.count("Sit") == 1,
+        "'box step' uploaded the song, set volume level 2 (20%), set it to LOOP, and played it":
+            audio[:4] == [("audiohub", 2001, "box step", audio[0][3]), ("vui", 1003, '{"volume": 2}'),
+                          ("audiohub", 1007, '{"play_mode": "single_cycle"}'), ("audiohub", 1002, '{"unique_id": "uid-boxstep"}')],
+        "'volume 50 percent' -> level 5, then the bare 'stop' paused the music (and stopped the dog once)":
+            audio[4:] == [("vui", 1003, '{"volume": 5}'), ("audiohub", 1003, "{}")] and sports.count("StopMove") == 1,
+        "the dog was never told to sit or lie down (stayed standing until 'stop')": "Sit" not in sports[2:] and "StandDown" not in sports,
+        "the box-step session ended on 'stop'; ended on four legs with nothing pending":
+            not app.box_step and not app.upright and app.pending is None,
+    }
+    print("\nSELFTEST-LISTEN ambient:", app.ambient_log)
+    print("SELFTEST-LISTEN sports:", sports, " api:", api)
+    print("SELFTEST-LISTEN audio:", audio)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+VOICEMOVE_LINES = ["walk forward", "turn left", "go back a little", "turn right 45 degrees", "step left", "stop"]
+
+
+def _selftest_voicemove_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    moves = [e[1:] for e in log if e[0] == "move"]
+    sports = [e[1] for e in log if e[0] == "sport"]
+    after = log[app._log_len_after_stop:] if app._log_len_after_stop is not None else None
+    L, A = app.args.linear, app.args.angular
+    expected = [(round(L, 2), 0.0, 0.0), (0.0, 0.0, round(A, 2)), (round(-L, 2), 0.0, 0.0),
+                (0.0, 0.0, round(-A, 2)), (0.0, round(L, 2), 0.0)]
+    checks = {
+        "each spoken move produced the right velocity, in order (fwd, left, back, right, strafe left)": moves == expected,
+        "balanced once before the first move, then 'stop' sent StopMove": sports == ["BalanceStand", "StopMove"],
+        "'stop' cancelled the step in progress (no moves afterwards)": after is not None and not any(e[0] == "move" for e in after),
+        "no voice move left running": app.voice_move is None,
+        "heard all six": [lab for _, lab in app.heard_log] == ["walk forward", "turn left", "walk backward", "turn right", "step left", "STOP"],
+    }
+    print("\nSELFTEST-VOICEMOVE heard:", app.heard_log)
+    print("SELFTEST-VOICEMOVE moves:", moves)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+def _selftest_objects_verdict(app: "App") -> int:
+    snap = app._obj_snapshot or []
+    names = {follow_mod.COCO_CLASSES[d[5]] for d in snap}
+    checks = {
+        "overlay produced detections while on (>= 5 boxes)": len(snap) >= 5,
+        "found the tv (people this small in a 16:9 frame are below what YOLOX-tiny reliably sees)": "tv" in names,
+        "found furniture too (chair or dining table)": bool(names & {"chair", "dining table"}),
+        "pressing O again switched it off and cleared the boxes": not app.objects_on and app.objects is None,
+        "objects mode never moved the dog": not any(e[0] in ("move", "sport") for e in getattr(app.robot, "log", [])),
+    }
+    print("\nSELFTEST-OBJECTS saw:", follow_mod.summarize(snap))
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+def _objects_test_canvas() -> np.ndarray | None:
+    """1280x720 frame made from the COCO living-room photo (letterboxed, grey sides)."""
+    import cv2
+
+    path = "/tmp/go2test/000000000139.jpg"
+    if not os.path.exists(path):
+        print(f"missing {path}")
+        return None
+    img = cv2.imread(path)[:, :, ::-1]
+    h, w = img.shape[:2]
+    s = 720 / h
+    big = cv2.resize(img, (int(w * s), 720))
+    canvas = np.full((720, 1280, 3), 60, np.uint8)
+    x0 = (1280 - big.shape[1]) // 2
+    canvas[:, x0 : x0 + big.shape[1]] = big
+    return canvas
+
+
+def _follow_test_canvas() -> np.ndarray | None:
+    """A 1280x720 frame with the COCO 'skier' person small and right of centre (err = +0.2, height ~0.23)."""
+    import cv2
+
+    path = "/tmp/go2test/000000000785.jpg"
+    if not os.path.exists(path):
+        print(f"missing {path}")
+        return None
+    small = cv2.resize(cv2.imread(path)[:, :, ::-1], (320, 212))
+    canvas = np.full((720, 1280, 3), 200, np.uint8)
+    canvas[300:512, 701:1021] = small
+    return canvas
+
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ip", default=os.environ.get("ROBOT_IP", "192.168.12.1"))
     p.add_argument("--demo", action="store_true", help="fake robot + synthetic video, no dog needed")
+    p.add_argument("--fetch-model", action="store_true", help="download the object detector and voice model (needs internet), then exit")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-voice", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-objects", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-voicemove", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-listen", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--wake-word", default=os.environ.get("GO2_WAKE_WORD", "ernest"),
+                   help="always-listening wake word: say it first ('ernest, sit down'); a bare 'stop' works without it")
+    p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
+    p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "1050")),
+                   help="Unitree WalkUpright id: 1050 (older numbering, what DimOS uses) or 2050 (newer); try the other if nothing happens")
+    p.add_argument("--music-volume", type=int, default=20, help="dog speaker volume for songs, percent (default 20)")
+    p.add_argument("--music-dir", default=(music_mod.MUSIC_DIR if music_mod else os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")),
+                   help="folder of songs (wav/mp3/...) to play through the dog")
+    p.add_argument("--no-music-preload", action="store_true", help="don't upload songs to the dog at startup")
+    p.add_argument("--box-wait", type=float, default=3.2, help="seconds 'box step' waits for the dog to finish standing up before balancing")
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
+    p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
+    p.add_argument("--stt", choices=["local", "elevenlabs"], default=os.environ.get("GO2_STT", "local"),
+                   help="speech-to-text for the V key: 'local' = offline Whisper (default), 'elevenlabs' = cloud (needs internet + key)")
+    p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "base.en"),
+                   help="local Whisper model (base.en is fast and accurate for short commands; small.en is slower)")
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
-    return App(p.parse_args()).run()
+    args = p.parse_args()
+    if args.fetch_model:  # everything that needs the internet, done once, so the dog's Wi-Fi is enough afterwards
+        rc = 0
+        if follow_mod is None:
+            print(f"follow.py couldn't be loaded: {_FOLLOW_ERR}")
+            rc = 1
+        elif follow_mod.model_present():
+            print("object/person detector: already downloaded")
+        else:
+            follow_mod.fetch_model()
+        if voice_mod is None:
+            print(f"voice.py couldn't be loaded: {_VOICE_ERR}")
+            rc = 1
+        elif voice_mod.whisper_model_path(args.whisper_model):
+            print(f"voice model '{args.whisper_model}': already downloaded")
+        else:
+            voice_mod.fetch_whisper_model(args.whisper_model)
+        return rc
+    image = None
+    if args.selftest_follow:
+        image = _follow_test_canvas()
+        if image is None:
+            return 2
+    if args.selftest_objects:
+        image = _objects_test_canvas()
+        if image is None:
+            return 2
+    if any(k.startswith("selftest") and v for k, v in vars(args).items()):
+        args.no_listen = args.no_music_preload = True          # tests never open the mic or upload songs on their own
+        args.box_wait = 0.4                                     # (and don't wait 3 s for a fake dog to stand)
+        if args.selftest_listen:
+            args.music_dir = _make_test_music()
+    app = App(args, demo_image=image)
+    if args.selftest_voice:
+        app.mic, app.stt = FakeMic(), FakeSTT(VOICE_TEST_LINES)
+    if args.selftest_voicemove:
+        app.mic, app.stt = FakeMic(), FakeSTT(VOICEMOVE_LINES)
+    return app.run()
 
 
 if __name__ == "__main__":
