@@ -737,14 +737,18 @@ class App:
                 time.sleep(1.5)
             order = [self.upright_api] + [a for a in (2050, 1050) if a != self.upright_api]
             for api in (order if on else order[:1]):      # going up tries the other id if the dog refuses the first
+                reply = None
                 try:
-                    code, err = _reply_code(self.robot.sport_api(api, {"data": on})), None
+                    reply = self.robot.sport_api(api, {"data": on})
+                    code, err = _reply_code(reply), None
                 except Exception as e:  # noqa: BLE001
                     code, err = None, e
                 ok = err is None and code in (0, None)
                 self.say(f"back-leg {'stand' if on else 'release'} (api {api}): "
-                         + (f"error {err}" if err else f"the dog replied code {code}") + ("" if ok else "  <- refused"),
+                         + (f"error {type(err).__name__} {err}" if err else f"the dog replied code {code}") + ("" if ok else "  <- refused"),
                          GOOD if ok else WARN)
+                if not ok and reply is not None:
+                    self.say(f"   raw reply: {str(reply)[:200]}", WARN)
                 if ok:
                     self.upright_api = api
                     return
