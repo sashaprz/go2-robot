@@ -273,6 +273,7 @@ class App:
         self.stt = None
         self.voice_state = ""       # "" | "listening" | "transcribing"
         self.voice_q: queue.Queue = queue.Queue()
+        self.voice_move = None              # {"cmd", "dur", "start", "created", "label"} while a spoken move runs
         self._voice_gen = 0                 # bumped per transcription so a timed-out one can be ignored
         self._voice_deadline = 0.0
         self.heard_log: list = []           # (transcript, matched label) - used by the self-test
@@ -299,7 +300,7 @@ class App:
     def connect_bg(self) -> None:
         try:
             if (self.args.demo or self.args.selftest or self.args.selftest_follow or self.args.selftest_voice
-                    or self.args.selftest_objects):
+                    or self.args.selftest_objects or self.args.selftest_voicemove):
                 r = FakeRobot(self.demo_image)
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
@@ -391,6 +392,7 @@ class App:
         self.follower = follow_mod.Follower(cfg)
         self.follower.reset()
         self.follow_res = None
+        self.voice_move = None
         self.following = True
         self.follow_starts += 1
         self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
@@ -519,9 +521,18 @@ class App:
             else:
                 self.handle_heard(payload)
 
+    def start_voice_move(self, intent) -> None:
+        """'walk forward', 'turn left 90 degrees', ...: a short timed move. Spoken amounts are capped (see voice.py)."""
+        cmd, secs = voice_mod.plan_motion(intent, self.args.linear, self.args.angular)
+        self.stop_follow("voice move")
+        self.abort.set()   # a running routine must not keep issuing tricks while we walk
+        self.pending = None
+        self.voice_move = {"cmd": cmd, "dur": secs, "start": None, "created": time.time(), "label": intent.label}
+        self.say(f"> {intent.label} for {secs:.1f} s   (say 'stop' / Space / any key cancels)")
+
     def handle_heard(self, text: str) -> None:
         """Turn a transcript into the same actions the keys trigger. Voice is push-to-talk, so it is deliberate:
-        tricks run directly, but starting to FOLLOW (autonomous walking) still needs the Y key."""
+        tricks, timed moves and FOLLOW all start directly. 'stop' always wins."""
         intent = voice_mod.parse_command(text) if text else None
         self.heard_log.append((text, intent.label if intent else None))
         if not text:
@@ -537,7 +548,11 @@ class App:
             self.stop_follow("voice")
         elif intent.kind == "follow":
             if not self.following and self.follow_available():
-                self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, time.time() + CONFIRM_SECS)
+                self.pending = None
+                self.voice_move = None
+                self.start_follow()
+        elif intent.kind == "move":
+            self.start_voice_move(intent)
         elif intent.kind == "sport":
             label, wait = self.lookup[intent.arg]
             self.run_trick(label, intent.arg, wait)
@@ -546,6 +561,7 @@ class App:
 
     # -- actions ----------------------------------------------------------------------------------------
     def run_trick(self, label: str, name: str, wait: float) -> None:
+        self.voice_move = None
         self.stop_follow(f"{label} pressed")
         self.say(f"> {label}")
         self.busy_until = time.time() + wait
@@ -575,6 +591,7 @@ class App:
     def emergency_stop(self) -> None:
         self.abort.set()
         self.pending = None
+        self.voice_move = None
         self.busy_until = 0.0
         self.desired = (0.0, 0.0, 0.0)
         self.stop_follow("SPACE")
@@ -637,6 +654,29 @@ class App:
         if self.robot is None:
             self.desired = (0.0, 0.0, 0.0)
             return
+        if self.voice_move:
+            vm = self.voice_move
+            if manual:
+                self.voice_move = None            # the human always wins; carry on as manual below
+                self.say("voice move cancelled (key pressed)", WARN)
+            else:
+                if vm["start"] is None and now - vm["created"] > 10:
+                    self.voice_move = None
+                    self.desired = (0.0, 0.0, 0.0)
+                    self.say("voice move dropped: the dog was busy for over 10 s", WARN)
+                    return
+                if not self.ensure_ready(now):
+                    self.desired = (0.0, 0.0, 0.0)
+                    return
+                if vm["start"] is None:
+                    vm["start"] = now
+                if now - vm["start"] >= vm["dur"]:
+                    self.voice_move = None
+                    self.desired = (0.0, 0.0, 0.0)
+                    self.say(f"{vm['label']}: done")
+                    return
+                self.desired = vm["cmd"]
+                return
         if self.following:
             if manual:
                 self.stop_follow("manual drive key")      # the human always wins; carry on as manual below
@@ -724,6 +764,10 @@ class App:
             banner = ("transcribing ...", WARN)
         elif self.pending and now < self.pending[2]:
             banner = (f"{self.pending[0]}: press Y to confirm ({self.pending[2] - now:.0f}s)", WARN)
+        elif self.voice_move:
+            vm = self.voice_move
+            banner = (f"VOICE MOVE: {vm['label']}" + ("" if vm["start"] else "  (getting ready ...)")
+                      + "     say 'stop' / Space / any key cancels", GOOD)
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
             banner = (f"FOLLOWING: {st}    (Space / T / any drive key stops)", GOOD)
@@ -749,7 +793,7 @@ class App:
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
             "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
-            "VOICE   hold V and talk: \"say hello\", \"dance two\", \"sit\", \"stretch\", \"follow me\" (then Y), \"stop\".  "
+            "VOICE   hold V: \"say hello\", \"sit\", \"dance two\", \"walk forward\", \"turn left\", \"follow me\", \"stop\".  "
             + ("Offline (local Whisper)." if self.args.stt == "local" else "Needs internet (ElevenLabs)."),
             "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
             "Click this window so it has keyboard focus.   Esc quits.",
@@ -769,9 +813,9 @@ class App:
             threading.Thread(target=self._prepare_voice, daemon=True).start()
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
-                                       objects=self.args.selftest_objects)
+                                       objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove)
                   if (self.args.selftest or self.args.selftest_follow or self.args.selftest_voice
-                      or self.args.selftest_objects) else None)
+                      or self.args.selftest_objects or self.args.selftest_voicemove) else None)
         t0 = time.time()
         try:
             while self.running:
@@ -788,6 +832,7 @@ class App:
                             self.stop_listening()
                     elif ev.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
                         self.held.clear()  # KEYUPs never arrive once focus is lost: don't keep walking
+                        self.voice_move = None
                         self.cancel_listening()
                         self.stop_follow("window lost focus")
                         self.say("window lost focus: stopped", WARN)
@@ -815,12 +860,20 @@ class App:
             return self.selftest_voice_verdict()
         if self.args.selftest_objects:
             return _selftest_objects_verdict(self)
+        if self.args.selftest_voicemove:
+            return _selftest_voicemove_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
-    def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False):
+    def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False, voicemove: bool = False):
         K = pygame
-        if objects:  # toggle the overlay on, look at it, toggle it off
+        if voicemove:  # six push-to-talk presses, one per canned transcript; 'stop' lands mid-step
+            steps = []
+            for t in (0.5, 2.6, 3.6, 4.7, 6.6, 7.2):
+                steps += [(t, K.KEYDOWN, K.K_v), (t + 0.3, K.KEYUP, K.K_v)]
+            steps.append((9.0, K.KEYDOWN, K.K_ESCAPE))
+            shot_at = 4.3
+        elif objects:  # toggle the overlay on, look at it, toggle it off
             steps = [(0.5, K.KEYDOWN, K.K_o), (0.7, K.KEYUP, K.K_o), (3.6, K.KEYDOWN, K.K_o), (3.8, K.KEYUP, K.K_o),
                      (4.6, K.KEYDOWN, K.K_ESCAPE)]
             shot_at = 2.6
@@ -855,13 +908,15 @@ class App:
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
             if t >= shot_at and not state["shot"]:
                 state["shot"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest_objects.png" if objects else
+                pygame.image.save(screen, "/tmp/go2_selftest_voicemove.png" if voicemove else
+                                  "/tmp/go2_selftest_objects.png" if objects else
                                   "/tmp/go2_selftest_voice.png" if voice else
                                   "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
             if objects and t >= 3.0 and self._obj_snapshot is None and self.objects:
                 self._obj_snapshot = list(self.objects[1])   # what the overlay held just before it was switched off
-            if follow and t >= 5.0 and not state["marked"] and isinstance(self.robot, FakeRobot):
-                state["marked"] = True  # 0.5 s after Space: nothing should move the dog from here on
+            mark_at = 5.0 if follow else 8.0 if voicemove else None
+            if mark_at and t >= mark_at and not state["marked"] and isinstance(self.robot, FakeRobot):
+                state["marked"] = True  # 0.5 s after Space / 'stop': nothing should move the dog from here on
                 self._log_len_after_stop = len(self.robot.log)
 
         return script
@@ -913,14 +968,38 @@ def _selftest_voice_verdict(app: "App") -> int:
     labels = [lab for _, lab in app.heard_log]
     checks = {
         "'say hello' -> Hello, 'dance two' -> Dance2, 'stop' -> StopMove (and nothing else)": sports == ["Hello", "Dance2", "StopMove"],
-        "'follow me' did NOT start following (needs the Y key)": app.follow_starts == 0,
+        "'follow me' started following directly (no Y needed)": app.follow_starts == 1,
         "'what is the weather' matched nothing": labels[4] is None,
         "every transcript was handled": labels == ["Hello", "Dance 2", "follow the nearest person", "STOP", None, "stop following"],
-        "'stop' cleared the pending follow confirm": app.pending is None,
-        "not following at the end": not app.following,
+        "'stop' ended the follow it had started": not app.following and app.pending is None,
     }
     print("\nSELFTEST-VOICE heard:", app.heard_log)
     print("SELFTEST-VOICE command log:", log)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+VOICEMOVE_LINES = ["walk forward", "turn left", "go back a little", "turn right 45 degrees", "step left", "stop"]
+
+
+def _selftest_voicemove_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    moves = [e[1:] for e in log if e[0] == "move"]
+    sports = [e[1] for e in log if e[0] == "sport"]
+    after = log[app._log_len_after_stop:] if app._log_len_after_stop is not None else None
+    L, A = app.args.linear, app.args.angular
+    expected = [(round(L, 2), 0.0, 0.0), (0.0, 0.0, round(A, 2)), (round(-L, 2), 0.0, 0.0),
+                (0.0, 0.0, round(-A, 2)), (0.0, round(L, 2), 0.0)]
+    checks = {
+        "each spoken move produced the right velocity, in order (fwd, left, back, right, strafe left)": moves == expected,
+        "balanced once before the first move, then 'stop' sent StopMove": sports == ["BalanceStand", "StopMove"],
+        "'stop' cancelled the step in progress (no moves afterwards)": after is not None and not any(e[0] == "move" for e in after),
+        "no voice move left running": app.voice_move is None,
+        "heard all six": [lab for _, lab in app.heard_log] == ["walk forward", "turn left", "walk backward", "turn right", "step left", "STOP"],
+    }
+    print("\nSELFTEST-VOICEMOVE heard:", app.heard_log)
+    print("SELFTEST-VOICEMOVE moves:", moves)
     for name, ok in checks.items():
         print(("  PASS  " if ok else "  FAIL  ") + name)
     return 0 if all(checks.values()) else 1
@@ -983,6 +1062,7 @@ def main() -> int:
     p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-voice", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-objects", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-voicemove", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
     p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
@@ -1022,6 +1102,8 @@ def main() -> int:
     app = App(args, demo_image=image)
     if args.selftest_voice:
         app.mic, app.stt = FakeMic(), FakeSTT(VOICE_TEST_LINES)
+    if args.selftest_voicemove:
+        app.mic, app.stt = FakeMic(), FakeSTT(VOICEMOVE_LINES)
     return app.run()
 
 

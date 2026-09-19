@@ -47,10 +47,19 @@ Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **cl
 ### Voice commands (hold `V`)
 
 Hold **V**, speak, release. Speech is transcribed **offline** by a local Whisper model (faster-whisper `base.en`, CPU), so
-it works on the dog's own Wi-Fi and your audio never leaves the PC. The transcript is matched to the same actions as the keys: "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up",
-"stretch", "wiggle your hips", "make a heart", "good boy", "recover", "greeting", and **"stop"** (emergency stop, always
-wins). "Follow me" only *offers* to follow: you still press **Y** to confirm, because that is autonomous walking.
-The window shows what it heard and what it matched.
+it works on the dog's own Wi-Fi and your audio never leaves the PC. The transcript is matched to actions, and the window
+shows what it heard and what it matched.
+
+- **Tricks and poses:** "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up", "stretch",
+  "wiggle your hips", "make a heart", "good boy", "recover", "greeting".
+- **Walking and turning (timed moves):** "walk forward", "go back", "turn left", "turn right", "turn around",
+  "step left" / "step right" (sideways). Add an amount if you like: "walk forward two seconds", "go forward one meter",
+  "turn right 45 degrees", "go back a little" (half), "walk forward a lot" (double). Defaults: 1.5 s forward/back
+  (~0.6 m at 0.4 m/s), 1 s sideways, 90 degrees for a turn, 180 for "turn around". A spoken move is **capped at 5 s
+  (~2 m)** walking or 8 s turning. A new move replaces the current one.
+- **Follow:** "follow me" starts follow mode straight away (the keyboard `T` still asks for `Y`); "stop following" ends it.
+- **"stop"** (or halt / freeze) is an emergency stop and always wins. Space, or pressing any drive key, also cancels a
+  spoken move.
 
 - **One-time download (needs internet):** `go2.bat --fetch-model` fetches the object detector and the Whisper model
   (~150 MB, cached in `~/.cache/`). After that no internet is needed.

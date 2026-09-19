@@ -213,17 +213,24 @@ class LocalWhisperSTT:
 # ---- phrase matcher ---------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Intent:
-    kind: str          # "stop" | "stop_follow" | "follow" | "sport" | "routine"
-    arg: str = ""      # sport command name / routine name
+    kind: str          # "stop" | "stop_follow" | "follow" | "sport" | "routine" | "move"
+    arg: str = ""      # sport command name / routine name / move: forward|back|strafe_left|strafe_right|turn_left|turn_right|turn_around
     label: str = ""    # for the on-screen message
+    amount: float | None = None   # move only: the number that was spoken, if any
+    unit: str = ""                # move only: "s" | "m" | "deg" (as spoken; "" = none given)
+    scale: float = 1.0            # move only: "a little" = 0.5, "a lot" = 2.0
 
+
+_MOTION = object()  # marks where the movement rules sit in the priority order (see _parse_motion)
 
 # Ordered: the first matching rule wins, so the safety words come first.
-_RULES: list[tuple[str, Intent]] = [
+_RULES: list = [
     (r"\b(stop|halt|freeze|emergency|abort)\b.*\bfollow|\bfollow\w*\b.*\b(stop|halt|off)\b|\b(don t|do not|quit|cancel) follow",
      Intent("stop_follow", label="stop following")),
     (r"\b(stop|halt|freeze|emergency|abort|whoa)\b", Intent("stop", label="STOP")),
     (r"\bfollow\w*\b", Intent("follow", label="follow the nearest person")),
+    (r"\brecover\w*\b|\bget back up\b", Intent("sport", "RecoveryStand", "Recovery stand")),  # before 'back' = move back
+    (_MOTION, None),
     (r"\bdanc\w*\s+(2|two|to|too|second)\b|\bsecond dance\b|\bother dance\b", Intent("sport", "Dance2", "Dance 2")),
     (r"\bdanc\w*\b|\bboogie\b|\bgroove\b|\bshow (me )?(your )?moves\b", Intent("sport", "Dance1", "Dance 1")),
     (r"\bgreeting\b|\bintroduce yourself\b", Intent("routine", "greeting", "greeting routine")),
@@ -232,7 +239,6 @@ _RULES: list[tuple[str, Intent]] = [
     (r"\bstretch\b", Intent("sport", "Stretch", "Stretch")),
     (r"\bhello\b|\bhi\b|\bhey\b|\bwave\b|\bsay hi\b|\bgreet\b", Intent("sport", "Hello", "Hello")),
     (r"\bhappy\b|\bcontent\b|\bgood (boy|dog|girl)\b", Intent("sport", "Content", "Content")),
-    (r"\brecover\w*\b|\bget back up\b", Intent("sport", "RecoveryStand", "Recovery stand")),
     (r"\brise\b|\bget up from (sitting|sit)\b", Intent("sport", "RiseSit", "Rise from sit")),
     (r"\bsit\b", Intent("sport", "Sit", "Sit")),
     (r"\b(lie|lay|lying) down\b|\bget down\b|\bdown\b", Intent("sport", "StandDown", "Lie down")),
@@ -241,12 +247,106 @@ _RULES: list[tuple[str, Intent]] = [
 ]
 
 
+_UNITS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+          "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16,
+          "seventeen": 17, "eighteen": 18, "nineteen": 19}
+_TENS = {"twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _words_to_digits(t: str) -> str:
+    """'turn left forty five degrees' -> 'turn left 45 degrees' (runs of number words become one number)."""
+    out, run = [], []
+
+    def flush():
+        if run:
+            cur = 0
+            for w in run:
+                if w == "hundred":
+                    cur = (cur or 1) * 100
+                else:
+                    cur += _UNITS.get(w, 0) + _TENS.get(w, 0)
+            out.append(str(cur))
+            run.clear()
+
+    for w in t.split():
+        if w in _UNITS or w in _TENS or (w == "hundred" and run):
+            run.append(w)
+        else:
+            flush()
+            out.append(w)
+    flush()
+    return " ".join(out)
+
+
+def _parse_motion(t: str) -> Intent | None:
+    """Walk/turn phrases: 'walk forward', 'go back a little', 'turn left', 'turn right 45 degrees', 'step left'."""
+    t = _words_to_digits(t)
+    side = re.search(r"\b(left|right)\b", t)
+    side = side.group(1) if side else None
+    if re.search(r"\b(turn|rotate|spin|pivot|face)\b", t):
+        if re.search(r"\b(around|about|180)\b", t):
+            arg, label = "turn_around", "turn around"
+        elif side:
+            arg, label = f"turn_{side}", f"turn {side}"
+        else:
+            return None
+    elif side and re.search(r"\b(strafe|straf\w*|strap|struff|strife|sidestep|side step|slide|shuffle|step|go|walk|move|head|scoot|shift)\b", t):
+        arg, label = f"strafe_{side}", f"step {side}"
+    elif re.search(r"\b(back|backward|backwards|reverse|retreat)\b", t):
+        arg, label = "back", "walk backward"
+    elif re.search(r"\b(forward|forwards|ahead|straight|advance)\b", t):
+        arg, label = "forward", "walk forward"
+    else:
+        return None
+    m = re.search(r"(\d+(?:_\d+)?)\s*(seconds?|secs?|meters?|metres?|degrees?|deg)?\b", t)
+    amount, unit = None, ""
+    if m:
+        amount = float(m.group(1).replace("_", "."))
+        u = (m.group(2) or "")
+        unit = "s" if u.startswith("sec") else "m" if u.startswith(("meter", "metre")) else "deg" if u.startswith("deg") else ""
+    scale = 0.5 if re.search(r"\b(little|bit|slightly|tiny|small|short)\b", t) else 2.0 if re.search(r"\b(lot|far|long|way)\b", t) else 1.0
+    return Intent("move", arg, label, amount, unit, scale)
+
+
+def plan_motion(intent: Intent, linear: float, angular: float) -> tuple[tuple[float, float, float], float]:
+    """(vx, vy, yaw), seconds for a 'move' intent, at the given base speeds. Durations are capped for safety."""
+    import math
+
+    vec = {"forward": (linear, 0.0, 0.0), "back": (-linear, 0.0, 0.0),
+           "strafe_left": (0.0, linear, 0.0), "strafe_right": (0.0, -linear, 0.0),
+           "turn_left": (0.0, 0.0, angular), "turn_right": (0.0, 0.0, -angular), "turn_around": (0.0, 0.0, angular)}[intent.arg]
+    if intent.arg.startswith("turn"):
+        default_deg = 180.0 if intent.arg == "turn_around" else 90.0
+        deg = intent.amount if intent.amount is not None and intent.unit in ("", "deg") else default_deg * intent.scale
+        secs = math.radians(abs(deg)) / max(angular, 1e-3)
+        cap = MAX_TURN_SECONDS
+    else:
+        default_s = 1.0 if intent.arg.startswith("strafe") else 1.5
+        if intent.amount is not None and intent.unit == "m":
+            secs = intent.amount / max(linear, 1e-3)
+        elif intent.amount is not None and intent.unit in ("", "s"):
+            secs = intent.amount
+        else:
+            secs = default_s * intent.scale
+        cap = MAX_WALK_SECONDS
+    return vec, min(max(secs, 0.3), cap)
+
+
+MAX_WALK_SECONDS = 5.0    # a voice walk never lasts longer than this (~2 m at 0.4 m/s)
+MAX_TURN_SECONDS = 8.0    # ~ one full turn at 0.8 rad/s
+
+
 def parse_command(text: str) -> Intent | None:
-    t = re.sub(r"[^a-z0-9 ]+", " ", text.lower().replace("'", " "))
+    t = re.sub(r"(?<=\d)\.(?=\d)", "_", text.lower().replace("'", " "))   # keep 1.5 as one number
+    t = re.sub(r"[^a-z0-9_ ]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     if not t:
         return None
     for pattern, intent in _RULES:
-        if re.search(pattern, t):
+        if pattern is _MOTION:
+            found = _parse_motion(t)
+            if found:
+                return found
+        elif re.search(pattern, t):
             return intent
     return None
