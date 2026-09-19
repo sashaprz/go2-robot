@@ -768,7 +768,11 @@ class App:
                 if ok:
                     self.upright_api = api
                     return
-            raise RuntimeError("the dog refused every back-leg command (" + "; ".join(tried) + "). This model/firmware may not support it")
+            try:
+                mode = self.robot.motion_mode()
+            except Exception:  # noqa: BLE001
+                mode = "unknown"
+            raise RuntimeError(f"the dog (motion mode: {mode}) refused every back-leg command (" + "; ".join(tried) + ")")
         except Exception as e:  # noqa: BLE001
             self.say(f"back-leg stand {'on' if on else 'off'} failed: {e}", BAD)
             if on:
