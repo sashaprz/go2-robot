@@ -23,7 +23,32 @@ running inside WSL2 (Ubuntu 24.04).
    (`/mnt/c/Users/Sasha/go2-robot/...`); edit the path in `dimos-go2.bat` and `fetch-aes-key.bat`
    if your clone lives elsewhere or your Windows username differs.
 
-## Driving the dog
+## All-in-one: camera + driving + tricks (`go2.bat`)
+
+One window with the dog's live camera (FPV), keyboard driving, and poses/tricks. Needs no internet; join the dog's
+Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **click the window** for keyboard focus.
+`go2.bat --demo` previews the window with a fake robot and synthetic video (no dog needed).
+
+| Keys | Action |
+|---|---|
+| W / S | forward / back |
+| Q / E | strafe left / right |
+| A / D | turn left / right |
+| Shift / Ctrl (held) | faster x1.5 / slower x0.5 (base 0.4 m/s, 0.8 rad/s; `--linear` / `--angular` change it) |
+| Space | emergency stop (also aborts a routine) |
+| 1-6 | stand up, balance, lie down, recovery stand, sit, rise from sit |
+| 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
+| N / M, R, then **Y** | dance 1 / dance 2 / greeting routine, each needs a confirming Y within 4 s |
+| Esc | quit |
+
+Driving sends BalanceStand first automatically, and is locked out while a trick is running (Space clears it).
+Losing window focus stops the dog. Flips/handstand are deliberately not included. Which tricks an Air accepts depends
+on model and firmware. `--motion-mode mcf` (DimOS notes that mode is the one that traverses stairs) is an untested opt-in.
+
+## Driving the dog with DimOS instead (`dimos-go2.bat`)
+
+The full DimOS stack: keyboard teleop plus optional mapping/navigation and agent blueprints. It has no camera in the
+keyboard blueprint. `go2.bat` and `dimos-go2.bat` can't run at the same time: the dog accepts one controller.
 
 1. Power on the dog. Close the Unitree Go phone app (only one controller can connect at a time).
 2. Join the dog's Wi-Fi: **Go2_61331_29d4be72**, password **88888888** (Unitree's default). The PC will have
@@ -67,7 +92,8 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 
 ## Files
 
-- `dimos-go2.bat` / `run_dimos.sh`: launcher (Windows entry point / script that runs inside WSL)
+- `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks window (recommended)
+- `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
 - `fetch-aes-key.bat` / `fetch_aes_key.sh`: fetch and save the AES key
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete**: it uses a library without
   AES-key support, so it can't connect to current firmware. Kept for reference.
