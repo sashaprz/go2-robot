@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import queue
 import sys
 import threading
 import time
@@ -36,6 +37,12 @@ try:
 except Exception as _e:  # noqa: BLE001 - go2.py must still run without it
     follow_mod = None
     _FOLLOW_ERR = str(_e)
+
+try:
+    import voice as voice_mod  # push-to-talk mic + ElevenLabs speech-to-text + phrase matcher (voice.py)
+except Exception as _ve:  # noqa: BLE001
+    voice_mod = None
+    _VOICE_ERR = str(_ve)
 
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
@@ -67,11 +74,12 @@ CONFIRM_TRICKS = {
 }
 ROUTINE_KEY = pygame.K_r
 FOLLOW_KEY = pygame.K_t
+VOICE_KEY = pygame.K_v   # hold to talk
 # EDIT FREELY. Timed lists of the sport commands above; each step waits that command's busy time.
 ROUTINES = {"greeting": ["StandUp", "BalanceStand", "Hello", "Content", "WiggleHips", "Sit"]}
 # Deliberately absent: flips, handstand, bound. They can hurt the robot and most aren't supported on an Air.
 
-WIN_W, WIN_H = 1024, 712
+WIN_W, WIN_H = 1024, 736
 VIDEO_H = 576
 BG = (18, 20, 24)
 TXT = (225, 228, 232)
@@ -192,6 +200,26 @@ class FakeRobot:
         self._halt.set()
 
 
+class FakeMic:
+    """Self-test stand-in for voice.MicRecorder: 'records' one second of silence."""
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> bytes:
+        return b"\x01\x00" * 16000
+
+
+class FakeSTT:
+    """Self-test stand-in for voice.ElevenLabsSTT: returns canned transcripts in order."""
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    def transcribe(self, pcm: bytes) -> str:
+        return self.lines.pop(0)
+
+
 # ---- the app ----------------------------------------------------------------------------------------------
 class App:
     def __init__(self, args, demo_image=None):
@@ -228,6 +256,13 @@ class App:
         self._detector_loading = False
         self.follow_res = None      # (timestamp, FollowResult, frame_shape)
         self._log_len_after_stop = None  # selftest bookkeeping
+        # voice (push-to-talk)
+        self.mic = None
+        self.stt = None
+        self.voice_state = ""       # "" | "listening" | "transcribing"
+        self.voice_q: queue.Queue = queue.Queue()
+        self.heard_log: list = []           # (transcript, matched label) - used by the self-test
+        self.follow_starts = 0              # how many times follow actually started - self-test
 
     # -- feedback ---------------------------------------------------------------------------------------
     def say(self, text: str, color=TXT) -> None:
@@ -245,7 +280,7 @@ class App:
     # -- robot plumbing ---------------------------------------------------------------------------------
     def connect_bg(self) -> None:
         try:
-            if self.args.demo or self.args.selftest or self.args.selftest_follow:
+            if self.args.demo or self.args.selftest or self.args.selftest_follow or self.args.selftest_voice:
                 r = FakeRobot(self.demo_image)
             else:
                 key = os.environ.get("UNITREE_AES_128_KEY")
@@ -323,6 +358,7 @@ class App:
         self.follower.reset()
         self.follow_res = None
         self.following = True
+        self.follow_starts += 1
         self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
         if self.detector is None and not self._detector_loading:
             self._detector_loading = True
@@ -353,6 +389,94 @@ class App:
             self.follow_res = (time.time(), res, frame.shape)
             if res.lost:
                 self.stop_follow(res.status)
+
+    # -- voice (push-to-talk) ---------------------------------------------------------------------------
+    def voice_ready(self) -> bool:
+        if self.mic is not None and self.stt is not None:  # (self-tests inject fakes)
+            return True
+        if voice_mod is None:
+            self.say(f"voice.py couldn't be loaded: {_VOICE_ERR}", BAD)
+            return False
+        key = os.environ.get("ELEVENLABS_API_KEY")
+        if not key:
+            self.say("No ELEVENLABS_API_KEY. Run set-elevenlabs-key.bat, then restart go2.bat", WARN)
+            return False
+        self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.ElevenLabsSTT(key)
+        return True
+
+    def start_listening(self) -> None:
+        if self.voice_state or not self.voice_ready():
+            return
+        try:
+            self.mic.start()
+        except Exception as e:  # noqa: BLE001
+            self.say(f"voice: {e}", BAD)
+            return
+        self.voice_state = "listening"
+
+    def stop_listening(self) -> None:
+        if self.voice_state != "listening":
+            return
+        pcm = self.mic.stop()
+        if voice_mod is not None and voice_mod.too_short(pcm):
+            self.voice_state = ""
+            self.say("too short: hold V the whole time you speak", WARN)
+            return
+        self.voice_state = "transcribing"
+        threading.Thread(target=self._transcribe, args=(pcm,), daemon=True).start()
+
+    def cancel_listening(self) -> None:
+        if self.voice_state == "listening":
+            try:
+                self.mic.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self.voice_state = ""
+            self.say("voice cancelled (window lost focus)", WARN)
+
+    def _transcribe(self, pcm: bytes) -> None:
+        try:
+            self.voice_q.put(("heard", self.stt.transcribe(pcm)))
+        except Exception as e:  # noqa: BLE001 - VoiceError or anything else: show it, never crash the window
+            self.voice_q.put(("error", str(e)))
+        finally:
+            self.voice_state = ""
+
+    def drain_voice(self) -> None:
+        while True:
+            try:
+                kind, payload = self.voice_q.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "error":
+                self.say(f"voice: {payload}", BAD)
+            else:
+                self.handle_heard(payload)
+
+    def handle_heard(self, text: str) -> None:
+        """Turn a transcript into the same actions the keys trigger. Voice is push-to-talk, so it is deliberate:
+        tricks run directly, but starting to FOLLOW (autonomous walking) still needs the Y key."""
+        intent = voice_mod.parse_command(text) if text else None
+        self.heard_log.append((text, intent.label if intent else None))
+        if not text:
+            self.say("heard nothing", WARN)
+            return
+        if intent is None:
+            self.say(f'heard: "{text}"  (no command matched)', WARN)
+            return
+        self.say(f'heard: "{text}"  ->  {intent.label}', GOOD)
+        if intent.kind == "stop":
+            self.emergency_stop()
+        elif intent.kind == "stop_follow":
+            self.stop_follow("voice")
+        elif intent.kind == "follow":
+            if not self.following and self.follow_available():
+                self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, time.time() + CONFIRM_SECS)
+        elif intent.kind == "sport":
+            label, wait = self.lookup[intent.arg]
+            self.run_trick(label, intent.arg, wait)
+        elif intent.kind == "routine":
+            self.run_routine(intent.arg)
 
     # -- actions ----------------------------------------------------------------------------------------
     def run_trick(self, label: str, name: str, wait: float) -> None:
@@ -412,6 +536,8 @@ class App:
                 self.stop_follow("T pressed")
             elif self.follow_available():
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key == VOICE_KEY:
+            self.start_listening()
         elif key in TRICKS:
             self.run_trick(*TRICKS[key])
         elif key in CONFIRM_TRICKS:
@@ -504,7 +630,11 @@ class App:
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
 
         banner = None
-        if self.pending and now < self.pending[2]:
+        if self.voice_state == "listening":
+            banner = ("LISTENING ...  release V to send", BAD)
+        elif self.voice_state == "transcribing":
+            banner = ("transcribing ...", WARN)
+        elif self.pending and now < self.pending[2]:
             banner = (f"{self.pending[0]}: press Y to confirm ({self.pending[2] - now:.0f}s)", WARN)
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
@@ -531,10 +661,11 @@ class App:
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
             "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
+            "VOICE   hold V and talk: \"say hello\", \"dance two\", \"sit\", \"stretch\", \"follow me\" (then Y), \"stop\".  Needs internet.",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
         for i, line in enumerate(lines):
-            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 4 else DIM, 21)
+            self.text(screen, line, 12, VIDEO_H + 10 + i * 24, TXT if i < 5 else DIM, 21)
 
     # -- main loop --------------------------------------------------------------------------------------
     def run(self) -> int:
@@ -545,7 +676,8 @@ class App:
         threading.Thread(target=self.control_loop, daemon=True).start()
         threading.Thread(target=self.follow_loop, daemon=True).start()
         clock = pygame.time.Clock()
-        script = self.selftest_script(follow=self.args.selftest_follow) if (self.args.selftest or self.args.selftest_follow) else None
+        script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice)
+                  if (self.args.selftest or self.args.selftest_follow or self.args.selftest_voice) else None)
         t0 = time.time()
         try:
             while self.running:
@@ -558,10 +690,14 @@ class App:
                         self.on_key(ev.key)
                     elif ev.type == pygame.KEYUP:
                         self.held.discard(ev.key)
+                        if ev.key == VOICE_KEY:
+                            self.stop_listening()
                     elif ev.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
                         self.held.clear()  # KEYUPs never arrive once focus is lost: don't keep walking
+                        self.cancel_listening()
                         self.stop_follow("window lost focus")
                         self.say("window lost focus: stopped", WARN)
+                self.drain_voice()
                 self.update_velocity()
                 self.draw(screen)
                 pygame.display.flip()
@@ -581,12 +717,20 @@ class App:
             pygame.quit()
         if self.args.selftest_follow:
             return self.selftest_follow_verdict()
+        if self.args.selftest_voice:
+            return self.selftest_voice_verdict()
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
-    def selftest_script(self, follow: bool = False):
+    def selftest_script(self, follow: bool = False, voice: bool = False):
         K = pygame
-        if follow:
+        if voice:  # hold V briefly for each canned transcript (see main(): FakeMic / FakeSTT)
+            steps = []
+            for i in range(6):
+                steps += [(0.5 + i * 0.7, K.KEYDOWN, K.K_v), (0.8 + i * 0.7, K.KEYUP, K.K_v)]
+            steps.append((5.8, K.KEYDOWN, K.K_ESCAPE))
+            shot_at = 3.6
+        elif follow:
             steps = [(0.5, K.KEYDOWN, K.K_t), (0.7, K.KEYUP, K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
                      (4.5, K.KEYDOWN, K.K_SPACE), (7.0, K.KEYDOWN, K.K_ESCAPE)]
             shot_at = 3.5
@@ -611,7 +755,8 @@ class App:
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
             if t >= shot_at and not state["shot"]:
                 state["shot"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
+                pygame.image.save(screen, "/tmp/go2_selftest_voice.png" if voice else
+                                  "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
             if follow and t >= 5.0 and not state["marked"] and isinstance(self.robot, FakeRobot):
                 state["marked"] = True  # 0.5 s after Space: nothing should move the dog from here on
                 self._log_len_after_stop = len(self.robot.log)
@@ -634,6 +779,9 @@ class App:
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
 
+    def selftest_voice_verdict(self) -> int:
+        return _selftest_voice_verdict(self)
+
     def selftest_follow_verdict(self) -> int:
         log = self.robot.log if isinstance(self.robot, FakeRobot) else []
         sports = [e[1] for e in log if e[0] == "sport"]
@@ -651,6 +799,28 @@ class App:
         for name, ok in checks.items():
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
+
+
+VOICE_TEST_LINES = ["say hello", "dance two", "follow me", "stop", "what is the weather", "stop following"]
+
+
+def _selftest_voice_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    sports = [e[1] for e in log if e[0] == "sport"]
+    labels = [lab for _, lab in app.heard_log]
+    checks = {
+        "'say hello' -> Hello, 'dance two' -> Dance2, 'stop' -> StopMove (and nothing else)": sports == ["Hello", "Dance2", "StopMove"],
+        "'follow me' did NOT start following (needs the Y key)": app.follow_starts == 0,
+        "'what is the weather' matched nothing": labels[4] is None,
+        "every transcript was handled": labels == ["Hello", "Dance 2", "follow the nearest person", "STOP", None, "stop following"],
+        "'stop' cleared the pending follow confirm": app.pending is None,
+        "not following at the end": not app.following,
+    }
+    print("\nSELFTEST-VOICE heard:", app.heard_log)
+    print("SELFTEST-VOICE command log:", log)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
 
 
 def _follow_test_canvas() -> np.ndarray | None:
@@ -674,6 +844,7 @@ def main() -> int:
     p.add_argument("--fetch-model", action="store_true", help="download the person detector (needs internet), then exit")
     p.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-follow", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-voice", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
     p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
@@ -691,7 +862,10 @@ def main() -> int:
         image = _follow_test_canvas()
         if image is None:
             return 2
-    return App(args, demo_image=image).run()
+    app = App(args, demo_image=image)
+    if args.selftest_voice:
+        app.mic, app.stt = FakeMic(), FakeSTT(VOICE_TEST_LINES)
+    return app.run()
 
 
 if __name__ == "__main__":

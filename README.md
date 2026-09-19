@@ -40,7 +40,24 @@ Wi-Fi (see below), close the phone app, then double-click **`go2.bat`** and **cl
 | 7 8 9 0 F | hello, stretch, content, wiggle hips, finger heart |
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine, each needs a confirming Y within 4 s |
 | T, then **Y** | follow the nearest person (see below); T again / Space / any drive or trick key stops it |
+| V (hold) | push-to-talk voice commands (see below) |
 | Esc | quit |
+
+### Voice commands (hold `V`)
+
+Hold **V**, speak, release. The audio is sent to ElevenLabs speech-to-text **only while V is held**, and the transcript is
+matched to the same actions as the keys: "say hello" / "wave", "dance" / "dance two", "sit", "lie down", "stand up",
+"stretch", "wiggle your hips", "make a heart", "good boy", "recover", "greeting", and **"stop"** (emergency stop, always
+wins). "Follow me" only *offers* to follow: you still press **Y** to confirm, because that is autonomous walking.
+The window shows what it heard and what it matched.
+
+- **API key:** run `set-elevenlabs-key.bat` once (hidden prompt; saved to `~/.dimos.env` in WSL, never in the repo).
+  The key needs the speech-to-text permission. Model is `scribe_v2` (override with `ELEVENLABS_STT_MODEL`), language
+  `en` (`ELEVENLABS_STT_LANG`).
+- **Needs internet.** The dog's own Wi-Fi has none. Give the PC a second connection with internet while it is on the
+  dog's Wi-Fi (e.g. USB tethering from a phone) or put the dog on a shared network. Without it the window says
+  "can't reach ElevenLabs".
+- **Microphone:** captured through WSLg's PulseAudio (`libpulse-simple`); Windows must allow microphone access.
 
 ### Follow mode (`T`)
 
@@ -104,6 +121,8 @@ List them all with `dimos list` inside WSL. If the dog is on another network (ST
 
 - `go2.bat` / `run_go2.sh` / `go2.py`: all-in-one FPV + driving + tricks + follow window (recommended)
 - `follow.py`: person detector and follow controller used by `go2.py`
+- `voice.py`: microphone capture, ElevenLabs speech-to-text client, and phrase matcher used by `go2.py`
+- `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`: save your ElevenLabs API key (hidden prompt)
 - `dimos-go2.bat` / `run_dimos.sh`: launcher for DimOS blueprints (Windows entry point / script that runs inside WSL)
 - `fetch-aes-key.bat` / `fetch_aes_key.sh`: fetch and save the AES key
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete**: it uses a library without
