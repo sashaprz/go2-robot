@@ -7,9 +7,10 @@ This is a webcam-only test:
 - print the matching action without connecting to a robot
 
 Useful beginner mapping:
-- peace       -> walk forward
-- thumbs down -> walk backward
-- fist        -> sit
+- peace              -> walk forward
+- thumbs down        -> walk backward
+- horizontal hand    -> sit
+- flat hand up       -> stand up
 
 Run:
     py gesture_test.py
@@ -51,7 +52,8 @@ def action_for_gesture(gesture: str) -> str:
     return {
         "peace": "WALK FORWARD",
         "thumbs_down": "WALK BACKWARD",
-        "fist": "SIT",
+        "horizontal_hand": "SIT",
+        "flat_hand": "STAND UP",
     }.get(gesture, "NO COMMAND")
 
 
@@ -59,20 +61,33 @@ def gesture_from_landmarks(landmarks):
     """Very simple gesture detector for a beginner setup."""
     index_tip = landmarks[8]
     index_pip = landmarks[6]
+    index_mcp = landmarks[5]
     middle_tip = landmarks[12]
     middle_pip = landmarks[10]
+    middle_mcp = landmarks[9]
     ring_tip = landmarks[16]
     ring_pip = landmarks[14]
+    ring_mcp = landmarks[13]
     pinky_tip = landmarks[20]
     pinky_pip = landmarks[18]
+    pinky_mcp = landmarks[17]
     thumb_tip = landmarks[4]
     thumb_ip = landmarks[3]
     thumb_mcp = landmarks[2]
 
-    index_open = index_tip.y < index_pip.y
-    middle_open = middle_tip.y < middle_pip.y
-    ring_open = ring_tip.y < ring_pip.y
-    pinky_open = pinky_tip.y < pinky_pip.y
+    # More robust finger detection: check if finger is extended by comparing distances
+    # Extended finger: tip is far from MCP joint
+    # Curled finger: tip is close to MCP joint
+    def finger_extended(tip, mcp, pip):
+        tip_to_mcp = math.dist((tip.x, tip.y), (mcp.x, mcp.y))
+        pip_to_mcp = math.dist((pip.x, pip.y), (mcp.x, mcp.y))
+        # If tip is at least 1.5x further from MCP than PIP is, finger is extended
+        return tip_to_mcp > pip_to_mcp * 1.5
+
+    index_open = finger_extended(index_tip, index_mcp, index_pip)
+    middle_open = finger_extended(middle_tip, middle_mcp, middle_pip)
+    ring_open = finger_extended(ring_tip, ring_mcp, ring_pip)
+    pinky_open = finger_extended(pinky_tip, pinky_mcp, pinky_pip)
 
     fingers_closed = not index_open and not middle_open and not ring_open and not pinky_open
     thumb_extended = math.dist((thumb_tip.x, thumb_tip.y), (thumb_mcp.x, thumb_mcp.y)) > (
@@ -90,6 +105,28 @@ def gesture_from_landmarks(landmarks):
 
     if index_open and middle_open and not ring_open and not pinky_open:
         return "peace"
+
+    # All fingers extended: check orientation
+    if index_open and middle_open and ring_open and pinky_open:
+        # Calculate average horizontal vs vertical spread of fingers
+        avg_x_dist = abs(index_tip.x - pinky_tip.x)
+        avg_y_dist = abs(index_tip.y - pinky_tip.y)
+
+        # Horizontal hand (karate chop): fingers spread more horizontally than vertically
+        if avg_x_dist > avg_y_dist * 1.3:
+            return "horizontal_hand"
+
+        # Palm down: fingers pointing down (tips below PIPs in screen coordinates)
+        fingers_down = (index_tip.y > index_pip.y and
+                       middle_tip.y > middle_pip.y and
+                       ring_tip.y > ring_pip.y and
+                       pinky_tip.y > pinky_pip.y)
+
+        if fingers_down:
+            return "palm_down"
+        else:
+            # Flat hand / palm forward: fingers pointing up
+            return "flat_hand"
 
     return "unknown"
 
@@ -111,10 +148,16 @@ class GestureController:
         elif gesture == "thumbs_down":
             print("WALK BACKWARD")
             self.robot.move(-self.forward_speed, 0.0, 0.0)
-        elif gesture == "fist":
+        elif gesture == "horizontal_hand":
             print("SIT")
             if hasattr(self.robot, "sport"):
                 self.robot.sport("Sit")
+            else:
+                self.robot.stop_move()
+        elif gesture == "flat_hand":
+            print("STAND UP")
+            if hasattr(self.robot, "sport"):
+                self.robot.sport("StandUp")
             else:
                 self.robot.stop_move()
         else:
@@ -154,7 +197,7 @@ def main() -> int:
     robot = FakeRobot()
     print("Test mode: no real robot connection")
     controller = GestureController(robot, forward_speed=args.forward_speed, turn_speed=args.turn_speed)
-    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7, min_tracking_confidence=0.7)
+    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
     cap = cv2.VideoCapture(args.camera_index)
 
     if not cap.isOpened():
@@ -162,7 +205,7 @@ def main() -> int:
         return 1
 
     print("Press ESC to quit.")
-    print("Commands: peace = walk forward, thumbs down = walk backward, fist = sit")
+    print("Commands: peace = walk forward, thumbs down = walk backward, horizontal hand = sit, flat hand up = stand up")
 
     while True:
         ok, frame = cap.read()
@@ -178,7 +221,25 @@ def main() -> int:
                 gesture = gesture_from_landmarks(hand.landmark)
                 controller.decide(gesture)
                 action = action_for_gesture(gesture)
+
+                # Show detected gesture and finger states for debugging
+                def finger_ext_debug(tip_idx, mcp_idx, pip_idx):
+                    tip = hand.landmark[tip_idx]
+                    mcp = hand.landmark[mcp_idx]
+                    pip = hand.landmark[pip_idx]
+                    tip_to_mcp = math.dist((tip.x, tip.y), (mcp.x, mcp.y))
+                    pip_to_mcp = math.dist((pip.x, pip.y), (mcp.x, mcp.y))
+                    return tip_to_mcp > pip_to_mcp * 1.5
+
+                index_open = finger_ext_debug(8, 5, 6)
+                middle_open = finger_ext_debug(12, 9, 10)
+                ring_open = finger_ext_debug(16, 13, 14)
+                pinky_open = finger_ext_debug(20, 17, 18)
+                debug = f"I:{int(index_open)} M:{int(middle_open)} R:{int(ring_open)} P:{int(pinky_open)}"
+
                 cv2.putText(frame, action, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(frame, f"gesture: {gesture}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(frame, debug, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         cv2.imshow("Go2 gesture control", frame)
 
