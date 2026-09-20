@@ -195,6 +195,15 @@ class Robot:
 
         self._subs.append(self.c.lowstate_stream().subscribe(handle))
 
+    def on_audio(self, cb) -> None:
+        """cb(av.AudioFrame) for every audio frame from the dog's own microphone (switches the audio channel on).
+        If this dog sends no audio, cb is simply never called."""
+        async def handle(frame):
+            cb(frame)
+
+        self.c.conn.audio.add_track_callback(handle)
+        self.c.loop.call_soon_threadsafe(self.c.conn.audio.switchAudioChannel, True)
+
     def on_lidar(self, cb) -> None:
         """cb(points_world (N, 3) float32, pose (x, y, z, yaw)) for every lidar message. Switches the dog's lidar on
         (DimOS doesn't). If this dog sends no lidar, cb is simply never called."""
@@ -276,6 +285,9 @@ class FakeRobot:
 
     def on_battery(self, cb) -> None:
         cb(87)
+
+    def on_audio(self, cb) -> None:
+        pass                                            # the pretend dog has no microphone
 
     def on_lidar(self, cb) -> None:
         """A pretend lidar (self-tests): a person-sized blob of points 1.8 m ahead and 0.45 m to the right, 8 times a second."""
@@ -375,6 +387,9 @@ class App:
         self.cal_events: list = []          # (self-test) what calibration did
         self.cal = None                     # calibration in progress: {step, phase, boxes, samples, until, last}
         self._det_times: deque = deque(maxlen=30)   # when the detector last finished (for the fps readout)
+        self.dogmic = None                  # voice.DogMic: the dog's own microphone (--mic dog)
+        self.ear_source = "computer"         # which microphone the always-on ear is using
+        self._dogmic_check = None           # when to check that the dog is really sending audio
         self.heel_side = "left"             # which side of you the dog walks on, for the banner
         self._lock_warned = 0.0             # last time we said we were ignoring a stranger
         self._lidar_on = False              # has the lidar feed been started?
@@ -770,6 +785,10 @@ class App:
                     self.stt.load()
                     self.say("voice model ready (offline Whisper)", GOOD)
                     if not self.args.no_listen:
+                        if self.args.mic == "dog":                      # the dog's mic needs the connection first
+                            t0 = time.time()
+                            while self.robot is None and time.time() - t0 < 30:
+                                time.sleep(0.5)
                         self.start_listener()
         except Exception as e:  # noqa: BLE001
             self.say(f"voice model failed to load: {e}", BAD)
@@ -781,16 +800,44 @@ class App:
         if voice_mod is None or self.stt is None or self.args.stt != "local":
             self.say("always-listening needs the offline model (default --stt local)", WARN)
             return
+        mic, self.ear_source = None, "computer"
+        if self.args.mic == "dog":
+            if self.robot is None or not hasattr(self.robot, "on_audio"):
+                self.say("dog mic: not connected to the dog yet, so the ear is using the computer's microphone", WARN)
+            else:
+                try:
+                    if self.dogmic is None:
+                        self.dogmic = voice_mod.DogMic()
+                        self.robot.on_audio(self.dogmic.feed)
+                    self.dogmic.frames = 0
+                    mic, self.ear_source = self.dogmic, "dog"
+                    self._dogmic_check = time.time() + 6.0
+                except Exception as e:  # noqa: BLE001
+                    self.say(f"dog mic unavailable ({e}): using the computer's microphone", WARN)
         try:
             self.listener = voice_mod.AlwaysListener(self.stt, lambda t: self.voice_q.put(("ambient", t, -1)),
-                                                     on_error=self._ear_error, log_dir=self.args.voice_log)
+                                                     on_error=self._ear_error, log_dir=self.args.voice_log, mic=mic)
             self.listener.start()
         except Exception as e:  # noqa: BLE001
             self.listener, self.ear = None, "error"
             self.say(f"always-listening unavailable: {e}", WARN)
             return
         self.ear = "on"
-        self.say(f'always listening: say "{self.args.wake_word}" + a command. A bare "stop" works without it.', GOOD)
+        src = "the dog's own microphone" if self.ear_source == "dog" else "the computer's microphone"
+        self.say(f'always listening ({src}): say "{self.args.wake_word}" + a command. A bare "stop" works without it.', GOOD)
+
+    def update_dogmic(self, now: float) -> None:
+        """A few seconds after the ear starts on the dog's microphone: is audio really arriving? If not, say so and use the computer's mic."""
+        if self._dogmic_check is None or now < self._dogmic_check:
+            return
+        self._dogmic_check = None
+        if self.dogmic is not None and self.dogmic.frames > 0:
+            self.say(f"dog mic: receiving audio ({self.dogmic.sample_rate} Hz, {self.dogmic.channels} channel(s)). Say \"{self.args.wake_word}\" near the dog; the level shows in the top bar", GOOD)
+        elif self.ear_source == "dog":
+            self.say("dog mic: NO audio arrived from the dog (this dog may not stream its microphone). Using the computer's microphone instead", WARN)
+            self.args.mic = "pc"
+            self.stop_listener()
+            self.start_listener()
 
     def _ear_error(self, msg: str) -> None:
         self.ear = "error"
@@ -1320,7 +1367,8 @@ class App:
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
         # second row: the ear (wake word), what it last heard, the back-leg state
         if self.ear == "on":
-            ear_txt, ear_col = f'ear: ON, say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else ""), GOOD
+            ear_txt, ear_col = (f'ear: ON' + (f' (dog mic {self.dogmic.level * 100:.1f})' if self.ear_source == 'dog' and self.dogmic is not None else '')
+                                + f', say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else "")), GOOD
         elif self.ear == "error":
             ear_txt, ear_col = "ear: ERROR (press L to retry)", BAD
         else:
@@ -1436,6 +1484,7 @@ class App:
                     self.listener.paused = bool(self.voice_state)   # hold-V push-to-talk takes priority over the ear
                 self.drain_voice()
                 self.update_calibration(time.time())
+                self.update_dogmic(time.time())
                 self.update_velocity()
                 self.draw(screen)
                 pygame.display.flip()
@@ -1779,6 +1828,8 @@ def main() -> int:
     p.add_argument("--selftest-listen", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--wake-word", default=os.environ.get("GO2_WAKE_WORD", "ernest"),
                    help="always-listening wake word: say it first ('ernest, sit down'); a bare 'stop' works without it")
+    p.add_argument("--mic", choices=["pc", "dog"], default=os.environ.get("GO2_MIC", "pc"),
+                   help="microphone for the always-listening ear: pc = the computer's (default), dog = the dog's own microphone over the same link (falls back to the computer's if the dog sends no audio)")
     p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
     p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "2050")),
                    help="back-leg stand id tried first: 2050 BackStand (firmware 1.1.7+, the default) or 1050 (older); the other is the fallback")

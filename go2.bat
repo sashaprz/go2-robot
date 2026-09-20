@@ -15,6 +15,7 @@ REM     --heel-offset 0.18 : how far off-centre it holds you (0 = dead ahead lik
 REM     --heel-range 0     : ignore the lidar; the camera alone holds ~1.5 m (--heel-height 0.82 to 0.9 = closer, less exact)
 REM   --no-heel-lidar    : add this to switch the lidar off entirely (the camera alone then holds the distance).
 REM   --heel-style geometric : the older heel (camera geometry; needs calibrating with J). Not the default.
+REM   --mic dog : listen through the DOG's own microphone instead of the computer's (run dogmic-probe.bat first to see if it works).
 REM   To save what the always-on mic hears (to study misses in loud places), add: --voice-log /mnt/c/Users/Sasha/go2-voice-log
 set OPTS=--motion-mode mcf --heel-speed 1.0
 wsl -d Ubuntu-24.04 -- bash /mnt/c/Users/Sasha/go2-robot/run_go2.sh %OPTS% %*

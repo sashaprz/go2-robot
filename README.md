@@ -104,6 +104,15 @@ things worse). **When the voices around you are as loud as yours, nothing in sof
 setting): put a microphone near your mouth (a headset or clip-on mic as the Windows default input) or use push-to-talk (`V`).
 `--voice-log DIR` saves every utterance the always-on mic hears (wav + what it thought it heard) so real misses can be studied.
 
+**The dog's own microphone (`--mic dog`).** The always-on ear can listen through the dog's built-in microphone instead of the computer's, over
+the same link (the connection's audio channel; needs no computer microphone, so the laptop can stay in a backpack). Add `--mic dog` to the `OPTS`
+line in `go2.bat`. About six seconds after it starts, the window says either "dog mic: receiving audio" (and the top bar shows the mic level) or "NO
+audio arrived from the dog" and falls back to the computer's mic automatically. **Whether your dog streams its microphone, and how well it hears you
+over its own fans and gait, is unknown until you try:** run `dogmic-probe.bat` first. It records ~44 s (silence, then you saying commands at 1 m
+and 3 m), saves `dogmic_recording.wav`, and shows what the same Whisper model made of it and how far above the dog's own noise you were. Push-to-talk
+(`V`) still uses the computer's mic. Tested here only with generated speech through the whole path (8/8 commands); gait noise while walking is the
+big unknown, and the level in the top bar will show it. It is off by default.
+
 **What you can say**
 
 | Say | Does |
@@ -285,6 +294,7 @@ in mind: they are the emergency stop.
 - `corridor.py` / `corridor.bat` / `corridor-dry.bat`: walk down a corridor by lidar (self-test: `python corridor.py`; the dry one never moves the dog)
 - `pathplan.py`: lidar -> top-down room grid (saveable) -> A* path -> steering commands (self-test: `python pathplan.py`). Not used by anything yet: it is the next step (go to a place / round obstacles)
 - `lidar_probe.py` / `lidar-probe.bat`: read-only check of what the dog's lidar delivers (never moves the dog)
+- `dogmic_probe.py` / `dogmic-probe.bat`: read-only check of the dog's own microphone (never moves the dog); `dogmic_test.py`: checks the dog-mic conversion with fake frames
 - `voice.py`: microphone capture, wake word + always-listening, local Whisper (and optional ElevenLabs), phrase matcher
 - `dimos-go2.bat` / `run_dimos.sh`, `fetch-aes-key.bat` / `fetch_aes_key.sh`, `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete** (no AES-key support); kept for reference.

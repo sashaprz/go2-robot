@@ -12,3 +12,5 @@ wheel_tmp/
 lidar_recording.npz
 lidar_probe_report.txt
 heel_calibration.json
+dogmic_recording.wav
+dogmic_probe_report.txt

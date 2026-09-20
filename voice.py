@@ -119,6 +119,71 @@ class MicStream(MicRecorder):
             self._stream = None
 
 
+class DogMic:
+    """The dog's OWN microphone, streamed over the same WebRTC link (the connection's audio channel must be switched on).
+
+    Same interface as MicStream (open / read_chunk / close), so AlwaysListener can use it instead of the computer's mic.
+    feed() takes the audio frames the connection delivers (av.AudioFrame, normally 48 kHz stereo) and turns them into the
+    16 kHz mono PCM16 the speech-to-text wants. read_chunk() never blocks forever: if the dog goes quiet it returns silence,
+    so the ear stays alive (the app watches `frames` to notice a dog that never sends audio at all)."""
+
+    MAX_BUFFER_SECONDS = 10                     # never let a backlog build up if speech-to-text falls behind
+
+    def __init__(self):
+        self._buf = bytearray()
+        self._cv = threading.Condition()
+        self._closed = False
+        self._resampler = None
+        self.frames = 0                         # audio frames received so far
+        self.last_frame_at = 0.0
+        self.level = 0.0                        # smoothed loudness, 0..1 (for the on-screen meter)
+        self.sample_rate = 0
+        self.channels = 0
+
+    def open(self) -> None:
+        self._closed = False
+
+    def feed(self, frame) -> None:
+        import av
+        import numpy as np
+
+        if self._resampler is None:
+            self._resampler = av.AudioResampler(format="s16", layout="mono", rate=RATE)
+            self.sample_rate, self.channels = frame.sample_rate, len(frame.layout.channels)
+        out = self._resampler.resample(frame)
+        out = out if isinstance(out, list) else [out]
+        pcm = b"".join(f.to_ndarray().tobytes() for f in out if f is not None)
+        if not pcm:
+            return
+        x = np.frombuffer(pcm, dtype=np.int16)
+        with self._cv:
+            self.frames += 1
+            self.last_frame_at = time.time()
+            self.level = 0.9 * self.level + 0.1 * float(np.sqrt(np.mean((x.astype(np.float32) / 32768.0) ** 2)))
+            self._buf += pcm
+            cap = self.MAX_BUFFER_SECONDS * RATE * 2
+            if len(self._buf) > cap:
+                del self._buf[: len(self._buf) - cap]
+            self._cv.notify_all()
+
+    def read_chunk(self, ms: int = 100) -> bytes | None:
+        n = RATE * ms // 1000 * 2
+        with self._cv:
+            self._cv.wait_for(lambda: len(self._buf) >= n or self._closed, timeout=1.0)
+            if self._closed:
+                return None
+            if len(self._buf) < n:
+                return bytes(n)                 # nothing arrived for a second: silence, so the listener carries on
+            chunk = bytes(self._buf[:n])
+            del self._buf[:n]
+            return chunk
+
+    def close(self) -> None:
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+
 def wav_bytes(pcm: bytes) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
