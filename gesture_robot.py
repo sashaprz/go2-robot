@@ -5,10 +5,10 @@ This file is separate from gesture_test.py so the webcam test cannot connect
 to the robot by accident.
 
 Mapping:
-- peace (victory)    -> walk forward
-- thumbs_down        -> walk backward
+- peace (victory)    -> stand up
+- thumbs_down        -> lie down
 - open_palm          -> sit
-- thumbs_up          -> stand up
+- thumbs_up          -> walk forward
 """
 
 from __future__ import annotations
@@ -136,7 +136,7 @@ def main() -> int:
         return 1
 
     print("Connected. Keep the robot area clear. Press ESC to stop.")
-    print("Commands: peace = walk forward, thumbs_down = walk backward, open_palm = sit, thumbs_up = stand up")
+    print("Commands: peace = stand up, thumbs_down = lie down, open_palm = sit, thumbs_up = walk forward")
 
     frame_timestamp_ms = 0
     try:

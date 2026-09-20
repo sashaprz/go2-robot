@@ -6,10 +6,10 @@ This is a webcam-only test:
 - print the matching action without connecting to a robot
 
 Useful beginner mapping:
-- peace (victory)    -> walk forward
-- thumbs_down        -> walk backward
+- peace (victory)    -> stand up
+- thumbs_down        -> lie down
 - open_palm          -> sit
-- thumbs_up          -> stand up
+- thumbs_up          -> walk forward
 
 Run:
     python3 gesture_test.py
@@ -50,10 +50,10 @@ class FakeRobot:
 def action_for_gesture(gesture: str) -> str:
     """Map gesture names to robot actions."""
     return {
-        "peace": "WALK FORWARD",
-        "thumbs_down": "WALK BACKWARD",
+        "peace": "STAND UP",
+        "thumbs_down": "LIE DOWN",
         "open_palm": "SIT",
-        "thumbs_up": "STAND UP",
+        "thumbs_up": "WALK FORWARD",
     }.get(gesture, "NO COMMAND")
 
 
@@ -158,11 +158,17 @@ class GestureController:
 
     def _send_action(self, gesture: str) -> None:
         if gesture == "peace":
-            print("WALK FORWARD")
-            self.robot.move(self.forward_speed, 0.0, 0.0)
+            print("STAND UP")
+            if hasattr(self.robot, "sport"):
+                self.robot.sport("StandUp")
+            else:
+                self.robot.stop_move()
         elif gesture == "thumbs_down":
-            print("WALK BACKWARD")
-            self.robot.move(-self.forward_speed, 0.0, 0.0)
+            print("LIE DOWN")
+            if hasattr(self.robot, "sport"):
+                self.robot.sport("Damp")
+            else:
+                self.robot.stop_move()
         elif gesture == "open_palm":
             print("SIT")
             if hasattr(self.robot, "sport"):
@@ -170,11 +176,8 @@ class GestureController:
             else:
                 self.robot.stop_move()
         elif gesture == "thumbs_up":
-            print("STAND UP")
-            if hasattr(self.robot, "sport"):
-                self.robot.sport("StandUp")
-            else:
-                self.robot.stop_move()
+            print("WALK FORWARD")
+            self.robot.move(self.forward_speed, 0.0, 0.0)
         else:
             return
 
@@ -242,7 +245,7 @@ def main() -> int:
         return 1
 
     print("Press ESC to quit.")
-    print("Commands: peace = walk forward, thumbs_down = walk backward, open_palm = sit, thumbs_up = stand up")
+    print("Commands: peace = stand up, thumbs_down = lie down, open_palm = sit, thumbs_up = walk forward")
 
     frame_timestamp_ms = 0
     while True:
