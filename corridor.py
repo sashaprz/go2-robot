@@ -1,10 +1,14 @@
-"""Walk down a corridor: stay in the middle, keep the walls parallel, stop when something is in the way.
+"""Walk down a corridor: stay in the middle, keep the walls parallel, stop when something is in the way (or the floor ends).
 
 Purely reactive, from ONE lidar scan at a time (no map, no goal): it heads for the most open direction (so slanted
 corridors, bends and jogs are just "open to one side"), the walls on its left and right keep it centred when it is
 heading straight, and it slows near things. It stops when no direction has room (a dead end, or boxed in), and it
 does not plan: it can't choose between two openings or remember where it has been. Bends need a corridor at least ~1 m wide. (That is the map + path planner in
 pathplan.py.)
+
+Drop-offs: every scan is also checked for stairs going down or a ledge (dropoff.py: floor that stops in plain sight, or ground well below it), and one is treated as
+a wall at its lip, so the walker slows and stops in front of it (state "blocked", .why says "drop-off"). It sees them from about 2.3 m. Things up to ~1.2 m high
+count (a table top or shelf across the way stops it); above that this lidar returns nothing, so a low sign or beam is NOT seen.
 
   python corridor.py                run the self-test (simulated corridors, a dog that lags its commands): no dog needed
   python corridor.py -v             also print each scenario's track
@@ -21,8 +25,9 @@ import time
 
 import numpy as np
 
+import dropoff
 import obstacles
-from obstacles import Corridor, PathWatcher, clearance, to_dog_frame
+from obstacles import HEAD_TOP, Corridor, PathWatcher, clearance, to_dog_frame
 
 
 class CorridorWalker:
@@ -36,7 +41,8 @@ class CorridorWalker:
 
     def __init__(self, vmax: float = 0.4, stop_at: float = 0.9, slow_from: float = 1.9, hold: float = 0.6,
                  side_range: float = 1.2, look: float = 2.5, vy_max: float = 0.15, wmax: float = 0.8,
-                 k_y: float = 0.6, k_w: float = 1.5, min_points: int = 400, vmin: float = 0.12, prefer_straight: float = 0.8):
+                 k_y: float = 0.6, k_w: float = 1.5, min_points: int = 400, vmin: float = 0.12, prefer_straight: float = 0.8,
+                 cliffs: bool = True, cliff_stop: float = 1.3):
         self.vmax, self.stop_at, self.slow_from, self.hold = vmax, stop_at, slow_from, hold
         self.side_range, self.look, self.vy_max, self.wmax, self.k_y, self.k_w = side_range, look, vy_max, wmax, k_y, k_w
         self.vmin = min(vmin, vmax)         # the dog barely moves for a forward command below ~0.1 m/s: walk properly or not at all
@@ -45,6 +51,10 @@ class CorridorWalker:
         self.watch = PathWatcher(stop_at=stop_at, clear_for=1.0)
         self.bearings = np.radians(np.arange(-90, 91, 10))
         self.state, self.left, self.right, self.front, self.tilt, self.steer = "walking", None, None, None, 0.0, 0.0
+        self.cliffs = cliffs                                    # look for stairs down / ledges too
+        self.cliff_watch = PathWatcher(stop_at=cliff_stop, clear_for=1.0)     # a drop-off in the cone ahead: stops at once whatever the steering thinks
+        self.cliff: float | None = None                         # m to the nearest drop-off this scan, None if there is none
+        self.why = ""                                           # when "blocked": what is in the way
 
     def _wall(self, p: np.ndarray, sign: int) -> tuple[float | None, float | None]:
         """(distance to that side's wall in m, its angle to the dog's heading in rad), None where it can't tell."""
@@ -62,20 +72,39 @@ class CorridorWalker:
         if len(pts) < self.min_points:
             self.state = "no_data"
             return 0.0, 0.0, 0.0
-        band = pts[(pts[:, 2] > 0.15) & (pts[:, 2] < 1.0)]
+        band = pts[(pts[:, 2] > 0.15) & (pts[:, 2] < HEAD_TOP)]
         band = band[~((np.abs(band[:, 0]) < obstacles_body[0]) & (np.abs(band[:, 1]) < obstacles_body[1]))]   # not the dog itself
         (self.left, la), (self.right, ra) = self._wall(band, +1), self._wall(band, -1)
         angles = [a for a in (la, ra) if a is not None]
         self.tilt = float(np.mean(angles)) if angles else 0.0
+        ahead = band                                                            # what the strips look for: obstacles, plus the lip of any drop-off
+        self.cliff = None
+        if self.cliffs:
+            seen, low, obst, origin = dropoff.grids_from_points(pts)
+            found = dropoff.detect(seen, low, obst, origin, 0.1, (0.0, 0.0, 0.0))
+            self.cliff = found.nearest
+            in_cone = None
+            if found.nearest is not None:
+                xy = dropoff.cells_xy(found, origin, 0.1)
+                ahead = np.vstack((band, np.column_stack((xy, np.full(len(xy), 0.5)))))
+                ang = np.abs(np.arctan2(xy[:, 1], xy[:, 0]))
+                cone = (xy[:, 0] > 0.0) & (ang <= math.radians(60))
+                if cone.any():
+                    in_cone = float(np.hypot(xy[cone, 0], xy[cone, 1]).min())
+            if self.cliff_watch.update(in_cone, now):               # the steering below picks the most OPEN direction, and a lip that spans the corridor
+                self.state, self.front = "blocked", in_cone or 0.0   # leaves diagonals toward the side walls looking open: so this is a hard stop
+                self.why = "drop-off ahead (stairs down?)"
+                return 0.0, 0.0, 0.0
         clear = []
         for th in self.bearings:                                                # free distance along each bearing, for a dog-wide strip
-            c = clearance(band, Corridor(length=self.look, half_width=0.3, heading=float(th)))
+            c = clearance(ahead, Corridor(length=self.look, half_width=0.3, heading=float(th)))
             clear.append(self.look if c is None else c)
         clear = np.asarray(clear)
         if self.watch.update(float(clear.max()), now):                            # nowhere to go: stay put
             self.state, self.front = "blocked", float(clear.max())
+            self.why = "drop-off ahead (stairs down?)" if self.cliff is not None and self.cliff < self.stop_at + 1.2 else "something in the way, or a dead end"
             return 0.0, 0.0, 0.0
-        self.state = "walking"
+        self.state, self.why = "walking", ""
         score = clear - self.prefer_straight * np.abs(self.bearings - self.tilt)
         i = int(np.argmax(score))
         th, self.front, self.steer = float(self.bearings[i]), float(clear[i]), float(self.bearings[i])
@@ -130,7 +159,7 @@ def _drive(sim, walker, seconds=40.0, events=(), dt=0.1):
 
 
 def _selftest(verbose: bool) -> int:
-    from pathplan import Sim
+    from pathplan import PersistentSim, Sim
 
     checks: dict[str, bool] = {}
     end = [(7.0, -4, 7.1, 4, 1.8)]
@@ -218,6 +247,32 @@ def _selftest(verbose: bool) -> int:
         max(c[0] for c in cmds) <= 0.3 + 1e-9 and max(abs(c[1]) for c in cmds) <= 0.15 + 1e-9 and max(abs(c[2]) for c in cmds) <= 0.8 + 1e-9)
     checks["never asks for a forward speed the dog won't walk at (between 0 and 0.12 m/s)"] = all(c[0] == 0 or c[0] >= 0.12 - 1e-9 for c in cmds)
 
+    # -- stairs down at the end of the corridor, and something up high across it
+    stairs = [(4.0, -0.8, 7.0, 0.8, 0.17), (4.6, -0.8, 7.0, 0.8, 0.34)]              # two steps down, no wall at the end: the floor just stops
+    sim = PersistentSim(both, pits=stairs, floor_half=7.5, floor_per_m2=200.0)
+    w = CorridorWalker()
+    _drive(sim, w, seconds=60.0)
+    show("stairs down", sim)
+    checks[f"the corridor ends in stairs going down: it stops {4.0 - sim.x:.2f} m before the top step, blocked by a '{w.why}'"] = (
+        w.state == "blocked" and "drop-off" in w.why and sim.pit_gap() > 0.4)
+    sim = PersistentSim(both, pits=stairs, floor_half=7.5, floor_per_m2=200.0)
+    w = CorridorWalker(cliffs=False)
+    _drive(sim, w, seconds=60.0)
+    checks[f"...and with drop-off detection off the same walk goes over the top step (pit gap {sim.pit_gap():.2f} m)"] = sim.pit_gap() < 0
+
+    sim = PersistentSim(both + end, floor_half=7.5, floor_per_m2=200.0)
+    w = CorridorWalker()
+    _drive(sim, w, seconds=60.0)
+    checks[f"an ordinary corridor with a wall at the end on a dense floor: no false drop-off (state {w.state}, why '{w.why}')"] = (
+        w.state == "blocked" and "drop-off" not in w.why and sim.x > 4.5)
+
+    sim = PersistentSim(both + end, floor_half=7.5, floor_per_m2=200.0)
+    sim.add_slab(3.5, -0.8, 4.1, 0.8, 1.05, 1.15)                                    # a shelf at 1.1 m across the whole corridor: above the old 1.0 m limit
+    w = CorridorWalker()
+    _drive(sim, w, seconds=60.0)
+    checks[f"a shelf at 1.1 m across the corridor: stops before it ({3.5 - sim.x:.2f} m short, the walker's usual standoff), it used to walk under it"] = (
+        w.state == "blocked" and sim.x < 3.5)
+
     for name, ok in checks.items():
         print(("  PASS  " if ok else "  FAIL  ") + name)
     return 0 if all(checks.values()) else 1
@@ -245,6 +300,7 @@ def _live(dry: bool, seconds: float, speed: float) -> int:
             latest["v"] = (time.time(), pts, pose)
 
     r.on_lidar(on_lidar)
+    t_lidar = last_kick = time.time()
     if not dry:
         r.sport("BalanceStand")
         time.sleep(1.5)
@@ -265,6 +321,13 @@ def _live(dry: bool, seconds: float, speed: float) -> int:
                 if now - last_print > 1:
                     last_print = now
                     print("no fresh lidar: standing still", flush=True)
+                if now - (got[0] if got else t_lidar) > 4 and now - last_kick > 6:      # the dog's lidar sometimes goes quiet: reset it (off, then on)
+                    last_kick = now
+                    print("lidar silent: switching it off and on again", flush=True)
+                    pub, topic = r.c.conn.datachannel.pub_sub.publish_without_callback, r._topic["ULIDAR_SWITCH"]
+                    r.c.loop.call_soon_threadsafe(pub, topic, "off")
+                    time.sleep(0.8)
+                    r.c.loop.call_soon_threadsafe(pub, topic, "on")
                 continue
             cmd = walker.step(to_dog_frame(got[1], *got[2]), now)
             if not dry:
@@ -272,12 +335,12 @@ def _live(dry: bool, seconds: float, speed: float) -> int:
             if now - last_print > 1:
                 last_print = now
                 f = lambda v: "  -  " if v is None else f"{v:4.2f} m"      # noqa: E731
-                print(f"{walker.state:8s} left {f(walker.left)} right {f(walker.right)} open {f(walker.front)} "
-                      f"steer {math.degrees(walker.steer):+4.0f} deg  -> vx {cmd[0]:+.2f} vy {cmd[1]:+.2f} yaw {cmd[2]:+.2f}", flush=True)
+                print(f"{walker.state:8s} left {f(walker.left)} right {f(walker.right)} open {f(walker.front)} drop-off {f(walker.cliff)} "
+                      f"steer {math.degrees(walker.steer):+4.0f} deg  -> vx {cmd[0]:+.2f} vy {cmd[1]:+.2f} yaw {cmd[2]:+.2f}  {walker.why}", flush=True)
             if walker.state == "blocked":
                 blocked_since = blocked_since or now
                 if now - blocked_since > 3.0:
-                    print("stopped: end of the corridor (or something in the way)")
+                    print(f"stopped: {walker.why}")
                     break
             else:
                 blocked_since = None

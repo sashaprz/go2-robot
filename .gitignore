@@ -14,3 +14,11 @@ lidar_probe_report.txt
 heel_calibration.json
 dogmic_recording.wav
 dogmic_probe_report.txt
+.winmic_token
+winmic.log
+.phone_tls/
+.phone_token
+phone_qr.html
+phone_url.txt
+phone_server.log
+.phone_wsl_token

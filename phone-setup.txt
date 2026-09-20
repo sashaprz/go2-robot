@@ -1,0 +1,35 @@
+GO2 PHONE LINK - setup (iPhone 15 Pro)
+======================================
+
+What it does
+  * The phone's MICROPHONE becomes the voice mic: say "ernest, follow me" into the air near the phone and the app hears it.
+    (Before the phone connects, or if it drops out, the laptop mic is used automatically.)
+  * The phone's MOTION SENSORS say whether you are walking or standing. If the camera loses you, the dog now WAITS while your phone says
+    you have stopped, instead of giving up after 1-2 s. (It does not steer by the phone's compass/gyro: that didn't help in simulation.)
+
+ONCE ONLY
+  1. Make sure the laptop AND the iPhone are on the dog's Wi-Fi (the same network).
+  2. On the laptop, right-click phone-firewall.bat > Run as administrator.
+  3. Double-click go2.bat. The first launch takes ~10 s longer (it makes the certificates) and then opens phone_qr.html.
+  4. On the iPhone open Safari and go to  http://<the laptop's address>:8080   (phone_qr.html shows it, step 1).
+       - Tap "Download the certificate", Allow.
+       - Settings > "Profile Downloaded" > Install (twice).
+       - Settings > General > About > Certificate Trust Settings > switch "go2-robot local CA" ON.
+     (iPhones only give a web page the microphone and motion sensors over HTTPS, and only trust a certificate you install. This one can only
+     vouch for local names and private addresses, never a real website.)
+
+EVERY TIME
+  1. Double-click go2.bat. It opens phone_qr.html. Scan the QR code with the iPhone camera (or type the link from phone_url.txt).
+  2. Tap Start. Allow Microphone, then allow Motion & Orientation.
+  3. Leave the page open and the screen ON (the page asks iOS to keep the screen awake; if the screen locks, Safari stops the stream and the
+     app falls back to the laptop mic and the camera alone, and says so).
+  4. The app's message area says "phone connected", then "the ear is now listening through the phone microphone".
+     The top bar shows "phone mic <level>" while it is used.
+
+The link contains a secret: don't share it. Delete .phone_token to change it (then re-scan).
+
+Troubleshooting
+  * The phone can't open the page: same Wi-Fi? phone-firewall.bat run? If the dog's Wi-Fi blocks phone-to-laptop traffic (some routers isolate
+    clients) it can't work on that network: then use the laptop as a hotspot and put the phone AND the dog on... (the dog's Wi-Fi is the simplest).
+  * "Your connection is not private": the certificate isn't installed/trusted yet (step 4 above), or the laptop's address changed since (just restart go2.bat: it makes a new one and the root stays trusted).
+  * No app "phone connected": phone_server.log next to go2.bat says what it saw.

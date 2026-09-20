@@ -139,6 +139,7 @@ class DogMic:
         self.level = 0.0                        # smoothed loudness, 0..1 (for the on-screen meter)
         self.sample_rate = 0
         self.channels = 0
+        self._rec: bytearray | None = None      # push-to-talk recording, when active
 
     def open(self) -> None:
         self._closed = False
@@ -155,6 +156,12 @@ class DogMic:
         pcm = b"".join(f.to_ndarray().tobytes() for f in out if f is not None)
         if not pcm:
             return
+        self._push(pcm)
+
+    def _push(self, pcm: bytes) -> None:
+        """16 kHz mono PCM16 in: buffer it, track the level, and (push-to-talk) record it."""
+        import numpy as np
+
         x = np.frombuffer(pcm, dtype=np.int16)
         with self._cv:
             self.frames += 1
@@ -164,6 +171,8 @@ class DogMic:
             cap = self.MAX_BUFFER_SECONDS * RATE * 2
             if len(self._buf) > cap:
                 del self._buf[: len(self._buf) - cap]
+            if self._rec is not None:
+                self._rec += pcm
             self._cv.notify_all()
 
     def read_chunk(self, ms: int = 100) -> bytes | None:
@@ -182,6 +191,197 @@ class DogMic:
         with self._cv:
             self._closed = True
             self._cv.notify_all()
+
+
+def _windows_host_ip() -> str:
+    """This PC's address as seen from WSL2 (its NAT gateway), from the routing table. GO2_WIN_HOST overrides."""
+    if os.environ.get("GO2_WIN_HOST"):
+        return os.environ["GO2_WIN_HOST"]
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.read().splitlines()[1:]:
+                parts = line.split()
+                if len(parts) > 2 and parts[1] == "00000000":
+                    g = int(parts[2], 16)
+                    return ".".join(str((g >> (8 * i)) & 255) for i in range(4))
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+class WinMic(DogMic):
+    """A microphone captured on the WINDOWS side by winmic.py (go2.bat starts it) and read here over a local socket, chosen by NAME
+    (for example the AirPods) instead of whatever Windows has as its default. WSL can't start Windows programs here, so the helper
+    is started by go2.bat and this connects to it.
+
+    One capture serves both the always-on ear (read_chunk) and push-to-talk (start / stop, like MicRecorder). `error` says what is
+    wrong when nothing arrives, `frames` counts chunks, `level` is the smoothed loudness (an AirPods mic that is not really connected
+    sits at ~0.00001)."""
+
+    def __init__(self, device: str = "AirPods", host: str | None = None, port: int = 48123, token_path: str | None = None):
+        super().__init__()
+        self.device = device
+        self.host = host or _windows_host_ip()
+        self.port = port
+        self.token_path = token_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".winmic_token")
+        self.error = ""
+        self.connected = False
+        self._thread: threading.Thread | None = None
+        self._sock = None
+
+    WHAT = "the Windows mic helper"
+    HINT = "launch go2.bat, which starts it"
+
+    def open(self) -> None:
+        with self._cv:
+            self._closed = False
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(target=self._run, daemon=True, name="winmic")
+            self._thread.start()
+
+    def _run(self) -> None:
+        import socket
+
+        while not self._closed:
+            try:
+                with open(self.token_path, encoding="ascii") as f:
+                    token = f.read().strip()
+            except OSError:
+                self.error = f"{self.WHAT} hasn't started (no {os.path.basename(self.token_path)}): {self.HINT}"
+                time.sleep(1.0)
+                continue
+            sock = socket.socket()
+            sock.settimeout(4.0)
+            try:
+                sock.connect((self.host, self.port))
+                sock.sendall(token.encode("ascii"))
+            except OSError as e:
+                self.error = f"can't reach {self.WHAT} at {self.host}:{self.port} ({type(e).__name__}): {self.HINT}"
+                sock.close()
+                time.sleep(1.0)
+                continue
+            self._sock, self.connected, self.error = sock, True, ""
+            sock.settimeout(3.0)
+            carry = b""
+            try:
+                while not self._closed:
+                    data = sock.recv(6400)
+                    if not data:
+                        self.error = self.closed_msg()
+                        break
+                    data = carry + data
+                    keep = len(data) - len(data) % 2
+                    carry = data[keep:]
+                    if keep:
+                        self._push(data[:keep])
+            except socket.timeout:
+                self.error = f"{self.WHAT} stopped sending audio"
+            except OSError as e:
+                if not self._closed:
+                    self.error = f"lost {self.WHAT} ({type(e).__name__})"
+            finally:
+                self.connected = False
+                sock.close()
+            if not self._closed:
+                time.sleep(1.0)
+
+    def closed_msg(self) -> str:
+        return f"the Windows helper closed the connection (it could not open the '{self.device}' microphone? see winmic.log)"
+
+    # push-to-talk (the MicRecorder interface): record from the same capture
+    def start(self) -> None:
+        self.open()
+        with self._cv:
+            self._rec = bytearray()
+
+    def stop(self) -> bytes:
+        with self._cv:
+            rec, self._rec = self._rec, None
+        return bytes(rec or b"")
+
+    def close(self) -> None:
+        super().close()
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except OSError:
+            pass
+
+
+class PhoneMic(WinMic):
+    """The iPhone's microphone, streamed by phone_server.py (go2.bat starts it). Same socket protocol as WinMic, its own port and secret.
+    The phone only sends audio while its page is open and started, so `frames` stays 0 until then and the app keeps its other mic meanwhile."""
+    WHAT = "the phone link (phone_server.py)"
+    HINT = "launch go2.bat with PHONE=1 set, which starts it"
+
+    def __init__(self, host: str | None = None, port: int = 48125, token_path: str | None = None):
+        super().__init__("phone", host, port, token_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".phone_wsl_token"))
+
+    def closed_msg(self) -> str:
+        return "the phone link closed the connection (phone_server.py exited?)"
+
+
+class SwitchMic:
+    """The always-on ear and push-to-talk, on the PHONE's microphone whenever the phone is streaming and on the computer's microphone
+    otherwise (before the phone page is opened, after its screen locks, when its Wi-Fi drops). It switches by itself, both ways, so the
+    wake word keeps working whatever the phone does. `source` says which one is in use right now."""
+
+    LIVE_WITHIN = 1.5                       # s: the phone counts as streaming if audio arrived this recently
+    MAX_LAG = 0.25                          # s: never let the phone's audio lag behind real time by more than this
+
+    def __init__(self, phone: "PhoneMic", ear=None, ptt=None):
+        self.phone = phone
+        self._ear = ear if ear is not None else MicStream()
+        self._ptt = ptt if ptt is not None else MicRecorder()
+        self._ptt_on = None                 # which one push-to-talk is recording from
+        self._was_live = False
+
+    @property
+    def live(self) -> bool:
+        return self.phone.last_frame_at > 0 and time.time() - self.phone.last_frame_at < self.LIVE_WITHIN
+
+    @property
+    def source(self) -> str:
+        return "phone" if self.live else "computer"
+
+    def open(self) -> None:
+        self.phone.open()
+        self._ear.open()
+
+    def _flush_ear(self, ms: int) -> None:
+        """The computer's mic buffered sound while the phone was in charge: read that old sound away (fast) so it isn't heard as new."""
+        for _ in range(60):
+            t0 = time.time()
+            if self._ear.read_chunk(ms) is None or time.time() - t0 > 0.5 * ms / 1000:
+                return                      # a read took real time: the buffer is empty, we are at 'now'
+
+    def read_chunk(self, ms: int = 100) -> bytes | None:
+        if self.live:                       # the phone sets the pace, and its audio is kept close to real time (a backlog is what makes it feel slow)
+            self._was_live = True
+            with self.phone._cv:
+                keep = int(RATE * self.MAX_LAG) * 2
+                if len(self.phone._buf) > keep + RATE * ms // 1000 * 2:
+                    del self.phone._buf[: len(self.phone._buf) - keep]
+            return self.phone.read_chunk(ms)
+        if self._was_live:                  # the phone went quiet: forget what it left, and skip the laptop mic's stale sound
+            with self.phone._cv:
+                self.phone._buf.clear()
+            self._was_live = False
+            self._flush_ear(ms)
+        return self._ear.read_chunk(ms)
+
+    def start(self) -> None:
+        self.phone.open()                   # (connects if the ear hasn't already)
+        self._ptt_on = self.phone if self.live else self._ptt
+        self._ptt_on.start()
+
+    def stop(self) -> bytes:
+        src, self._ptt_on = self._ptt_on, None
+        return src.stop() if src is not None else b""
+
+    def close(self) -> None:
+        self._ear.close()
+        self.phone.close()
 
 
 def wav_bytes(pcm: bytes) -> bytes:
@@ -306,6 +506,28 @@ class LocalWhisperSTT:
         return sane_transcript(text, len(audio) / RATE)
 
 
+class SwitchSTT:
+    """Two Whisper models: a FAST one (base.en, ~0.5-1 s here) while the phone's close microphone is in use, where the sound is clean, and the
+    more accurate slower one (small.en, ~2-3 s here) otherwise (the laptop mic in a noisy room). The speech-to-text is most of the delay after
+    you speak, and Whisper always processes a fixed 30 s window whatever the clip length, so only a smaller model is faster."""
+
+    def __init__(self, fast, accurate, use_fast):
+        self.fast, self.accurate, self.use_fast = fast, accurate, use_fast
+        self.last_used = ""
+
+    def load(self) -> None:
+        self.accurate.load()
+        try:
+            self.fast.load()
+        except Exception:  # noqa: BLE001 - the fast one is optional
+            self.fast = None
+
+    def transcribe(self, pcm: bytes) -> str:
+        m = self.fast if (self.fast is not None and self.use_fast()) else self.accurate
+        self.last_used = m.model_name
+        return m.transcribe(pcm)
+
+
 def sane_transcript(text: str, seconds: float) -> str:
     """Drop Whisper decoding loops ('a little bit of a little bit of ...'): far more words than anyone can say in
     that time, or heavily repetitive text. Real commands are a handful of words."""
@@ -324,8 +546,8 @@ def sane_transcript(text: str, seconds: float) -> str:
 # ---- phrase matcher ---------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Intent:
-    kind: str          # "stop" | "stop_follow" | "follow" | "heel" | "sport" | "routine" | "move" | "upright" | "box_step"
-    arg: str = ""      # sport command / routine name; move: forward|back|strafe_*|turn_*; upright: on|off
+    kind: str          # "stop" | "stop_follow" | "follow" | "heel" | "lead" | "sport" | "routine" | "move" | "upright" | "box_step"
+    arg: str = ""      # sport command / routine name; move: forward|back|strafe_*|turn_*; upright: on|off; lead: "AHEAD,LEFT" metres, "" = the usual spot
     label: str = ""    # for the on-screen message
     amount: float | None = None   # move only: the number that was spoken, if any
     unit: str = ""                # move only: "s" | "m" | "deg" (as spoken; "" = none given)
@@ -333,6 +555,7 @@ class Intent:
 
 
 _MOTION = object()  # marks where the movement rules sit in the priority order (see _parse_motion)
+_LEAD = object()    # ...and where "lead me ..." sits (see _parse_lead): before 'follow' and before the movement rules, which would take "lead me forward 3 metres" as a walk
 
 # Standing on the back legs (Unitree "WalkUpright"). OFF is checked before ON so "stop standing on two legs" comes down.
 # Both sit ahead of the 'stop', 'back' (move) and 'stand' (stand up) rules, which would otherwise swallow them.
@@ -348,8 +571,8 @@ _HEEL = (r"(?:\bheel\w*|\bheal\w*|\bhe ll\b|\b(?:walk|stay|come|be)\s+(?:with|be
 
 # Ordered: the first matching rule wins, so the safety words come first.
 _RULES: list = [
-    (r"\b(stop|halt|freeze|emergency|abort)\b.*\b(follow|heel|heal)|\b(follow|heel|heal)\w*\b.*\b(stop|halt|off)\b"
-     r"|\b(don t|do not|quit|cancel) (follow|heel|heal)",
+    (r"\b(stop|halt|freeze|emergency|abort)\b.*\b(follow|heel|heal|lead\w*|guid\w*)|\b(follow|heel|heal)\w*\b.*\b(stop|halt|off)\b"
+     r"|\b(don t|do not|quit|cancel) (follow|heel|heal|lead\w*|guid\w*)",
      Intent("stop_follow", label="stop following")),
     # "box step" = up on the back legs and step in a square (Whisper also writes it as box stop/stap/tap, so those count too).
     # Ahead of the 'stop' rule.
@@ -363,6 +586,7 @@ _RULES: list = [
     (_HEEL + r".*\bright\b", Intent("heel", "right", "heel (dog on your right)")),
     (_HEEL + r".*\bleft\b", Intent("heel", "left", "heel (dog on your left)")),
     (_HEEL, Intent("heel", "", "heel: walk at your side")),
+    (_LEAD, None),
     (r"\bfollow\w*\b", Intent("follow", label="follow the nearest person")),
     (r"\brecover\w*\b|\bget back up\b", Intent("sport", "RecoveryStand", "Recovery stand")),  # before 'back' = move back
     (_MOTION, None),
@@ -443,6 +667,46 @@ def _parse_motion(t: str) -> Intent | None:
     return Intent("move", arg, label, amount=amount, unit=unit, scale=scale)
 
 
+MAX_LEAD_METERS = 15.0    # a spoken lead never goes further than this in either direction
+
+_LEAD_WORDS = r"\b(?:lead|leads|leed|led|leading|guide|guides|guiding)\b"     # (Whisper hears "lead" as "led" / "leed")
+_LEAD_DIRS = {"forward": "f", "forwards": "f", "ahead": "f", "straight": "f", "left": "l", "right": "r"}
+
+
+def _parse_lead(t: str) -> Intent | None:
+    """'lead' / 'lead me' / 'lead me to the door': the usual spot (arg ""). 'lead me five metres', 'lead me forward 4 metres and left 2',
+    'guide me three metres to the right', 'lead me ten feet': arg "AHEAD,LEFT" in metres (left is positive). Each number goes with the
+    nearest direction word (ties: the one before it); a number with no direction word is forward. Seconds and degrees are not distances."""
+    if not re.search(_LEAD_WORDS, t):
+        return None
+    toks = _words_to_digits(t).split()
+    dirs = [(i, _LEAD_DIRS[w]) for i, w in enumerate(toks) if w in _LEAD_DIRS]
+    ahead = left = 0.0
+    found = False
+    for i, w in enumerate(toks):
+        if not re.fullmatch(r"\d+(?:_\d+)?", w):
+            continue
+        val = float(w.replace("_", "."))
+        unit = toks[i + 1] if i + 1 < len(toks) else ""
+        if unit.startswith(("sec", "deg", "min", "hour", "percent")):
+            continue
+        if unit in ("feet", "foot", "ft"):
+            val *= 0.3048
+        near = min(dirs, key=lambda d: (abs(d[0] - i), d[0] > i), default=None)
+        kind = near[1] if near else "f"
+        val = min(val, MAX_LEAD_METERS)
+        if kind == "f":
+            ahead += val
+        else:
+            left += val if kind == "l" else -val
+        found = True
+    if not found or (abs(ahead) < 1e-6 and abs(left) < 1e-6):
+        return Intent("lead", "", "lead: walk to the usual spot")
+    ahead, left = max(-MAX_LEAD_METERS, min(ahead, MAX_LEAD_METERS)), max(-MAX_LEAD_METERS, min(left, MAX_LEAD_METERS))
+    side = "" if abs(left) < 1e-6 else f", {abs(left):.1f} m {'left' if left > 0 else 'right'}"
+    return Intent("lead", f"{ahead:.2f},{left:.2f}", f"lead: {ahead:.1f} m ahead{side}")
+
+
 def plan_motion(intent: Intent, linear: float, angular: float) -> tuple[tuple[float, float, float], float]:
     """(vx, vy, yaw), seconds for a 'move' intent, at the given base speeds. Durations are capped for safety."""
     import math
@@ -485,6 +749,10 @@ def parse_command(text: str) -> Intent | None:
     for pattern, intent in _RULES:
         if pattern is _MOTION:
             found = _parse_motion(t)
+            if found:
+                return found
+        elif pattern is _LEAD:
+            found = _parse_lead(t)
             if found:
                 return found
         elif re.search(pattern, t):
@@ -586,6 +854,9 @@ class AlwaysListener:
         self.mic = mic or MicStream()
         self.seg = segmenter or UtteranceSegmenter()
         self.paused = False
+        self.last_latency = 0.0                                 # s from the end of the last utterance to its transcript (queue wait + speech-to-text)
+        self.last_stt = 0.0                                     # s of that spent in the speech-to-text itself
+        self.stale_after = 6.0                                  # s: an utterance that waited longer than this is dropped, not acted on late
         self._stop = threading.Event()
         self._q: queue.Queue = queue.Queue(maxsize=3)
         self._threads: list[threading.Thread] = []
@@ -607,19 +878,30 @@ class AlwaysListener:
                 return
             for utt in self.seg.feed(chunk):
                 if not self.paused:
-                    try:
-                        self._q.put_nowait(utt)
-                    except queue.Full:
-                        pass                                    # STT is behind: drop rather than build a backlog
+                    item = (utt, time.time())
+                    while True:
+                        try:
+                            self._q.put_nowait(item)
+                            break
+                        except queue.Full:                      # STT is behind: drop the OLDEST, the newest speech is what matters
+                            try:
+                                self._q.get_nowait()
+                            except queue.Empty:
+                                pass
 
     def _work_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                utt = self._q.get(timeout=0.2)
+                utt, t_cut = self._q.get(timeout=0.2)
             except queue.Empty:
                 continue
+            if time.time() - t_cut > self.stale_after:
+                continue                                        # said long ago: acting on it now would surprise you
             try:
+                t0 = time.time()
                 text = self.stt.transcribe(utt)
+                self.last_stt = time.time() - t0
+                self.last_latency = time.time() - t_cut
                 self._log(utt, text)
                 if text:
                     self.on_text(text)

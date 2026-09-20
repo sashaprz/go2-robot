@@ -51,6 +51,18 @@ except Exception as _ve:  # noqa: BLE001
     voice_mod = None
     _VOICE_ERR = str(_ve)
 
+try:
+    import phonelink as phonelink_mod  # the iPhone's motion sensors (phone_server.py on Windows -> here)
+except Exception as _pe:  # noqa: BLE001
+    phonelink_mod = None
+    _PHONE_ERR = str(_pe)
+
+try:
+    import guide as guide_mod  # "lead": walk to a point round obstacles, stopping at drop-offs (guide.py -> pathplan.py, dropoff.py)
+except Exception as _ge:  # noqa: BLE001
+    guide_mod = None
+    _GUIDE_ERR = str(_ge)
+
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
 ANGULAR = 0.8     # rad/s turning
@@ -91,6 +103,8 @@ VOICE_KEY = pygame.K_v   # hold to talk
 OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
 LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
+LEAD_KEY = pygame.K_g     # lead: walk to a point, round obstacles, stopping at drop-offs (asks for Y, like follow)
+LEAD_STALE = 0.7          # ignore a lead command older than this many seconds (the guide thread stalled): stand still
 WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
 
 
@@ -305,6 +319,44 @@ class FakeRobot:
         self._halt.set()
 
 
+class LeadSimRobot(FakeRobot):
+    """Self-test dog for 'lead': its lidar is a simulated room (pathplan.PersistentSim: the real lidar's persistent map, blind zone and ghosts, and
+    a lip that hides the ground past it), and move() drives the simulated dog in real time. stairs=True: two steps down across the room from x = 2.5."""
+
+    def __init__(self, stairs: bool = False):
+        super().__init__(None)
+        from pathplan import PersistentSim
+
+        walls = [(-6, -4, 6, -3.9, 1.8), (-6, 3.9, 6, 4, 1.8), (-6, -4, -5.9, 4, 1.8), (5.9, -4, 6, 4, 1.8)]
+        if stairs:
+            self.sim = PersistentSim(walls, pits=[(2.5, -4, 6, 4, 0.17), (3.2, -4, 6, 4, 0.34)], start=(-1.0, 0.0))
+        else:
+            self.sim = PersistentSim(walls + [(1.6, -0.3, 2.2, 0.3, 0.6)], start=(-1.0, 0.0))      # a box 2.6 m ahead
+        self.cmd, self.cmd_at = (0.0, 0.0, 0.0), 0.0
+
+    def move(self, vx: float, vy: float, yaw: float) -> None:
+        super().move(vx, vy, yaw)
+        self.cmd, self.cmd_at = (vx, vy, yaw), time.time()
+
+    def stop_move(self) -> None:
+        super().stop_move()
+        self.cmd = (0.0, 0.0, 0.0)
+
+    def on_lidar(self, cb) -> None:
+        def gen():
+            t0, last = time.time(), 0.0
+            while not self._halt.is_set():
+                cmd = self.cmd if time.time() - self.cmd_at < 0.3 else (0.0, 0.0, 0.0)     # the real dog self-stops 0.2 s after the last command
+                self.sim.tick(cmd, 0.05)
+                self.sim.t = time.time() - t0
+                if self.sim.t - last > 0.125:
+                    last = self.sim.t
+                    cb(self.sim.scan().astype(np.float32), self.sim.pose())
+                time.sleep(0.05)
+
+        threading.Thread(target=gen, daemon=True).start()
+
+
 class FakeMic:
     """Self-test stand-in for voice.MicRecorder: 'records' one second of silence."""
 
@@ -387,7 +439,13 @@ class App:
         self.cal_events: list = []          # (self-test) what calibration did
         self.cal = None                     # calibration in progress: {step, phase, boxes, samples, until, last}
         self._det_times: deque = deque(maxlen=30)   # when the detector last finished (for the fps readout)
+        self.winmic = None                  # voice.WinMic: a named Windows microphone such as the AirPods (--mic win)
+        self._winmic_check = None           # when to check that it really delivers sound
         self.dogmic = None                  # voice.DogMic: the dog's own microphone (--mic dog)
+        self.phone = None                   # phonelink.PhoneLink: the iPhone's motion (--phone)
+        self.switchmic = None               # voice.SwitchMic: the phone's mic when it streams, the computer's otherwise (--phone)
+        self._phone_seen = False            # said "phone connected" yet?
+        self._phone_audio_seen = False
         self.ear_source = "computer"         # which microphone the always-on ear is using
         self._dogmic_check = None           # when to check that the dog is really sending audio
         self.heel_side = "left"             # which side of you the dog walks on, for the banner
@@ -412,6 +470,13 @@ class App:
         self.box_dancing = False            # True once it is up on the back legs: the box-step square runs
         self.box_t0 = None                  # when the current box-step square started
         self.ambient_log: list = []         # (text, verdict) - self-test
+        # lead: walk from where the dog stands to a point, round obstacles, stop at drop-offs
+        self.leading = False
+        self.lead = None                    # {"goal": (ahead, left), "guide": guide.Guide, "t0", "seen", "pose", "key"} while leading
+        self.lead_cmd = None                # (time, (vx, vy, yaw)) from the guide thread
+        self.lead_result = None             # (state, reason) once the guide has finished: arrived / gave_up / stuck / no_data
+        self.lead_starts = 0
+        self.lead_events: list = []         # (self-test) start / stop / goal
 
     def is_selftest(self) -> bool:
         return any(k.startswith("selftest") and v for k, v in vars(self.args).items())
@@ -438,7 +503,7 @@ class App:
     def connect_bg(self) -> None:
         try:
             if self.args.demo or self.is_selftest():
-                r = FakeRobot(self.demo_image)
+                r = LeadSimRobot(stairs=self.args.selftest_lead_stairs) if (self.args.selftest_lead or self.args.selftest_lead_stairs) else FakeRobot(self.demo_image)
                 if self.args.selftest_listen:
                     # this fake dog only knows the older back-leg id (exercises the fallback); GO2_TEST_REFUSE=2050,1050 = no back legs
                     r.refuse = {int(x) for x in os.environ.get("GO2_TEST_REFUSE", "2050").split(",") if x}
@@ -542,6 +607,7 @@ class App:
         self.follower.reset()
         self.follow_res = None
         self.voice_move = None
+        self.stop_lead("follow started")
         self.follow_mode = "follow"
         self.following = True
         self.follow_starts += 1
@@ -556,6 +622,7 @@ class App:
             self.say("not connected / no video yet", WARN)
             return
         self.stop_follow("calibrating")
+        self.stop_lead("calibrating")
         self.cal = {"step": 0, "phase": "wait", "mode": None, "total": CAL_LIDAR_SPOTS, "boxes": [], "clouds": [], "samples": [],
                     "until": 0.0, "last": None, "h": 0}
         self.ensure_detector()
@@ -671,6 +738,7 @@ class App:
         self.follower.reset()
         self.follow_res = None
         self.voice_move = None
+        self.stop_lead("heel started")
         self.follow_mode = "heel"
         self.following = True
         self.follow_starts += 1
@@ -707,6 +775,140 @@ class App:
         self.desired = (0.0, 0.0, 0.0)
         self.say(f"{'heel' if self.follow_mode == 'heel' else 'follow'} stopped: {reason}", WARN)
 
+    # -- lead: A to B by lidar, round obstacles, stopping at drop-offs ----------------------------------------------
+    def start_lead(self, arg: str = "") -> None:
+        """'ernest, lead me' / G: walk from where the dog stands to a point B (metres ahead, metres left; --lead-goal, or spoken: 'lead me five metres').
+        Built from the dog's lidar (guide.py): obstacles up to ~1.2 m are walked round, a DROP-OFF (stairs down, a ledge) is a no-go and stops it, and
+        with no way through it waits (and backs away to look again). It does NOT watch for people, and it cannot see anything above ~1.2 m."""
+        if guide_mod is None:
+            self.say(f"guide.py couldn't be loaded: {_GUIDE_ERR}", BAD)
+            return
+        if self.robot is None:
+            self.say("not connected yet", WARN)
+            return
+        if self.upright:
+            self.say("come down to four legs first (U / say 'come down')", WARN)
+            return
+        if not hasattr(self.robot, "on_lidar"):
+            self.say("this dog has no lidar feed: lead needs it", BAD)
+            return
+        try:
+            ahead, left = (float(v) for v in (arg or self.args.lead_goal).split(","))
+        except ValueError:
+            self.say(f"lead: '{arg or self.args.lead_goal}' is not AHEAD,LEFT in metres (for example 4,0)", BAD)
+            return
+        self.stop_follow("lead started")
+        self.stop_lead("restarted", quiet=True)
+        self.pending, self.voice_move = None, None
+        self.box_step = self.box_dancing = False
+        self.abort.set()                                 # a running routine must not keep issuing tricks while we walk
+        self.lead_result, self.lead_cmd = None, None
+        self.lead = {"goal": (ahead, left), "guide": None, "t0": time.time(), "seen": None, "pose": None, "key": None}
+        self.leading = True
+        self.lead_starts += 1
+        self.lead_events.append(("start", (ahead, left)))
+        self.ensure_lidar()
+        side = "" if abs(left) < 0.05 else f", {abs(left):.1f} m to the {'left' if left > 0 else 'right'}"
+        self.say(f"> leading: {ahead:.1f} m ahead{side}. It walks round obstacles and STOPS at drop-offs; Space / G / 'stop' / any drive key ends it. "
+                 "It does not watch for people and cannot see above ~1.2 m", GOOD)
+
+    def stop_lead(self, reason: str, quiet: bool = False) -> None:
+        if not self.leading:
+            return
+        self.leading, self.lead, self.lead_cmd = False, None, None
+        self.desired = (0.0, 0.0, 0.0)
+        self.lead_events.append(("stop", reason))
+        if not quiet:
+            self.say(f"lead stopped: {reason}", WARN)
+
+    def _lead_announce(self, ld, g) -> None:
+        """Say (on screen) when the guide's situation changes: a drop-off, waiting, backing away, the way clearing."""
+        drop = g.state == "waiting" and "drop-off" in g.reason
+        key = (g.state, drop)
+        if key == ld["key"]:
+            return
+        before, ld["key"] = ld["key"], key
+        if drop:
+            self.say(f"lead: DROP-OFF ahead ({g.reason}). Standing still: it will not go near it", BAD)
+        elif g.state == "waiting":
+            self.say("lead: no way through right now: waiting for it to clear", WARN)
+        elif g.state == "recovering":
+            self.say("lead: backing away a little to look again", WARN)
+        elif g.state == "no_data":
+            self.say(f"lead: {g.reason}: standing still", WARN)
+        elif g.state == "going" and before is not None and before[0] != "going":
+            self.say("lead: the way is clear: carrying on", GOOD)
+
+    def lead_loop(self) -> None:
+        """The guide runs here, not on the window thread (its path planning takes ~0.1 s). ~10 Hz: feed each new lidar message, ask for a command."""
+        while not self.stop_evt.is_set():
+            time.sleep(0.1)
+            ld = self.lead
+            if not self.leading or ld is None:
+                continue
+            now, lid = time.time(), self.lidar
+            try:
+                if ld["guide"] is None:                  # "here" is wherever the dog is when the first fresh lidar message arrives
+                    if lid is not None and now - lid[0] < 0.5:
+                        ld["guide"] = guide_mod.Guide(lid[2], [ld["goal"]], vmax=self.args.lead_speed, patience=self.args.lead_patience,
+                                                      recover=not self.args.no_lead_recover)
+                        ld["pose"] = lid[2]
+                        self.lead_events.append(("goal_world", ld["guide"].goals[0]))
+                    elif now - ld["t0"] > 8.0:
+                        self.lead_result = ("no_data", "no lidar data from the dog in 8 s: it will not walk blind")
+                    continue
+                g = ld["guide"]
+                if lid is not None and lid[0] != ld["seen"]:
+                    ld["seen"], ld["pose"] = lid[0], lid[2]
+                    g.feed(lid[1], lid[2], now)
+                if not (self.armed and now >= self.busy_until):
+                    self.lead_cmd = None                # balancing / busy: the guide's clock doesn't run
+                    continue
+                cmd = g.step(ld["pose"], now)
+                self.lead_cmd = (now, cmd)
+                self._lead_announce(ld, g)
+                if g.finished:
+                    self.lead_result = (g.state, g.reason)
+            except Exception as e:  # noqa: BLE001 - never leave the dog walking on a broken guide
+                self.lead_result = ("error", f"{type(e).__name__}: {e}")
+
+    def draw_lead_map(self, screen) -> None:
+        """A 12 m x 12 m top-down picture of what the guide knows: red = obstacle, orange = something at person height (a table top, a wall),
+        MAGENTA = DROP-OFF, green line = the path, yellow = the goal, cyan = the dog."""
+        ld = self.lead
+        g, pose = (ld["guide"], ld["pose"]) if ld else (None, None)
+        if g is None or pose is None:
+            return
+        room, half, size = g.room, 60, 200
+        cx, cy = room.cell(pose[0], pose[1])
+        x0, y0 = cx - half, cy - half
+        sx0, sx1, sy0, sy1 = max(x0, 0), min(x0 + 2 * half, room.nx), max(y0, 0), min(y0 + 2 * half, room.ny)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return
+        img = np.zeros((2 * half, 2 * half, 3), np.uint8)
+        img[:] = (24, 26, 32)
+        view = (slice(sy0, sy1), slice(sx0, sx1))
+        sub_img = img[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0]
+        high, occ = room.occupied_high()[view], room.occupied()[view]
+        sub_img[room.seen[view]] = (58, 64, 74)
+        sub_img[occ & ~high] = (235, 80, 80)
+        sub_img[high] = (235, 150, 70)
+        sub_img[room.cliff[view]] = (255, 60, 230)
+        surf = pygame.transform.scale(pygame.surfarray.make_surface(np.ascontiguousarray(img[::-1].swapaxes(0, 1))), (size, size))
+
+        def to_px(x, y):
+            return (int((room.cell(x, y)[0] - x0) / (2 * half) * size), int(size - (room.cell(x, y)[1] - y0) / (2 * half) * size))
+        pts = [to_px(*xy) for xy in (g.path or [])]
+        if len(pts) > 1:
+            pygame.draw.lines(surf, (110, 230, 130), False, pts, 2)
+        pygame.draw.circle(surf, (255, 220, 60), to_px(*g.goal), 5, 2)
+        d = to_px(pose[0], pose[1])
+        pygame.draw.circle(surf, (90, 220, 255), d, 4)
+        pygame.draw.line(surf, (90, 220, 255), d, (d[0] + int(10 * math.cos(pose[3])), d[1] - int(10 * math.sin(pose[3]))), 2)
+        pygame.draw.rect(surf, (120, 126, 134), (0, 0, size, size), 1)
+        screen.blit(surf, (WIN_W - size - 6, 106))
+        self.text(screen, "lead map:  red obstacle  orange tall  MAGENTA DROP-OFF", WIN_W - size - 6, 108 + size, DIM, 16)
+
     def vision_loop(self) -> None:
         """One inference per new frame, shared by person-follow and the object overlay."""
         last_seq = -1
@@ -736,6 +938,8 @@ class App:
                         lid = self.lidar
                         if lid is not None and time.time() - lid[0] < 0.5:      # a stale cloud is worse than none
                             kw["cloud"] = obstacles.to_dog_frame(lid[1], *lid[2])
+                    if self.phone is not None and isinstance(self.follower, follow_mod.Follower):
+                        kw["phone"] = self.phone.state()                           # walking / standing (None when the phone isn't sending)
                     res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape, **kw)
                     self.follow_sources.add(getattr(self.follower, "source", getattr(self.follower, "range_src", "camera")))
                     self._det_times.append(time.time())
@@ -774,7 +978,11 @@ class App:
         if voice_mod.whisper_model_path(self.args.whisper_model) is None:
             self.say("Voice model not downloaded. While ONLINE run: go2.bat --fetch-model", WARN)
             return False
-        self.mic, self.stt = voice_mod.MicRecorder(), voice_mod.LocalWhisperSTT(self.args.whisper_model)
+        self.mic, self.stt = self._make_mic(), voice_mod.LocalWhisperSTT(self.args.whisper_model)
+        fast = self.args.fast_model
+        if self.args.phone and fast and fast.lower() != "none" and fast != self.args.whisper_model and voice_mod.whisper_model_path(fast):
+            # the phone's microphone is right by your mouth: the clean sound doesn't need the big model, and the big model is ~2 s of delay
+            self.stt = voice_mod.SwitchSTT(voice_mod.LocalWhisperSTT(fast), self.stt, lambda: self.switchmic is not None and self.switchmic.live)
         return True
 
     def _prepare_voice(self) -> None:
@@ -794,6 +1002,53 @@ class App:
             self.say(f"voice model failed to load: {e}", BAD)
 
     # -- always-listening (wake word) -------------------------------------------------------------------
+    def _make_mic(self):
+        """The microphone push-to-talk (V) records from. --mic win: the Windows-side capture of a NAMED microphone (the AirPods),
+        which the ear shares; anything else: the computer's default (WSL's) microphone."""
+        if self.args.phone:
+            return self._phone_mic()
+        if self.args.mic == "win":
+            if self.winmic is None:
+                self.winmic = voice_mod.WinMic(self.args.mic_device)
+            return self.winmic
+        return voice_mod.MicRecorder()
+
+    def _phone_mic(self):
+        """--phone: the iPhone's microphone whenever it is streaming, the computer's otherwise (it switches by itself, both ways)."""
+        if self.switchmic is None:
+            self.switchmic = voice_mod.SwitchMic(voice_mod.PhoneMic())
+        return self.switchmic
+
+    def start_phone(self) -> None:
+        if self.phone is not None or not self.args.phone:
+            return
+        if phonelink_mod is None:
+            self.say(f"phone link unavailable: {_PHONE_ERR}", WARN)
+            return
+        self.phone = phonelink_mod.PhoneLink()
+        self.phone.start()
+        self.say("phone link: on the iPhone open the link in phone_qr.html (or phone_url.txt), tap Start. Its mic then becomes the ear's mic", DIM)
+
+    def update_phone(self, now: float) -> None:
+        """Tell the person when the phone connects / its microphone starts / it drops out."""
+        ph = self.phone
+        if ph is None:
+            return
+        if ph.live and not self._phone_seen:
+            self._phone_seen = True
+            self.say(f"phone connected ({ph.ua[:40] or 'unknown browser'}): " + ("turning set up" if ph.calibrated else "walking/standing only (turning not set up on the phone, that is fine)"), GOOD)
+        elif not ph.live and self._phone_seen and ph.age > 4:
+            self._phone_seen = False
+            self.say("phone link lost (screen locked? Wi-Fi?): using the camera alone", WARN)
+        sm = self.switchmic
+        if sm is not None:
+            if sm.live and not self._phone_audio_seen:
+                self._phone_audio_seen = True
+                self.say(f"the ear is now listening through the phone microphone: say \"{self.args.wake_word}\" near it", GOOD)
+            elif not sm.live and self._phone_audio_seen and time.time() - sm.phone.last_frame_at > 4:
+                self._phone_audio_seen = False
+                self.say("phone audio stopped: the ear is back on the computer microphone", WARN)
+
     def start_listener(self) -> None:
         if self.listener is not None:
             return
@@ -801,7 +1056,15 @@ class App:
             self.say("always-listening needs the offline model (default --stt local)", WARN)
             return
         mic, self.ear_source = None, "computer"
-        if self.args.mic == "dog":
+        if self.args.phone:
+            mic, self.ear_source = self._phone_mic(), "phone"
+        elif self.args.mic == "win":
+            if self.winmic is None:
+                self.winmic = voice_mod.WinMic(self.args.mic_device)
+            self.winmic.frames = 0
+            mic, self.ear_source = self.winmic, "win"
+            self._winmic_check = time.time() + 8.0
+        elif self.args.mic == "dog":
             if self.robot is None or not hasattr(self.robot, "on_audio"):
                 self.say("dog mic: not connected to the dog yet, so the ear is using the computer's microphone", WARN)
             else:
@@ -815,16 +1078,45 @@ class App:
                 except Exception as e:  # noqa: BLE001
                     self.say(f"dog mic unavailable ({e}): using the computer's microphone", WARN)
         try:
+            seg = voice_mod.UtteranceSegmenter(end_silence=0.6, check_every=0.2) if self.ear_source == "phone" else None    # a close mic: cut sooner
             self.listener = voice_mod.AlwaysListener(self.stt, lambda t: self.voice_q.put(("ambient", t, -1)),
-                                                     on_error=self._ear_error, log_dir=self.args.voice_log, mic=mic)
+                                                     on_error=self._ear_error, log_dir=self.args.voice_log, mic=mic, segmenter=seg)
             self.listener.start()
         except Exception as e:  # noqa: BLE001
             self.listener, self.ear = None, "error"
             self.say(f"always-listening unavailable: {e}", WARN)
             return
         self.ear = "on"
-        src = "the dog's own microphone" if self.ear_source == "dog" else "the computer's microphone"
+        src = {"dog": "the dog's own microphone", "win": f"the {self.args.mic_device} microphone",
+               "phone": "the computer's microphone until the phone connects, then the phone's"}.get(self.ear_source, "the computer's microphone")
         self.say(f'always listening ({src}): say "{self.args.wake_word}" + a command. A bare "stop" works without it.', GOOD)
+
+    def update_winmic(self, now: float) -> None:
+        """A few seconds after the ear starts on the named Windows mic: is real sound arriving? If not, say why and use the computer's mic
+        (a deaf ear is worse than the wrong microphone; keys and Space always work)."""
+        if self._winmic_check is None or now < self._winmic_check or self.winmic is None:
+            return
+        self._winmic_check = None
+        w, name = self.winmic, self.args.mic_device
+        why = None
+        if w.frames == 0:
+            why = w.error or f"nothing arrived from the Windows mic helper (see winmic.log). Is 'pip install sounddevice' done for the project's .venv?"
+        elif w.level < 1e-4:
+            why = (f"the {name} microphone is connected but SILENT (level {w.level:.5f}). Put them in your ears, make sure they are connected to "
+                   "THIS PC and not your iPhone, and that Windows shows them as the Headset microphone")
+        if why is None:
+            self.say(f"mic: the {name} microphone is live (level {w.level * 100:.1f}). Say \"{self.args.wake_word}\" near it", GOOD)
+            return
+        self.say(f"mic: {why}. Using the computer's microphone instead (L restarts the ear)", WARN)
+        self.args.mic = "pc"
+        self.stop_listener()
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.winmic = None
+        self.mic = voice_mod.MicRecorder()
+        self.start_listener()
 
     def update_dogmic(self, now: float) -> None:
         """A few seconds after the ear starts on the dog's microphone: is audio really arriving? If not, say so and use the computer's mic."""
@@ -952,6 +1244,7 @@ class App:
         """'walk forward', 'turn left 90 degrees', ...: a short timed move. Spoken amounts are capped (see voice.py)."""
         cmd, secs = voice_mod.plan_motion(intent, self.args.linear, self.args.angular)
         self.stop_follow("voice move")
+        self.stop_lead("voice move")
         self.abort.set()   # a running routine must not keep issuing tricks while we walk
         self.pending = None
         self.voice_move = {"cmd": cmd, "dur": secs, "start": None, "created": time.time(), "label": intent.label}
@@ -976,6 +1269,11 @@ class App:
             self.emergency_stop()
         elif intent.kind == "stop_follow":
             self.stop_follow("voice")
+            self.stop_lead("voice")
+        elif intent.kind == "lead":
+            self.pending = None
+            self.voice_move = None
+            self.start_lead(intent.arg)
         elif intent.kind == "follow":
             if not self.following and self.follow_available():
                 self.pending = None
@@ -1021,6 +1319,7 @@ class App:
         if self.upright or self.robot is None:
             return
         self.stop_follow("back-leg stand")
+        self.stop_lead("back-leg stand")
         self.voice_move = None
         was_armed = self.armed
         self.upright, self.armed = True, True             # (never send BalanceStand while up: it could drop the dog)
@@ -1081,6 +1380,7 @@ class App:
             self.say("box step is already running (say 'stop' to end it)")
         else:
             self.stop_follow("box step")
+            self.stop_lead("box step")
             self.voice_move, self.pending = None, None
             self.box_step, self.box_dancing, self.box_t0 = True, False, None
             self.say("> box step: up on the back legs, then it steps in a square. Say 'stop' to end it. (It can fall: keep clear.)", WARN)
@@ -1114,6 +1414,7 @@ class App:
         self.voice_move = None
         self.box_step = self.box_dancing = False    # a pose/trick you asked for beats an unfinished box-step sequence
         self.stop_follow(f"{label} pressed")
+        self.stop_lead(f"{label} pressed")
         self.say(f"> {label}")
         self.busy_until = time.time() + wait
         self.armed = name == "BalanceStand"  # after any other pose/trick, re-balance before driving
@@ -1125,6 +1426,7 @@ class App:
             return
         self.abort.clear()
         self.stop_follow("routine started")
+        self.stop_lead("routine started")
 
         def work():
             for step in ROUTINES[rname]:
@@ -1149,6 +1451,7 @@ class App:
         self.busy_until = 0.0
         self.desired = (0.0, 0.0, 0.0)
         self.stop_follow("SPACE")
+        self.stop_lead("stop")
         if self.cal is not None:
             self.cal = None
             self.say("calibration cancelled", WARN)
@@ -1177,6 +1480,13 @@ class App:
                 self.stop_follow("T pressed")
             elif self.follow_available():
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key == LEAD_KEY:
+            if self.leading:
+                self.stop_lead("G pressed")
+            elif guide_mod is not None:
+                self.pending = ("Lead: walk to the goal, round obstacles, stopping at drop-offs (does NOT watch for people)", self.start_lead, now + CONFIRM_SECS)
+            else:
+                self.say(f"guide.py couldn't be loaded: {_GUIDE_ERR}", BAD)
         elif key == CALIB_KEY:
             if self.cal is None:
                 self.start_calibration()
@@ -1248,6 +1558,23 @@ class App:
                     self.say(f"{vm['label']}: done")
                     return
                 self.desired = vm["cmd"]
+                return
+        if self.leading:
+            if manual:
+                self.stop_lead("manual drive key")         # the human always wins; carry on as manual below
+            else:
+                res = self.lead_result
+                if res is not None:                          # the guide finished: arrived, gave up, stuck, or no lidar
+                    self.say({"arrived": f"lead: ARRIVED ({res[1]})", "gave_up": f"lead: gave up: {res[1]}", "stuck": f"lead: STUCK: {res[1]}"}.get(
+                        res[0], f"lead: stopped: {res[1]}"), GOOD if res[0] == "arrived" else BAD)
+                    self.desired = (0.0, 0.0, 0.0)
+                    self.stop_lead(res[0], quiet=True)
+                    return
+                lc = self.lead_cmd
+                if not self.ensure_ready(now) or lc is None or now - lc[0] > LEAD_STALE:
+                    self.desired = (0.0, 0.0, 0.0)         # not balanced yet / no fresh command: stand still
+                else:
+                    self.desired = lc[1]
                 return
         if self._lidar_check and now > self._lidar_check and self.following:
             self._lidar_check = None
@@ -1367,8 +1694,15 @@ class App:
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
         # second row: the ear (wake word), what it last heard, the back-leg state
         if self.ear == "on":
-            ear_txt, ear_col = (f'ear: ON' + (f' (dog mic {self.dogmic.level * 100:.1f})' if self.ear_source == 'dog' and self.dogmic is not None else '')
-                                + f', say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else "")), GOOD
+            level_txt = ''
+            if self.ear_source == 'dog' and self.dogmic is not None:
+                level_txt = f' (dog mic {self.dogmic.level * 100:.1f})'
+            elif self.ear_source == 'phone' and self.switchmic is not None:
+                level_txt = f' (phone mic {self.switchmic.phone.level * 100:.1f})' if self.switchmic.live else ' (computer mic; phone not streaming)'
+            elif self.ear_source == 'win' and self.winmic is not None:
+                level_txt = f' ({self.args.mic_device} mic {self.winmic.level * 100:.1f})' if self.winmic.level >= 1e-4 else f' ({self.args.mic_device} mic SILENT)'
+            ear_txt, ear_col = (f'ear: ON{level_txt}, say "{self.args.wake_word}"' + (" ... (listening for a command)" if now < self.wake_until else "")), \
+                (BAD if 'SILENT' in level_txt else GOOD)
         elif self.ear == "error":
             ear_txt, ear_col = "ear: ERROR (press L to retry)", BAD
         else:
@@ -1378,7 +1712,8 @@ class App:
         if lh and now - lh[0] < 12:
             tone = {"ignore": DIM, "wake": GOOD, "command": GOOD, "stop": WARN, "confirm": GOOD}.get(lh[2], TXT)
             what = {"ignore": " (ignored: no wake word)", "wake": " (wake word)", "command": "", "stop": " (stop)", "confirm": " (yes)"}.get(lh[2], "")
-            self.text(screen, f'heard: "{lh[1][:56]}"{what}', 330, 34, tone, 22)
+            lat = f"  [{self.listener.last_latency:.1f} s]" if self.listener is not None and self.listener.last_latency > 0 else ""       # from the end of your sentence to the text
+            self.text(screen, f'heard: "{lh[1][:52]}"{what}{lat}', 330, 34, tone, 22)
         if self.upright:
             self.text(screen, "UPRIGHT", 900, 34, WARN, 24)
 
@@ -1407,6 +1742,16 @@ class App:
             banner = ((f"CALIBRATING {step}{how}: measuring, stand still ...  ({len(c['boxes'])} frames, {len(c['clouds'])} lidar scans)" if c["phase"] == "collect"
                        else f"CALIBRATION {step}{how}: {ask}, then press J   " + ("[I can see you]" if seen else "[I can't see you yet]")),
                       WARN if not seen else GOOD)
+        elif self.leading:
+            ld = self.lead
+            g = ld["guide"] if ld else None
+            if g is None or ld["pose"] is None:
+                banner = ("LEADING: waiting for the dog's lidar ...", WARN)
+            else:
+                to_go = math.hypot(g.goal[0] - ld["pose"][0], g.goal[1] - ld["pose"][1])
+                col = GOOD if g.state == "going" else BAD if "drop-off" in g.reason else WARN
+                banner = (f"LEADING to {ld['goal'][0]:.1f} m ahead, {ld['goal'][1]:+.1f} m left: {g.state}" + (f" - {g.reason}" if g.reason else "")
+                          + f"   [{to_go:.1f} m to go]   Space / G / 'stop' ends it", col)
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
             dt = [t for t in self._det_times if now - t < 3]
@@ -1419,6 +1764,11 @@ class App:
             screen.blit(back, (0, 60))
             self.text(screen, banner[0], 12, 68, banner[1], 30)
 
+        if self.leading:
+            try:
+                self.draw_lead_map(screen)
+            except Exception:  # noqa: BLE001 - the picture is a nicety: never let it take the window down
+                pass
         recent = [(msg, color) for t, msg, color in self.messages if now - t < 8]
         if recent:
             y = VIDEO_H - 26 * len(recent) - 10
@@ -1434,9 +1784,9 @@ class App:
             "DRIVE   W/S forward/back    Q/E strafe left/right    A/D turn left/right    Shift fast   Ctrl slow   SPACE = STOP",
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
-            "FOLLOW  T follow the nearest person, H heel (walk at your side), each then Y.  Again / Space / any drive key stops.  No obstacle avoidance!",
+            "FOLLOW  T follow, H heel (each then Y): NO obstacle avoidance.   G LEAD (then Y): walk to a spot round obstacles, STOPS at drop-offs.  Space stops.",
             f"VOICE   say \"{self.args.wake_word}, <command>\" or hold V: \"ready to dance\" (stand up), \"sit\", \"dance two\", \"walk forward\", "
-            "\"follow me\", \"heel\", \"box step\".  \"stop\" always works."
+            "\"follow me\", \"heel\", \"lead\" / \"lead me 5 metres\", \"box step\".  \"stop\" always works."
             + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
             "BACK LEGS  U (then Y), or \"" + self.args.wake_word + ", stand on your back legs\" then \"yes\".  U / \"come down\" returns to four legs.  Can fall: soft floor!",
             "VISION  O toggles labelled boxes for 80 object types.   J = calibrate heel distance (stand at 3 different distances; uses the lidar, no tape).",
@@ -1453,12 +1803,15 @@ class App:
         threading.Thread(target=self.connect_bg, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
         threading.Thread(target=self.vision_loop, daemon=True).start()
+        threading.Thread(target=self.lead_loop, daemon=True).start()
         if not _SELFTEST:
             threading.Thread(target=self._prepare_voice, daemon=True).start()
+            self.start_phone()
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
                                        objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove,
-                                       listen=self.args.selftest_listen, heel=self.args.selftest_heel, calib=self.args.selftest_calib)
+                                       listen=self.args.selftest_listen, heel=self.args.selftest_heel, calib=self.args.selftest_calib,
+                                       lead=self.args.selftest_lead, lead_stairs=self.args.selftest_lead_stairs)
                   if self.is_selftest() else None)
         t0 = time.time()
         try:
@@ -1479,12 +1832,15 @@ class App:
                         self.voice_move = None
                         self.cancel_listening()
                         self.stop_follow("window lost focus")
+                        self.stop_lead("window lost focus")
                         self.say("window lost focus: stopped", WARN)
                 if self.listener is not None:
                     self.listener.paused = bool(self.voice_state)   # hold-V push-to-talk takes priority over the ear
                 self.drain_voice()
                 self.update_calibration(time.time())
                 self.update_dogmic(time.time())
+                self.update_winmic(time.time())
+                self.update_phone(time.time())
                 self.update_velocity()
                 self.draw(screen)
                 pygame.display.flip()
@@ -1492,9 +1848,12 @@ class App:
         finally:
             print("Stopping and disconnecting ...", flush=True)
             self.stop_listener()
+            if self.phone is not None:
+                self.phone.close()
             self.stop_evt.set()
             self.abort.set()
             self.following = False
+            self.leading = False
             self.desired = (0.0, 0.0, 0.0)
             if self.robot is not None:
                 try:
@@ -1517,13 +1876,20 @@ class App:
             return _selftest_heel_verdict(self)
         if self.args.selftest_calib:
             return _selftest_calib_verdict(self)
+        if self.args.selftest_lead:
+            return _selftest_lead_verdict(self)
+        if self.args.selftest_lead_stairs:
+            return _selftest_lead_stairs_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
     def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False, voicemove: bool = False,
-                        listen: bool = False, heel: bool = False, calib: bool = False):
+                        listen: bool = False, heel: bool = False, calib: bool = False, lead: bool = False, lead_stairs: bool = False):
         K = pygame
-        if listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
+        if lead or lead_stairs:  # utterances injected as if the ear heard them (LEAD_TEST / LEAD_STAIRS_TEST); Esc two seconds after the lead finishes
+            steps = []
+            shot_at = 9.0 if lead else 14.0
+        elif listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
             steps = [(19.3, K.KEYDOWN, K.K_ESCAPE)]
             shot_at = 15.0
         elif voicemove:  # six push-to-talk presses, one per canned transcript; 'stop' lands mid-step
@@ -1570,13 +1936,30 @@ class App:
                     if t >= when and ("amb", i) not in done:
                         done.add(("amb", i))
                         self.voice_q.put(("ambient", text, -1))
+            if lead or lead_stairs:
+                for i, (when, text) in enumerate(LEAD_TEST if lead else LEAD_STAIRS_TEST):
+                    if t >= when and ("amb", i) not in done:
+                        done.add(("amb", i))
+                        self.voice_q.put(("ambient", text, -1))
+                sim = getattr(self.robot, "sim", None)
+                if sim is not None and lead:                 # is the dog really standing still while stopped? (between 'stop' and the second lead)
+                    if t >= 9.0 and "p9" not in state:
+                        state["p9"] = (sim.x, sim.y)
+                    if t >= 11.5 and "p11" not in state:
+                        state["p11"] = (sim.x, sim.y)
+                        self.lead_events.append(("still", state["p9"], state["p11"]))
+                if self.lead_result is not None and "esc" not in state:
+                    state["esc"] = t + 2.0
+                if ("esc" in state and t >= state["esc"] and "esc_sent" not in state) or (t > 90 and "esc_sent" not in state):
+                    state["esc_sent"] = True
+                    pygame.event.post(pygame.event.Event(K.KEYDOWN, key=K.K_ESCAPE, mod=0, unicode="", scancode=0))
             for i, (when, typ, key) in enumerate(steps):
                 if t >= when and i not in done:
                     done.add(i)
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
             if t >= shot_at and not state["shot"]:
                 state["shot"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest_calib.png" if calib else "/tmp/go2_selftest_listen.png" if listen else
+                pygame.image.save(screen, "/tmp/go2_selftest_lead.png" if (lead or lead_stairs) else "/tmp/go2_selftest_calib.png" if calib else "/tmp/go2_selftest_listen.png" if listen else
                                   "/tmp/go2_selftest_voicemove.png" if voicemove else
                                   "/tmp/go2_selftest_objects.png" if objects else
                                   "/tmp/go2_selftest_voice.png" if voice else
@@ -1683,6 +2066,64 @@ def _selftest_heel_verdict(app: "App") -> int:
 
 
 VOICE_TEST_LINES = ["say hello", "dance two", "follow me", "stop", "what is the weather", "stop following"]
+
+
+LEAD_TEST = [(1.0, "Ernest, lead me"), (8.0, "stop"), (12.0, "Ernest, lead me")]      # (seconds, what the ear "heard")
+LEAD_STAIRS_TEST = [(1.0, "Ernest, lead me six metres")]
+
+
+def _selftest_lead_verdict(app: "App") -> int:
+    """'Ernest, lead me' in a simulated room with a box in the way: it walks round it to B; 'stop' halts it mid-walk; a second 'lead me' finishes the job."""
+    r = app.robot
+    log, sim = r.log, r.sim
+    sports = [e[1] for e in log if e[0] == "sport"]
+    moves = [e for e in log if e[0] == "move"]
+    goal = next((e[1] for e in reversed(app.lead_events) if e[0] == "goal_world"), (0.0, 0.0))
+    dist = math.hypot(sim.x - goal[0], sim.y - goal[1])
+    still = next((e for e in app.lead_events if e[0] == "still"), None)
+    phrases = {"lead me five metres": ("lead", "5.00,0.00"), "lead me forward 4 metres and left 2": ("lead", "4.00,2.00"), "stop leading": ("stop_follow", ""),
+               "follow me": ("follow", ""), "walk forward": ("move", "forward")}
+    parsed = {t: (lambda i: (i.kind, i.arg) if i else None)(voice_mod.parse_command(t)) for t in phrases}
+    stops = [e for e in app.lead_events if e[0] == "stop"]
+    checks = {
+        "'Ernest, lead me' started a lead by voice, no Y needed (twice: the second after 'stop')": app.lead_starts == 2,
+        "it balanced first, and switched the lidar on": sports[:1] == ["BalanceStand"] and app._lidar_on,
+        "'stop' ended the first lead mid-walk, by voice": any(e[1] == "stop" for e in stops),
+        f"...and the dog really stood still while it was stopped (moved {math.hypot(still[1][0] - still[2][0], still[1][1] - still[2][1]):.2f} m)" if still else "the still check ran":
+            bool(still) and math.hypot(still[1][0] - still[2][0], still[1][1] - still[2][1]) < 0.1,
+        f"the second lead arrived: {app.lead_result}": bool(app.lead_result) and app.lead_result[0] == "arrived",
+        f"the simulated dog is {dist:.2f} m from B (world {goal[0]:.1f}, {goal[1]:.1f})": dist < 0.5,
+        f"it went round the box without touching it ({sim.gap():.2f} m clear)": sim.gap() > 0.18,
+        "it never went faster than --lead-speed": bool(moves) and all(m[1] <= app.args.lead_speed + 1e-6 for m in moves),
+        "the lead ended when it arrived: not leading, and the last thing sent was stop_move": not app.leading and log[-1] == ("stop_move",),
+        "the phrase table: 'lead me five metres', 'forward 4 and left 2', 'stop leading', and follow / walk unchanged":
+            all(parsed[t] == phrases[t] for t in phrases),
+    }
+    print("\nSELFTEST-LEAD events:", app.lead_events, "\n  result:", app.lead_result, " parsed:", parsed)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
+def _selftest_lead_stairs_verdict(app: "App") -> int:
+    """'Ernest, lead me six metres' with a staircase down across the room 3.5 m ahead: it must stop at the drop-off, say so, and never go near it."""
+    r = app.robot
+    log, sim = r.log, r.sim
+    moves = [e for e in log if e[0] == "move"]
+    said = " | ".join(app.messages_text()).lower()
+    before = 2.5 - sim.x
+    checks = {
+        "'Ernest, lead me six metres' started a lead by voice": app.lead_starts == 1 and any(e == ("start", (6.0, 0.0)) for e in app.lead_events),
+        "it walked toward the stairs first (there was room to walk)": any(m[1] > 0 for m in moves),
+        f"it stopped {before:.2f} m before the top step and never went over (closest {sim.pit_gap():.2f} m to the edge)": sim.pit_gap() > 0.4 and before > 0.5,
+        "it warned on screen that there is a DROP-OFF ahead (not just the intro line)": "drop-off ahead (" in said,
+        f"it gave up on the drop-off rather than finding a way over: {app.lead_result}": bool(app.lead_result) and app.lead_result[0] == "gave_up" and "drop-off" in app.lead_result[1],
+        "the lead ended: not leading, last command stop_move": not app.leading and log[-1] == ("stop_move",),
+    }
+    print("\nSELFTEST-LEAD-STAIRS events:", app.lead_events, "\n  result:", app.lead_result)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
 
 
 def _selftest_voice_verdict(app: "App") -> int:
@@ -1828,8 +2269,14 @@ def main() -> int:
     p.add_argument("--selftest-listen", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--wake-word", default=os.environ.get("GO2_WAKE_WORD", "ernest"),
                    help="always-listening wake word: say it first ('ernest, sit down'); a bare 'stop' works without it")
-    p.add_argument("--mic", choices=["pc", "dog"], default=os.environ.get("GO2_MIC", "pc"),
-                   help="microphone for the always-listening ear: pc = the computer's (default), dog = the dog's own microphone over the same link (falls back to the computer's if the dog sends no audio)")
+    p.add_argument("--mic", choices=["pc", "dog", "win"], default=os.environ.get("GO2_MIC", "pc"),
+                   help="microphone for voice: pc = the computer's default (default), dog = the dog's own microphone over the same link, win = a NAMED Windows "
+                        "microphone such as the AirPods (needs go2.bat, which starts winmic.py). The ear and push-to-talk both use it; it falls back to the computer's if it is silent")
+    p.add_argument("--mic-device", default=os.environ.get("GO2_MIC_DEVICE", "AirPods"),
+                   help="--mic win: part of the Windows input device's name to use (see: .venv\\Scripts\\python.exe winmic.py --list)")
+    p.add_argument("--phone", action="store_true", default=os.environ.get("GO2_PHONE", "") not in ("", "0"),
+                   help="use an iPhone (page served by phone_server.py, which go2.bat starts): its microphone becomes the ear's and V's microphone while it streams "
+                        "(the computer's mic otherwise), and its motion sensors tell follow/heel when you stopped or are moving while out of the camera's view")
     p.add_argument("--no-listen", action="store_true", help="don't start the always-on listener (hold V still works)")
     p.add_argument("--upright-api", type=int, default=int(os.environ.get("GO2_UPRIGHT_API", "2050")),
                    help="back-leg stand id tried first: 2050 BackStand (firmware 1.1.7+, the default) or 1050 (older); the other is the fallback")
@@ -1860,16 +2307,34 @@ def main() -> int:
     p.add_argument("--heel-cam-pitch", type=float, default=0.0, help="ESTIMATE: degrees the camera looks down")
     p.add_argument("--selftest-heel", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-calib", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-lead", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-lead-stairs", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--lead-goal", default=os.environ.get("GO2_LEAD_GOAL", "4,0"), metavar="AHEAD,LEFT",
+                   help="lead ('ernest, lead me' / G): where to walk, metres ahead and to the left of where the dog stands (default 4,0). "
+                        "Say 'lead me five metres' / 'lead me forward 4 metres and left 2' to choose one out loud")
+    p.add_argument("--lead-speed", type=float, default=0.3, help="lead: top forward speed, m/s (default 0.3; the drop-off check needs time to see a ledge, ~2 m ahead)")
+    p.add_argument("--lead-patience", type=float, default=90.0,
+                   help="lead: seconds to stand and wait with no way through before giving up (default 90: the dog's lidar map keeps a ghost ~40 s after something leaves)")
+    p.add_argument("--no-lead-recover", action="store_true",
+                   help="lead: never back away to look again (use it if someone may be standing right behind the dog: the lidar can't see nearer than ~1 m)")
     p.add_argument("--stt", choices=["local", "elevenlabs"], default=os.environ.get("GO2_STT", "local"),
                    help="speech-to-text for the V key: 'local' = offline Whisper (default), 'elevenlabs' = cloud (needs internet + key)")
     p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "small.en"),
                    help="local Whisper model (small.en, the default, copes better with noise; base.en is ~2.4x faster)")
+    p.add_argument("--fast-model", default=os.environ.get("GO2_FAST_MODEL", "base.en"),
+                   help="with --phone: the quicker Whisper model used while the phone's (close, clean) microphone is streaming; 'none' = always use --whisper-model")
     p.add_argument("--voice-log", default=os.environ.get("GO2_VOICE_LOG"), metavar="DIR",
                    help="save every utterance the always-on mic hears (wav + transcript) into DIR, to study what it gets wrong")
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
     args = p.parse_args()
     args.cal_loaded = None
+    try:
+        [float(v) for v in args.lead_goal.split(",")][1]
+    except (ValueError, IndexError):
+        p.error(f"--lead-goal '{args.lead_goal}' is not AHEAD,LEFT in metres (for example 4,0 or 3,-2)")
+    if args.selftest_lead_stairs:
+        args.lead_patience = 10.0                                # (don't wait 90 s for the test to conclude it can't get there)
     if follow_mod is not None and not any(k.startswith("selftest") and v for k, v in vars(args).items()) \
             and args.heel_cam_height == 0.35 and args.heel_cam_pitch == 0.0:           # (only if nothing was set by hand)
         saved = follow_mod.load_calibration()

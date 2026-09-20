@@ -103,6 +103,8 @@ SCENARIOS = {
     "90 deg turn to the right": ((1.3, -0.6), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "person walks TOWARD the dog (0.4 m/s)": ((2.5, -0.6), math.pi, walk([(10, 0.4, 0)]), 10, CAM.z, 0.0),
     "person walks straight AT the dog, dead ahead (0.4 m/s)": ((2.5, 0.0), math.pi, walk([(10, 0.4, 0)]), 10, CAM.z, 0.0),
+    "steps quickly out of the camera's view, then stands still": ((1.3, -0.35), 0.0, walk([(1.5, 0.6, 0), (1.9, 0.6, -math.pi / 2 / 0.4), (3.9, 1.3, 0), (16, 0, 0)]), 16, CAM.z, 0.0),
+    "walks up level with the dog (out of view), stands, then walks on": ((2.0, -0.5), math.pi, walk([(3.4, 0.6, 0), (9.0, 0, 0), (10.0, 0, math.pi), (22, 0.6, 0)]), 22, CAM.z, 0.0),
     "faster than the dog can go (1.3 m/s)": ((1.3, -0.6), 0.0, walk([(25, 1.3, 0)]), 25, CAM.z, 0.0),
     "sharp right turn (90 deg in 1 s)": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.0, 0.6, -math.pi / 2 / 1.0), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "S-bend: right then left": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (8, 0.6, 0), (9.6, 0.6, math.pi / 2 / 1.6), (18, 0.6, 0)]), 18, CAM.z, 0.0),
@@ -114,7 +116,8 @@ SCENARIOS = {
 
 
 def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lidar: bool = False, wall_y: float | None = None,
-        latency: float | None = None, det_hz: float | None = None, controller: str = "heel", lidar_bias: float = 0.0, lidar_until: float | None = None, cam_override: tuple | None = None, **cfg) -> dict:
+        latency: float | None = None, det_hz: float | None = None, controller: str = "heel", lidar_bias: float = 0.0, lidar_until: float | None = None, cam_override: tuple | None = None, phone: bool = False, phone_noise: float = 0.05,
+        phone_sign: float = 1.0, **cfg) -> dict:
     (ahead0, left0), rel_heading, path, dur, cam_z, cam_pitch = SCENARIOS[name]
     rng = random.Random(seed)
     if cam_override:
@@ -148,7 +151,11 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
             cloud = lidar_cloud(w, rng, wall_y) if lidar and frames % LIDAR_EVERY == 0 and (lidar_until is None or t < lidar_until) else None
             if cloud is not None and lidar_bias:                # the lidar sees the FRONT of the body: nearer than the feet
                 cloud[:, 0] -= lidar_bias
-            res = heeler.step([box] if box else [], (CAM.height, CAM.width, 3), now=t, cloud=cloud)
+            kw = {}
+            if phone and controller == "follow":                       # the person's phone: their own turn rate (noisy) and whether they are walking
+                v_now, om_now = path(max(t - 0.15, 0.0))               # (a little behind: sensor + network delay)
+                kw["phone"] = follow.PhoneState(yaw_rate=phone_sign * (om_now + rng.gauss(0, phone_noise)), walking=v_now > 0.15, calibrated=True, age=0.1)
+            res = heeler.step([box] if box else [], (CAM.height, CAM.width, 3), now=t, cloud=cloud, **kw)
             if res.lost and lost_at is None:
                 lost_at = t
             yaws.append(res.cmd[2])
@@ -335,6 +342,63 @@ def follow_style_checks() -> int:
     return 0 if all(checks.values()) else 1
 
 
+def scan_checks() -> int:
+    """When the camera loses the person, the dog turns side to side on the spot to find them again (instead of giving up after ~1.5 s)."""
+    import dataclasses
+    frame = (CAM.height, CAM.width, 3)
+    checks = {}
+
+    def lose(side_x: float):
+        """A follower that has been tracking someone at horizontal pixel side_x, then nobody: the (time, result) it gives each 0.1 s."""
+        f = follow.Follower(follow.heel_follow_config())
+        f.reset()
+        for i in range(6):
+            f.step([(side_x - 60, 200, side_x + 60, 690, 0.9)], frame, now=i * 0.1)
+        return f, [(k / 10, f.step([], frame, now=0.6 + k / 10)) for k in range(1, 130)]
+
+    f, out = lose(1000.0)                                                       # last seen on the RIGHT of the picture
+    res = {t: r for t, r in out}
+    checks["a brief dropout (< 0.6 s) is just waited out: it stands still"] = all(res[t].cmd == (0.0, 0.0, 0.0) and not res[t].lost for t in (0.1, 0.2, 0.4))
+    checks["then it turns on the spot toward the side they were last seen (right = negative yaw here)"] = res[1.5].cmd[2] < -0.5 and res[1.5].cmd[:2] == (0.0, 0.0)
+    yaws = [r.cmd[2] for _, r in out if not r.lost]
+    flips = sum(1 for a, b in zip(yaws, yaws[1:]) if a * b < 0)
+    checks["it sweeps to the other side and back (at least 2 direction changes in 8 s)"] = flips >= 2
+    turned = [0.0]
+    for (t0, r0), (t1, _) in zip(out, out[1:]):
+        turned.append(turned[-1] + r0.cmd[2] * (t1 - t0))
+    checks["it never turns further than about 75 deg either side of where it started"] = max(abs(x) for x in turned) < 1.3 + 0.2
+    checks["it never walks while searching (turns on the spot only)"] = all(r.cmd[0] == 0.0 and r.cmd[1] == 0.0 for _, r in out)
+    last_t = max(t for t, r in out if not r.lost)
+    checks["it gives up only after the search time (about 0.6 + 8 s), not before"] = 8.0 <= last_t <= 9.0 and out[-1][1].lost
+    checks["...and says it looked left and right"] = "left and right" in out[-1][1].status
+    f2, out2 = lose(200.0)
+    checks["last seen on the LEFT: it starts turning left (positive yaw)"] = dict(out2)[1.5].cmd[2] > 0.5
+    f3, _ = lose(1000.0)
+    for k in range(1, 40):
+        f3.step([], frame, now=0.6 + k / 10)
+    found = f3.step([(150, 200, 270, 690, 0.9)], frame, now=0.6 + 4.0)          # about 4 s into the search, on the opposite side of the picture
+    checks["when they reappear anywhere in the picture it goes back to following at once"] = found.cmd[2] > 0.0 and not found.lost and f3.scanning is False
+    checks["(and turns toward them, not away)"] = found.cmd[2] > 0.0                                            # they are on the left: positive yaw
+    cfg0 = dataclasses.replace(follow.heel_follow_config(), scan_for=0.0, phone_hold=0.0)
+    f4 = follow.Follower(cfg0)
+    f4.reset()
+    for i in range(6):
+        f4.step([(940, 200, 1060, 690, 0.9)], frame, now=i * 0.1)
+    checks["with the scan switched off (scan_for 0) it gives up after ~1.5 s as before"] = f4.step([], frame, now=0.6 + 2.0).lost
+
+    base = dataclasses.asdict(follow.heel_follow_config())
+    lost = {"on": 0, "off": 0}
+    for name in ("steps quickly out of the camera's view, then stands still", "walks up level with the dog (out of view), stands, then walks on", "90 deg turn to the right"):
+        for sd in (1, 2, 3):
+            lost["on"] += run(name, seed=sd, controller="follow", latency=0.22, det_hz=10.0, **{**base, "phone_hold": 0.0})["lost_at"] is not None
+            lost["off"] += run(name, seed=sd, controller="follow", latency=0.22, det_hz=10.0, **{**base, "phone_hold": 0.0, "scan_for": 0.0})["lost_at"] is not None
+    print(f"  (10 fps link, 9 runs of 3 losing scenarios, no phone: the dog gave up in {lost['on']} with the scan, {lost['off']} without it)")
+    checks["in simulation the scan keeps hold of the person through steps out of view and turns on a 10 fps link (0 of 9 lost; was several)"] = lost["on"] == 0 and lost["off"] >= 3
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
 def main() -> int:
     verbose = "-v" in sys.argv
     print(f"{'scenario':58s} {'seen':>5s}  {'ahead err m (med/p95)':>22s}  {'side err m (med/p95)':>21s}  {'closest':>7s}  gave up")
@@ -365,7 +429,7 @@ def main() -> int:
         slow_lost += lost
         print(f"  {name:44s} lost {lost}/3")
     print("\nlidar wait + loss reasons:")
-    rc = follow_style_checks() | plain_follow_checks() | unit_checks()
+    rc = follow_style_checks() | plain_follow_checks() | unit_checks() | scan_checks()
     print(f"  {'PASS' if slow_lost == 0 else 'FAIL'}  the dog kept hold of the person through every turn on the slower link ({slow_lost} of 12 runs lost them)")
     return rc or (1 if slow_lost else 0)
 

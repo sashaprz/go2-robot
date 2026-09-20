@@ -104,6 +104,17 @@ things worse). **When the voices around you are as loud as yours, nothing in sof
 setting): put a microphone near your mouth (a headset or clip-on mic as the Windows default input) or use push-to-talk (`V`).
 `--voice-log DIR` saves every utterance the always-on mic hears (wav + what it thought it heard) so real misses can be studied.
 
+**The AirPods (or any named Windows microphone): `--mic win --mic-device AirPods` (off in `go2.bat` now: on this laptop the AirPods mic stays silent, and the phone link below replaces it; `set WINMIC=AirPods` turns it on).** WSL only ever sees whichever microphone
+Windows has as its default, and can't start Windows programs here, so `go2.bat` starts a small Windows-side helper (`winmic.py`, using `sounddevice`) that
+captures the microphone whose name contains "AirPods" and serves it to the app over a local socket. Both the always-on ear and push-to-talk (`V`) use it.
+It listens only on the WSL virtual network address (not Wi-Fi or Ethernet), requires a secret token (`.winmic_token`), captures only while the app is
+connected, and exits by itself when the app is gone. About 8 seconds after the ear starts the window says the mic is live (with its level in the top
+bar) or says why not and **falls back to the laptop mic**: "SILENT" (the AirPods must be in your ears and connected to *this PC*, not the iPhone) or "can't
+reach the Windows mic helper" (launch `go2.bat`). To always use the laptop mic, set `set WINMIC=` in `go2.bat`. On another PC:
+`.venv\Scripts\python.exe -m pip install sounddevice`, then `.venv\Scripts\python.exe winmic.py --list`. Checked with a synthetic mic (15 checks), the real
+Windows helper capturing the laptop mic through the real WSL link (level 0.019) and finding the AirPods by name; **when I tried it, the AirPods mic returned
+digital silence (level 0.00001)**, i.e. it was not delivering audio, so I could not confirm it end to end with your voice.
+
 **The dog's own microphone (`--mic dog`).** The always-on ear can listen through the dog's built-in microphone instead of the computer's, over
 the same link (the connection's audio channel; needs no computer microphone, so the laptop can stay in a backpack). Add `--mic dog` to the `OPTS`
 line in `go2.bat`. About six seconds after it starts, the window says either "dog mic: receiving audio" (and the top bar shows the mic level) or "NO
@@ -151,8 +162,14 @@ centre; it used to be 60%, about 2.5 m: `--follow-height`). It walks at up to **
 and a small integral term so it keeps pace with a walking person instead of trailing 4-9 m behind, and it **backs away** if someone walks right up to it.
 In simulation it stops about 1.3 m from you and trails about 2 m behind a walking person (it was 5.7 m and 6.7-8.9 m), never lost the person across
 starts, stop-and-go and turns on a 15 or 10 fps detector, and kept a person walking straight at it at least 1.0 m away (the old settings touched them).
-It uses the clothing lock described under Heel (it will only follow the person it locked onto, and says what that is). Gives up after ~1.2 s without
-seeing them. **No obstacle avoidance**: keep the path clear, and remember it now moves faster. The detector is YOLOX-tiny on CPU (`follow.py`); no cloud.
+It uses the clothing lock described under Heel (it will only follow the person it locked onto, and says what that is).
+**When it loses you, it looks for you.** If the camera can't find you for over 0.6 s (you stepped out of the picture, walked past the dog, a fast turn),
+the dog does not give up: it turns on the spot toward the side you were last seen on, about 75 degrees, then sweeps across to the other side and back,
+for up to 8 s (`scan_for` in `follow.py`), and picks up again the moment your clothing colours reappear anywhere in the picture (it still never switches to
+someone else). It never walks while searching. With a phone streaming and saying you've stopped, it keeps looking 8 s longer. In simulation on a 10 fps
+link, in 9 runs of three losing situations (a quick step out of view, walking up level with the dog, a 90 degree turn) heel gave up in 5 without the scan and in
+0 with it (at 5 fps it rescues sharp turns too; the walk-up-level case at 5 fps additionally needs the phone). If nothing is found after the search it stops and says so.
+**No obstacle avoidance**: keep the path clear, and remember it now moves faster. The detector is YOLOX-tiny on CPU (`follow.py`); no cloud.
 Not yet tried on the real dog at the new settings.
 
 ## Heel (`H` or "ernest, heel")
@@ -235,6 +252,38 @@ turns the lidar part off. **It is off by default in `go2.bat` now:** recordings 
 - **No obstacle avoidance**, same as follow. It locks onto the biggest person in view when it starts, and with several people close together
   it can switch to the wrong one.
 
+## Phone link (iPhone: microphone + walking/standing)
+
+**Delay after you speak** is mostly the speech-to-text. On this laptop (measured, machine idle) `small.en` takes ~1.2-1.5 s for a short command with unpredictable
+spikes to 7-11 s when something else is using the CPU, while `base.en` takes a steady ~0.45 s (Whisper always processes a fixed 30 s window, so only a smaller
+model is faster). So while the phone's microphone is streaming (right by your mouth, clean sound) the app uses `base.en`, and the laptop mic keeps `small.en`
+(the noisy-room tests: `small.en` 71/108 commands vs `base.en` 61/108, which a close mic mostly removes). Other changes: the sentence is cut ~0.2 s sooner, a
+backlog of speech now drops the OLDEST sentence (it used to drop the newest) and a sentence that waited over 6 s is skipped rather than acted on late, the phone's
+audio is kept within 0.25 s of real time, and the `heard:` line in the top bar ends with `[x.x s]`: the time from the end of your sentence to the text. To keep the
+accurate model always, add `--fast-model none` to `OPTS` in `go2.bat`.
+
+`go2.bat` starts `phone_server.py` (`set PHONE=1`, on by default; `set PHONE=` turns it off). Your iPhone opens a page from the PC and streams
+(1) its **microphone**, which becomes the mic for the wake word and for `V` whenever it is streaming (the laptop mic before it connects and again if it
+drops out, switching by itself both ways), and (2) its **motion sensors**, from which the page decides *walking or standing*. If the camera loses you and the
+phone says you have stopped, the dog keeps looking (and waits up to 8 s longer) instead of giving up. Everything to do once, and every time, is in
+**`phone-setup.txt`**: put the phone on the dog's Wi-Fi with the laptop, run `phone-firewall.bat` once as administrator, install and trust the small local
+root certificate on the iPhone (iOS only gives a page the microphone and motion sensors over HTTPS, and only trusts certificates you install; this one is
+restricted to local names and private addresses), then scan the QR code that `go2.bat` opens (`phone_qr.html`) and tap Start. The app says "phone
+connected" and "the ear is now listening through the phone microphone", and the top bar shows the phone mic level.
+
+Safety: what the phone streams can move the dog (a spoken command is a command), so the page and its WebSocket need a random secret that is only in your
+link (`.phone_token`), the ports the app reads from listen only on the WSL virtual address and need a second secret (`.phone_wsl_token`), and the server exits
+by itself once the app is gone. The iPhone's browser stops the page when the screen locks (the page asks to keep the screen awake); then the app says the phone
+was lost and carries on with the laptop mic and the camera alone.
+
+What was tested here: the server's TLS chain against our own root, the secrets, audio byte-for-byte through it (13 + 17 checks: `phone_test.py`,
+`phonelink_test.py`), and the page itself in a real headless Edge with a fake beeping microphone (audio resampled to 16 kHz comes out as the right
+400 Hz beep, motion arrives at 10 Hz; `phone_page_test.py`). **Not tested (needs your iPhone):** installing/trusting the certificate, Safari's permission
+prompts, the real sensor readings, the screen lock, and whether the dog's Wi-Fi lets your phone talk to the laptop (some access points isolate clients).
+The page also has a one-time "turning set-up" and can send the person's turning rate, but the follower ignores it: in simulation steering by it gave mixed
+results and a backwards sign made the dog lose you, so `phone_ff` is off (only walking/standing is used). The phone is an aid, not a requirement: without it
+everything works from the camera alone. (AirPods position is not available to apps, and an AirTag can't be read by the laptop or the dog either.)
+
 ## Corridor walking (`corridor.bat`, standalone, not in the app)
 
 Walks the dog down a corridor using only its lidar. Each scan it heads for the most open direction (so a slanted corridor, a bend or a jog
@@ -245,11 +294,65 @@ Bends need a corridor at least ~1 m wide (the safety strip is 0.6 m). Close the 
 1. `corridor-dry.bat`: with the dog standing in a corridor, prints the left / right distances, how much room there is in the direction it would steer, and the command it *would* send. Never moves the dog. Check the numbers against a tape measure.
 2. `corridor.bat`: really walks (0.2 m/s, 40 s max; change `--speed` in its `OPTS` line). **Ctrl-C** stops it; it also stands still if the lidar goes quiet for half a second.
 
+**Stairs and ledges:** each scan is also checked for a drop-off (see Guide mode). One within 1.3 m in the +-60 degree cone ahead is a **hard stop** (`drop-off ahead (stairs down?)`),
+regardless of which way the steering wants to go, because a lip across the corridor leaves diagonals toward the side walls looking "open". Simulated: a corridor ending in a two-step staircase
+stops 1.1 m short of the top step, and without the detector it walks over. Things up to ~1.2 m high count as obstacles now (a shelf across the corridor stops it); above that nothing is seen.
+Like everything in the corridor walker it stops well short only of a drop-off: for an ordinary obstacle that fills the whole corridor it can end up ~0.3-0.7 m from it.
+
 Tested against simulated corridors (`python corridor.py`) and briefly on the real dog. **What recordings of the dog's lidar (`lidar-probe.bat`) showed:**
 each message is a persistent map (~13-40k points, ~7.7 per second), not one scan; nothing above ~1.2 m comes back; a person standing 2 m away shows up as a
 solid blob, but one walking about barely registers, and a "ghost" of someone who left lingers for ~40 s; and nothing standing up was ever seen closer than
 ~1 m to the dog (a person 0.6 m beside it never appeared). So walls closer than ~1 m may be invisible to the corridor walker, and lidar can't track a person
 at heel or guide-dog distance. The lidar also went silent once after 49 s and once never started: `lidar-probe.bat` and `corridor.bat` now reset it (off, then on) when that happens.
+
+## Guide mode (`guide-dry.bat` / `guide.bat`, standalone, not in the app)
+
+Leads the dog from where it stands (A) to a point B you give as **coordinates**, round whatever its lidar sees. B is in metres from the dog's
+starting spot: `--goto 4,1` is 4 m **ahead** and 1 m to the **left** (`--goto 3,-2` is 3 ahead, 2 to the right). Several points (`--goto 4,0 4,3`) are
+visited in order. `--odom` reads them as x,y in the dog's own odometry frame instead (it resets whenever the dog reboots). Close the phone app / `go2.bat` first.
+
+How it works: each lidar message goes into a top-down grid (`pathplan.RoomMap`); A* finds the cheapest path that keeps clear of obstacles and prefers the
+middle of a corridor; it follows that path and **re-plans twice a second**, so a box that turns up mid-walk is walked round. With no way through it **stands
+still and waits**, and gives up after `--patience` seconds (default 90) saying why. It also stops if the lidar goes stale or nearly empty (and resets the
+lidar), if it is told to walk but isn't moving (`stuck`), on Ctrl-C, and at `--seconds` (default 120).
+
+1. `guide-dry.bat`: plans from the real lidar and prints the map (`#` obstacle, `+` too close to pass, `v` drop-off, `*` path, `D` dog, `G` goal) plus what it *would* send. Never moves the dog.
+   Compare the picture with the room before trusting it.
+2. `guide.bat`: really walks (`--speed 0.3` in its `OPTS` line). Ctrl-C stops it. `--no-recover` turns off backing away (see below).
+
+**Drop-offs (stairs down, ledges, holes).** A lidar mounted 0.35 m up cannot see the ground just past a lip, so `dropoff.py` looks for what that leaves behind:
+floor that was returned right up to a line and then stops in plain sight (with the floor just before it seen, and nothing standing there to cast a shadow), or ground
+well below the floor (below -0.12 m: the recording's flat floor scatters within -0.08..+0.04 and never went lower). Those cells go in the map as no-go with a
+**0.75 m margin** (the dog's centre stops about 0.6 m from the lip, its nose about 0.25 m), the dog will not walk toward one within 0.6 m even if the planner says go, and the map
+remembers them after the dog gets too close to judge them (it judges 0.5-2.5 m ahead, front +-85 degrees only, because the recording showed floor returned 100% out to 1.5 m in
+front, ~80% at 2-3 m, and poorly behind or beside a wall). A ledge is first noticed about 2 m away. Tested in simulation against a lidar that hides the ground past a lip
+(a step, a 4-step staircase, a 50 cm drop, an angled ledge, a hole in the middle of a room, starting 0.4 m from an edge), and for false alarms: **0 in 95 frames of your real recording**,
+0 across 10 runs with a lidar far sparser than the real one, and none in any of the flat-floor runs. It cannot see a drop with less than ~5 cm of shadow, a dark or mirrored floor looks like a
+void (it stops: the safe way to be wrong), and a ramp down that shows lower ground is treated as a drop-off too.
+
+**Things up high.** Anything the lidar returns up to ~1.2 m (`HEAD_TOP`; the recording tops out at 1.19 m) is an obstacle, up from 1.0 m before. Anything from 0.45 m up also keeps a
+**person's width clear (0.35 m)**, not just the dog's (0.28 m): a table top, shelf or counter edge the dog could walk under still hits the person behind it. **Above ~1.2 m this lidar returns
+nothing at all, so a hanging sign, a low beam, a low ceiling or an awning is not seen and not avoided** (there is a test that says so: the dog walks under a sign at 1.5 m). Seeing that would need
+another sensor (a depth camera, or a monocular-depth model on the front camera).
+
+**Back away and look again.** The lidar cannot see anything standing nearer than ~1 m, so an obstacle that gets that close is only *remembered*, and the map does not believe it has gone until the dog
+can look again. Without a fix, someone who steps in front of the dog and leaves keeps blocking it until it gives up. So after 5 s of waiting, if something in its path (or a drop-off) is inside that blind
+zone, it **backs straight away at 0.15 m/s just far enough to see past it** (at most 1.2 m), looks again, and carries on if the way is clear. Once per wait, and only into space the map knows is empty. **It
+cannot see a person standing right behind it** (that is inside the blind zone too): use `--no-recover` if someone will be there.
+
+Two properties of the real lidar shaped all of it (from `lidar_recording.npz`): each message is the dog's **own persistent map** (successive messages share 91-99% of their points), so the
+grid is rebuilt from each message instead of accumulating, and **nothing at obstacle height is returned nearer than ~1 m**, so cells within 1.1 m of the dog keep what was seen before it got that
+close (a new return there still counts; only "it's gone" isn't believed). *Which* of those two the dog's map really does near itself isn't known from the recordings, so the simulator tests both.
+`python guide.py` runs 29 checks on simulated rooms (no dog): open floor, a box in the way, a box that appears mid-walk, a doorway across the room, a gap too narrow (waits, then gives up),
+a corridor blocked and then cleared (waits out the 40 s ghost, then walks on), lidar dropout, a dog that won't move, two points in a row, a start that isn't at the origin or facing +x, stairs, a
+hole, a table, a shelf, a sign, and someone stepping in and leaving (with and without the back-away).
+
+**What it does not do (read before using it near a person):**
+- **It does not lead a person.** It walks to B whether or not anyone is following. Nothing checks that the handler is still behind the dog; that is the next piece (turn and look, or a handle).
+- **Nothing above ~1.2 m is seen** (see above), and it has no idea about stairs going *up* beyond the risers being obstacles, a wet or slippery floor, or glass.
+- **A ghost is an obstacle.** Something that left lingers in the dog's map for ~40 s and the dog waits it out (patience 90 s covers that plus the time it stood there).
+- **Untested on the real dog: none of this has moved it yet, and the drop-off detector has never seen a real ledge**, only your flat-floor recording and simulated ones. Try `guide-dry.bat` at the top of a
+  staircase first (the map should show a `v` line at the lip) before trusting it to stop. Stay next to the dog with the window in reach: Ctrl-C stops it.
 
 ## Object detection (`O`)
 
@@ -290,11 +393,15 @@ in mind: they are the emergency stop.
 - `go2.bat` / `run_go2.sh` / `go2.py`: the app (window, keys, voice actions, box step, heel). Settings such as `--heel-speed` live in the `OPTS` line at the top of `go2.bat`, so you can just double-click it
 - `follow.py`: object/person detector (YOLOX-tiny), follow controller, and the heel controller
 - `heel_sim.py`: simulated walks that exercise the heel controller (no dog, no model): `python heel_sim.py`
-- `obstacles.py`: lidar point cloud -> "how far is the nearest thing in the path / on each side" (self-test: `python obstacles.py`). Not wired into the app yet.
+- `obstacles.py`: lidar point cloud -> "how far is the nearest thing in the path / on each side" (self-test: `python obstacles.py`). Used by the corridor walker, heel and guide; not wired into the app's other modes.
+- `dropoff.py`: stairs down / ledge / hole detection from the lidar (self-test: `python dropoff.py`); used by `guide.py` (through `pathplan.RoomMap`) and `corridor.py`
 - `corridor.py` / `corridor.bat` / `corridor-dry.bat`: walk down a corridor by lidar (self-test: `python corridor.py`; the dry one never moves the dog)
-- `pathplan.py`: lidar -> top-down room grid (saveable) -> A* path -> steering commands (self-test: `python pathplan.py`). Not used by anything yet: it is the next step (go to a place / round obstacles)
+- `pathplan.py`: lidar -> top-down room grid (saveable) -> A* path -> steering commands (self-test: `python pathplan.py`). Used by `guide.py`
+- `guide.py` / `guide.bat` / `guide-dry.bat`: go from A to a coordinate B round obstacles by lidar (self-test: `python guide.py`; the dry one never moves the dog)
 - `lidar_probe.py` / `lidar-probe.bat`: read-only check of what the dog's lidar delivers (never moves the dog)
 - `dogmic_probe.py` / `dogmic-probe.bat`: read-only check of the dog's own microphone (never moves the dog); `dogmic_test.py`: checks the dog-mic conversion with fake frames
+- `winmic.py` (Windows-side, started by `go2.bat`) / `winmic_test.py`: capture a named Windows microphone such as the AirPods and serve it to the app
+- `phone_server.py` + `phone.html` + `phone_tls.py` (Windows-side, started by `go2.bat`), `phonelink.py` (the app's side), `phone-setup.txt`, `phone-firewall.bat`: the iPhone link; tests `phone_test.py`, `phonelink_test.py`, `phone_page_test.py` (run with `.venv\Scripts\python.exe`)
 - `voice.py`: microphone capture, wake word + always-listening, local Whisper (and optional ElevenLabs), phrase matcher
 - `dimos-go2.bat` / `run_dimos.sh`, `fetch-aes-key.bat` / `fetch_aes_key.sh`, `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`
 - `dog.py`, `dog.bat`, `connect_test.py`: an earlier standalone controller. **Obsolete** (no AES-key support); kept for reference.

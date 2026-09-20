@@ -17,6 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 
 STAND_HEIGHT = 0.32          # m, body height above the floor while standing: the floor is (pose z - this)
+HEAD_TOP = 1.25              # m above the floor: the highest thing the dog's lidar reports (recordings top out at ~1.19). Anything above is NOT SEEN, not "clear".
 
 
 def to_dog_frame(points_world: np.ndarray, x: float, y: float, z: float, yaw: float,
@@ -34,7 +35,7 @@ class Corridor:
     length: float = 2.0          # m ahead
     half_width: float = 0.45     # m each side of the centre line: dog (~0.3 m) plus the person it leads
     z_min: float = 0.12          # m above the floor: ignore the floor itself and its noise...
-    z_max: float = 1.0           # ...and anything higher than the dog + person need (overhangs are a separate problem)
+    z_max: float = HEAD_TOP      # ...up to the top of what the lidar returns (a table top or shelf the person would hit; the dog could walk under it)
     min_points: int = 4          # a lone stray point is noise, not an obstacle
     heading: float = 0.0
 
@@ -52,7 +53,7 @@ def clearance(pts: np.ndarray, c: Corridor = Corridor()) -> float | None:
     return float(np.percentile(along[hit], 5))                # the near edge, robust to a stray point
 
 
-def sector_ranges(pts: np.ndarray, max_range: float = 3.0, z_min: float = 0.12, z_max: float = 1.0) -> dict[str, float]:
+def sector_ranges(pts: np.ndarray, max_range: float = 3.0, z_min: float = 0.12, z_max: float = HEAD_TOP) -> dict[str, float]:
     """Nearest obstacle in each 90 degree sector around the dog (front / left / back / right), max_range if none."""
     out = {"front": max_range, "left": max_range, "back": max_range, "right": max_range}
     if len(pts) == 0:

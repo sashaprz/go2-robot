@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Go2 phone link</title>
+<style>
+  :root { color-scheme: dark; --bg:#12141a; --card:#1c1f27; --txt:#e6e8ec; --dim:#8b93a1; --good:#5fd08a; --warn:#ffd05a; --bad:#ff7070; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:max(16px, env(safe-area-inset-top)) 16px 32px; background:var(--bg); color:var(--txt); font:16px/1.4 -apple-system, system-ui, sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .card { background:var(--card); border-radius:14px; padding:14px; margin:12px 0; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:10px; margin:6px 0; }
+  .dim { color:var(--dim); font-size:14px; }
+  button { width:100%; font-size:18px; font-weight:600; padding:15px; border:0; border-radius:12px; background:#3b82f6; color:#fff; }
+  button.secondary { background:#2b2f3a; color:var(--txt); font-size:15px; padding:12px; font-weight:500; }
+  button:disabled { opacity:.45; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--bad); margin-right:6px; }
+  .dot.ok { background:var(--good); } .dot.wait { background:var(--warn); }
+  .bar { height:12px; background:#2b2f3a; border-radius:6px; overflow:hidden; } .bar > i { display:block; height:100%; width:0; background:var(--good); }
+  pre { margin:0; font:12px/1.35 ui-monospace, Menlo, monospace; color:var(--dim); white-space:pre-wrap; max-height:34vh; overflow:auto; }
+  label { display:flex; gap:10px; align-items:center; margin:8px 0; }
+  input[type=checkbox] { width:22px; height:22px; }
+</style>
+</head>
+<body>
+<h1>Go2 phone link</h1>
+<div class="dim">Streams this phone's microphone (for the wake word) and its motion sensors (so the dog knows when you turn or stop) to the computer.</div>
+
+<div class="card">
+  <div class="row"><span><span class="dot" id="dConn"></span>Computer</span><span id="tConn" class="dim">not connected</span></div>
+  <div class="row"><span><span class="dot" id="dApp"></span>Dog app listening</span><span id="tApp" class="dim">-</span></div>
+  <div class="row"><span>Microphone</span><span id="tMic" class="dim">off</span></div>
+  <div class="bar"><i id="mic"></i></div>
+  <div class="row"><span>Turning</span><span id="tYaw" class="dim">-</span></div>
+  <div class="row"><span>Walking</span><span id="tWalk" class="dim">-</span></div>
+</div>
+
+<button id="start">Start</button>
+
+<div class="card">
+  <label><input type="checkbox" id="cMic" checked> Stream the microphone</label>
+  <label><input type="checkbox" id="cMotion" checked> Stream motion (gyro / steps)</label>
+  <div class="dim">Keep this page open and the screen on. iPhones stop the mic and sensors when the screen locks (the page asks the phone to stay awake). Wearing the AirPods first makes them the microphone.</div>
+</div>
+
+<div class="card">
+  <div class="row"><b>Turning set-up</b><span id="tCal" class="dim">not done</span></div>
+  <div class="dim">Phones report the turning direction differently. Carry the phone the way you will (pocket, hand), press the button, then turn <b>LEFT</b> on the spot (counter-clockwise, seen from above) for 4 seconds. Do it once.</div>
+  <div style="height:8px"></div>
+  <button class="secondary" id="calib" disabled>Set up turning</button>
+</div>
+
+<div class="card"><pre id="log"></pre></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const q = new URLSearchParams(location.search);
+const TOKEN = q.get("t") || "";
+const DEMO = q.get("demo") === "1";          // synthetic motion (for testing on a computer)
+const AUTO = q.get("auto") === "1";          // start without a tap (testing)
+const TARGET_RATE = 16000;
+let ws = null, wsOpen = false, retry = 1000, started = false;
+let sent = {audio: 0, motion: 0};
+let ctx = null, level = 0;
+let sign = parseFloat(localStorage.getItem("go2_yaw_sign") || "0");   // +1 / -1 once set up; 0 = unknown
+let wake = null;
+
+function log(msg) { const l = $("log"); l.textContent = (new Date().toLocaleTimeString() + "  " + msg + "\n" + l.textContent).slice(0, 4000); }
+function dot(id, cls) { $(id).className = "dot " + (cls || ""); }
+function setSign(s) { sign = s; localStorage.setItem("go2_yaw_sign", String(s)); $("tCal").textContent = s ? "done" : "not done"; }
+setSign(sign);
+
+// ---- connection --------------------------------------------------------------------------------------------
+function connect() {
+  if (!started) return;
+  ws = new WebSocket("wss://" + location.host + "/ws?t=" + encodeURIComponent(TOKEN));
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { wsOpen = true; retry = 1000; dot("dConn", "ok"); $("tConn").textContent = "connected"; log("connected to the computer");
+    ws.send(JSON.stringify({type: "hello", ua: navigator.userAgent, rate: ctx ? ctx.sampleRate : 0, sign: sign, demo: DEMO})); };
+  ws.onclose = () => { wsOpen = false; dot("dConn", "wait"); $("tConn").textContent = "reconnecting ..."; dot("dApp", ""); setTimeout(connect, retry); retry = Math.min(retry * 1.6, 8000); };
+  ws.onerror = () => { log("connection error (wrong link, or the computer's firewall is blocking port 8443?)"); };
+  ws.onmessage = e => {
+    if (typeof e.data !== "string") return;
+    try { const m = JSON.parse(e.data);
+      if (m.type === "status") { dot("dApp", m.app ? "ok" : "wait"); $("tApp").textContent = m.app ? "yes" : "waiting for go2.bat's app"; }
+    } catch (err) {}
+  };
+}
+function sendJSON(o) { if (wsOpen) ws.send(JSON.stringify(o)); }
+
+// ---- microphone -> 16 kHz mono int16 -----------------------------------------------------------------------
+let outBuf = [], acc = 0, cnt = 0, pos = 0, ratio = 3, totalSamples = 0, micTrack = null, micMode = "";
+function makeCtx() {                                                             // MUST run inside the tap: iOS only lets a tap start audio
+  if (!ctx) { ctx = new (window.AudioContext || window.webkitAudioContext)(); ctx.onstatechange = () => log("audio engine: " + ctx.state); }
+  if (ctx.state !== "running") ctx.resume().catch(() => {});
+}
+document.addEventListener("touchend", () => { if (ctx && ctx.state !== "running") ctx.resume().catch(() => {}); }, {passive: true});
+function onSamples(f32) {
+  totalSamples += f32.length;
+  let s2 = 0;
+  for (let k = 0; k < f32.length; k++) {
+    const v = f32[k]; s2 += v * v; acc += v; cnt++; pos += 1;
+    if (pos >= ratio) { outBuf.push(Math.max(-1, Math.min(1, acc / cnt)) * 32767 | 0); acc = 0; cnt = 0; pos -= ratio; }
+  }
+  level = 0.85 * level + 0.15 * Math.sqrt(s2 / f32.length);
+  if (outBuf.length >= 1600) {                                   // 100 ms
+    if (wsOpen && $("cMic").checked) { ws.send(Int16Array.from(outBuf).buffer); sent.audio++; }
+    outBuf = [];
+  }
+}
+async function startAudio() {
+  makeCtx();
+  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  micTrack = stream.getAudioTracks()[0];
+  log("microphone: " + ((micTrack && micTrack.label) || "(unnamed)") + ", " + (micTrack ? micTrack.readyState + (micTrack.muted ? ", MUTED" : "") : "no audio track"));
+  if (micTrack) {
+    micTrack.onmute = () => log("the phone MUTED the microphone (a call, Siri, or another app is using it?)");
+    micTrack.onunmute = () => log("microphone is back");
+    micTrack.onended = () => log("the microphone stopped (disconnected?)");
+  }
+  if (ctx.state !== "running") await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 1500))]);
+  ratio = ctx.sampleRate / TARGET_RATE;
+  const src = ctx.createMediaStreamSource(stream), mute = ctx.createGain();
+  mute.gain.value = 0; mute.connect(ctx.destination);                                              // silent, but keeps the graph running
+  try {
+    const code = "class P extends AudioWorkletProcessor{process(i){const c=i[0][0];if(c)this.port.postMessage(c.slice(0));return true;}}registerProcessor('cap',P);";
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], {type: "application/javascript"})));
+    const node = new AudioWorkletNode(ctx, "cap");
+    node.port.onmessage = e => onSamples(e.data);
+    src.connect(node); node.connect(mute); micMode = "worklet";
+  } catch (e) {
+    log("AudioWorklet failed (" + e.message + "): using the older capture method");
+    const sp = ctx.createScriptProcessor(4096, 1, 1);
+    sp.onaudioprocess = e => onSamples(e.inputBuffer.getChannelData(0));
+    src.connect(sp); sp.connect(mute); micMode = "script";
+  }
+  $("tMic").textContent = "on (" + Math.round(ctx.sampleRate / 1000) + " kHz, " + ((micTrack && micTrack.label) || "mic") + ")";
+  log("microphone on, " + ctx.sampleRate + " Hz -> " + TARGET_RATE + " Hz (" + micMode + "), audio engine " + ctx.state);
+}
+let lastTotal = -1, quietFor = 0;
+setInterval(() => {                                                            // is sound really arriving? say so on the page, and tell the computer (phone_server.log)
+  if (!started || !ctx) return;
+  if (ctx.state !== "running") ctx.resume().catch(() => {});
+  quietFor = totalSamples === lastTotal ? quietFor + 1 : 0;
+  lastTotal = totalSamples;
+  if ($("cMic").checked && quietFor >= 2) { $("tMic").textContent = "NOT receiving sound: tap the screen"; if (quietFor === 2) log("no microphone samples for 2 s (audio engine: " + ctx.state + (micTrack ? ", track " + micTrack.readyState + (micTrack.muted ? " muted" : "") : "") + "). Tap the screen; if it stays, another app or a call may hold the microphone."); }
+}, 1000);
+setInterval(() => { sendJSON({type: "diag", ctx: ctx ? ctx.state : "none", mode: micMode, samples: totalSamples, level: +level.toFixed(4), track: micTrack ? (micTrack.label + "|" + micTrack.readyState + (micTrack.muted ? "|muted" : "")) : "none", sentAudio: sent.audio}); }, 3000);
+
+// ---- motion -> turning rate (about the vertical) and walking ----------------------------------------------
+let g = null, yawRaw = 0, yawSm = 0, dynAcc = [], walking = false, energy = 0, heading = null, lastMotionT = 0;
+let calCollect = null;
+function onMotion(e) {
+  const r = e.rotationRate, a = e.accelerationIncludingGravity;
+  if (!r || !a || a.x === null) return;
+  const A = [a.x, a.y, a.z];
+  g = g ? g.map((v, i) => v + 0.05 * (A[i] - v)) : A.slice();                 // gravity direction, smoothed
+  const gn = Math.hypot(g[0], g[1], g[2]) || 1, gh = g.map(v => v / gn);
+  const w = [(r.beta || 0), (r.gamma || 0), (r.alpha || 0)].map(v => v * Math.PI / 180);   // rad/s about the device's x, y, z
+  yawRaw = w[0] * gh[0] + w[1] * gh[1] + w[2] * gh[2];                        // turning about the vertical, sign depends on the phone
+  yawSm += 0.2 * (yawRaw - yawSm);
+  if (calCollect) calCollect.push(yawRaw);
+  const dyn = Math.hypot(A[0], A[1], A[2]) - gn;                             // acceleration beyond gravity
+  dynAcc.push(dyn * dyn); if (dynAcc.length > 50) dynAcc.shift();             // ~1 s at 50 Hz
+  energy = Math.sqrt(dynAcc.reduce((s, v) => s + v, 0) / dynAcc.length);
+  walking = walking ? energy > 0.35 : energy > 0.7;                           // hysteresis
+  lastMotionT = performance.now();
+}
+function onOrient(e) { if (typeof e.webkitCompassHeading === "number") heading = e.webkitCompassHeading; else if (e.alpha != null && e.absolute) heading = (360 - e.alpha) % 360; }
+async function startMotion() {
+  if (DEMO) { log("DEMO: synthetic motion"); return; }
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+    const p = await DeviceMotionEvent.requestPermission();
+    if (p !== "granted") { log("motion permission refused: Settings > Safari > Motion & Orientation Access"); return; }
+  }
+  window.addEventListener("devicemotion", onMotion); window.addEventListener("deviceorientation", onOrient);
+  log("motion sensors on");
+}
+let demoT = 0;
+setInterval(() => {                                                            // 10 Hz to the computer, and the on-screen numbers
+  if (DEMO) { demoT += 0.1; yawRaw = yawSm = 0.6 * Math.sin(demoT * 0.7); walking = Math.sin(demoT * 0.3) > -0.4; energy = walking ? 2 : 0.1; lastMotionT = performance.now(); if (sign === 0) setSign(1); }
+  const fresh = performance.now() - lastMotionT < 1000;
+  const yaw = fresh ? yawSm * (sign || 1) : 0;
+  $("tYaw").textContent = fresh ? (sign ? (yaw > 0.15 ? "left " : yaw < -0.15 ? "right " : "straight ") + yaw.toFixed(2) + " rad/s" : "raw " + yawSm.toFixed(2) + " (set up turning)") : "-";
+  $("tWalk").textContent = fresh ? (walking ? "yes" : "standing") : "-";
+  $("mic").style.width = Math.min(100, level * 400) + "%";
+  if (started && $("cMotion").checked && fresh) { sendJSON({type: "m", t: Date.now(), yaw: +yaw.toFixed(3), walk: walking, en: +energy.toFixed(2), hdg: heading, cal: sign !== 0}); sent.motion++; }
+}, 100);
+setInterval(() => { if (started) $("start").textContent = "Running  (sent " + sent.audio + " audio, " + sent.motion + " motion)"; }, 1000);
+
+// ---- turning set-up -------------------------------------------------------------------------------------
+$("calib").onclick = () => {
+  $("calib").disabled = true; $("tCal").textContent = "turn LEFT now ..."; calCollect = [];
+  setTimeout(() => {
+    const v = calCollect; calCollect = null; $("calib").disabled = false;
+    const mean = v.reduce((s, x) => s + x, 0) / Math.max(1, v.length);
+    if (v.length < 20) { $("tCal").textContent = "no motion data"; log("no motion data during set-up: is 'Stream motion' on and Motion access allowed?"); return; }
+    if (Math.abs(mean) < 0.15) { $("tCal").textContent = "didn't see a turn"; log("mean turning rate only " + mean.toFixed(2) + " rad/s: turn on the spot, slowly, to the LEFT"); return; }
+    setSign(mean > 0 ? 1 : -1); log("set up: a left turn reads " + (mean > 0 ? "positive" : "negative") + " on this phone (mean " + mean.toFixed(2) + " rad/s)");
+    sendJSON({type: "hello", sign: sign});
+  }, 4500);
+};
+
+// ---- wake lock + start ----------------------------------------------------------------------------------
+async function keepAwake() { try { if ("wakeLock" in navigator) { wake = await navigator.wakeLock.request("screen"); log("screen will stay on"); } else log("this browser can't keep the screen awake: don't let the phone lock"); } catch (e) { log("wake lock: " + e.message); } }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && started) keepAwake(); });
+
+async function start() {
+  if (started) return;
+  if (!TOKEN) { log("no token in the link: use the link (or QR code) the computer shows"); return; }
+  $("start").disabled = true;
+  if ($("cMic").checked) makeCtx();                                            // the audio engine must be created inside the tap, before any await
+  try {
+    if ($("cMotion").checked) await startMotion();                             // iOS wants this inside the tap too
+    if ($("cMic").checked) await startAudio();
+  } catch (e) { log("could not start: " + e.name + ": " + e.message + (e.name === "NotAllowedError" ? "  (allow the microphone for this site)" : "")); $("start").disabled = false; return; }
+  started = true; $("calib").disabled = false; keepAwake(); connect();
+}
+$("start").onclick = start;
+if (AUTO) start();
+log(location.protocol === "https:" ? "secure page: ok" : "NOT secure: the microphone will be blocked. Use the https link.");
+</script>
+</body>
+</html>

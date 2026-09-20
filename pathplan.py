@@ -1,10 +1,12 @@
 """Corridors and paths from the Go2's lidar (numpy + scipy.ndimage: no dog needed to test it).
 
 The dog publishes lidar points in a fixed WORLD frame plus its own pose in that frame (see obstacles.py). RoomMap drops
-those points into a top-down grid: anything between z_lo and z_hi above the floor is an obstacle, floor-level returns
-mean "seen, walkable", and taller-than-z_hi returns (an overhang) are ignored. plan() turns the grid into a path that
+those points into a top-down grid: anything between z_lo and HEAD_TOP (the top of what this lidar returns, ~1.2 m) above the floor
+is an obstacle, and anything from 0.45 m up is also kept as an OVERHEAD layer that gets a person-wide berth (a table top the dog
+walks under still hits the person following it). Floor-level returns mean "seen, walkable". With cliffs=True it also finds drop-offs
+(dropoff.py: stairs down, ledges) and remembers them as no-go. plan() turns the grid into a path that
 keeps the dog's radius away from obstacles and prefers the middle of a corridor, and Navigator turns that path into
-move(vx, vy, yaw) commands. None of this is wired into go2.py yet. Everything the grid knows can be saved and loaded,
+move(vx, vy, yaw) commands. guide.py runs it on the real dog (standalone); none of it is wired into go2.py yet. Everything the grid knows can be saved and loaded,
 so a scan of a room can be reused later (the dog's world frame resets when it reboots: see the README before relying
 on a loaded map).
 
@@ -15,12 +17,14 @@ from __future__ import annotations
 
 import heapq
 import math
+import os
 import sys
 
 import numpy as np
 from scipy import ndimage
 
-from obstacles import STAND_HEIGHT, to_dog_frame
+import dropoff
+from obstacles import HEAD_TOP, STAND_HEIGHT, to_dog_frame
 
 BODY = (0.35, 0.25)          # m, half-extents of the dog's body in its own frame: lidar points inside it are the dog itself
 
@@ -28,14 +32,32 @@ BODY = (0.35, 0.25)          # m, half-extents of the dog's body in its own fram
 class RoomMap:
     """Top-down obstacle grid in the world frame. Cell [iy, ix] covers x in [x0 + ix*res, x0 + (ix+1)*res), same for y."""
 
-    def __init__(self, extent=(-8.0, -8.0, 8.0, 8.0), res: float = 0.1, z_lo: float = 0.15, z_hi: float = 1.0,
-                 min_hits: float = 3.0, decay_s: float | None = 4.0):
+    def __init__(self, extent=(-8.0, -8.0, 8.0, 8.0), res: float = 0.1, z_lo: float = 0.15, z_hi: float = HEAD_TOP,
+                 min_hits: float = 3.0, decay_s: float | None = 4.0, replace: bool = False, hold_radius: float = 0.0,
+                 z_head: float = 0.45, cliffs: bool = False, cliff_far: float = 2.5, cliff_forget: int = 12):
+        """replace=True: every lidar message is already the dog's own persistent map (recordings of the real dog: 91-99% of the
+        points repeat from one message to the next), so the grid is rebuilt from each message instead of accumulating them and
+        decay_s is ignored. hold_radius (m): the real lidar returns nothing standing up nearer than about 1 m, so cells that
+        close to the dog keep what was seen before it got that near (a new return there still counts; only "gone" is not believed).
+        z_hi is where the lidar STOPS SEEING (~1.2 m), not where the world is clear: a hanging sign or a low ceiling above it is not in
+        the map. z_head: returns from this height up also go in an overhead layer (costmap gives it handler_radius, a person's width).
+        cliffs=True: look for drop-offs with dropoff.detect (out to cliff_far m ahead) and remember them in .cliff. A flagged cell is only
+        forgotten after cliff_forget messages in a row that judged it and did not find it again (~1.5 s): a ledge seen at an angle, or with a
+        ragged shadow, flickers, and a flicker must not open a path to the edge."""
         self.x0, self.y0 = extent[0], extent[1]
         self.res, self.z_lo, self.z_hi, self.min_hits, self.decay_s = res, z_lo, z_hi, min_hits, decay_s
+        self.replace, self.hold_radius, self.z_head, self.cliffs, self.cliff_far = replace, hold_radius, z_head, cliffs, cliff_far
+        self.cliff_forget = cliff_forget
         self.nx = int(math.ceil((extent[2] - extent[0]) / res))
         self.ny = int(math.ceil((extent[3] - extent[1]) / res))
+        self._xc = self.x0 + (np.arange(self.nx) + 0.5) * res             # cell centres, for the hold radius
+        self._yc = self.y0 + (np.arange(self.ny) + 0.5) * res
         self.hits = np.zeros((self.ny, self.nx), np.float32)     # obstacle-height returns per cell (decays with time)
+        self.hits_hi = np.zeros((self.ny, self.nx), np.float32)  # ...of those, the ones from z_head up (the person's height)
+        self.low = np.zeros((self.ny, self.nx), np.float32)      # returns well BELOW the floor: the ground under a ledge
         self.seen = np.zeros((self.ny, self.nx), bool)           # any return at all: the cell has been looked at
+        self.cliff = np.zeros((self.ny, self.nx), bool)          # a drop-off: remembered until the dog looks again and it isn't (for a while)
+        self._cliff_miss = np.zeros((self.ny, self.nx), np.uint8)   # messages in a row that judged a flagged cell and did not find it
         self._t: float | None = None
 
     def cell(self, x: float, y: float) -> tuple[int, int]:
@@ -52,12 +74,22 @@ class RoomMap:
         what lets a removed obstacle fade. A static obstacle is re-hit on every message, so it never fades while seen.
         (If the dog's messages turn out to be a cumulative map rather than one scan, set decay_s=None.)"""
         x, y, z, yaw = pose
-        if self.decay_s and self._t is not None and t is not None and t > self._t:
-            self.hits *= math.exp(-(t - self._t) / self.decay_s)
+        near = None                                                  # cells too close to the dog for the lidar to see into
+        if self.hold_radius > 0:
+            near = np.hypot(self._xc[None, :] - x, self._yc[:, None] - y) < self.hold_radius
+        if not self.replace and self.decay_s and self._t is not None and t is not None and t > self._t:
+            f = math.exp(-(t - self._t) / self.decay_s)
+            for name in ("hits", "hits_hi", "low"):
+                g = getattr(self, name)
+                setattr(self, name, g * f if near is None else np.where(near, g, g * f).astype(np.float32))
         if t is not None:
             self._t = t
         p = np.asarray(points_world, np.float32).reshape(-1, 3)
         if len(p) == 0:
+            if self.replace:                                         # an empty map: nothing is seen, so only the held cells survive
+                for name in ("hits", "hits_hi", "low"):
+                    g = getattr(self, name)
+                    setattr(self, name, g * 0 if near is None else np.where(near, g, 0.0).astype(np.float32))
             return
         d = to_dog_frame(p, x, y, z, yaw)
         keep = ~((np.abs(d[:, 0]) < BODY[0]) & (np.abs(d[:, 1]) < BODY[1]))
@@ -66,21 +98,95 @@ class RoomMap:
         iy = np.floor((p[:, 1] - self.y0) / self.res).astype(np.int64)
         ok = (ix >= 0) & (ix < self.nx) & (iy >= 0) & (iy < self.ny)
         flat, h = iy[ok] * self.nx + ix[ok], h[ok]
-        band = (h >= self.z_lo) & (h <= self.z_hi)
-        self.hits += np.bincount(flat[band], minlength=self.nx * self.ny).reshape(self.ny, self.nx)
-        self.seen |= np.bincount(flat[h <= self.z_hi], minlength=self.nx * self.ny).reshape(self.ny, self.nx) > 0
+
+        def count(mask):
+            return np.bincount(flat[mask], minlength=self.nx * self.ny).reshape(self.ny, self.nx).astype(np.float32)
+
+        def merge(old, new):
+            if self.replace:
+                return new if near is None else np.where(near, np.maximum(old, new), new)
+            return old + new
+        self.hits = merge(self.hits, count((h >= self.z_lo) & (h <= self.z_hi)))
+        self.hits_hi = merge(self.hits_hi, count((h >= self.z_head) & (h <= self.z_hi)))
+        self.low = merge(self.low, count((h < dropoff.DROP_Z) & (h > -1.5)))
+        self.seen |= count(h <= self.z_hi) > 0
+        if self.cliffs:
+            self._find_cliffs(pose)
+
+    def _find_cliffs(self, pose) -> None:
+        far = self.cliff_far + 0.3
+        ix0, iy0 = self.cell(pose[0] - far, pose[1] - far)
+        ix1, iy1 = self.cell(pose[0] + far, pose[1] + far)
+        ix0, iy0, ix1, iy1 = max(ix0, 0), max(iy0, 0), min(ix1, self.nx - 1), min(iy1, self.ny - 1)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+        sl = (slice(iy0, iy1 + 1), slice(ix0, ix1 + 1))
+        r = dropoff.detect(self.seen[sl], self.low[sl], self.occupied()[sl], (self.x0 + ix0 * self.res, self.y0 + iy0 * self.res),
+                           self.res, (pose[0], pose[1], pose[3]), far=self.cliff_far)
+        found, flagged = r.window & r.cliff, self.cliff[sl]
+        missed = r.window & ~r.cliff & flagged                              # judged again, and not found this time
+        miss = np.where(found, 0, np.where(missed, np.minimum(self._cliff_miss[sl], 250) + 1, self._cliff_miss[sl])).astype(np.uint8)
+        self._cliff_miss[sl] = miss
+        self.cliff[sl] = (flagged | found) & ~(missed & (miss >= self.cliff_forget))   # found: flagged at once. Not found: forgotten only after a run of misses
 
     def occupied(self) -> np.ndarray:
         return self.hits >= self.min_hits
 
+    def occupied_high(self) -> np.ndarray:
+        return self.hits_hi >= self.min_hits
+
+    def nearest_ahead(self, mask: np.ndarray, pose, max_r: float, half_width: float | None = None) -> float | None:
+        """Distance (m) to the nearest True cell of `mask` in the half-plane ahead of the dog, within max_r (and, if given, within
+        half_width m of its line of travel). None if there is none."""
+        iy, ix = np.nonzero(mask)
+        if len(ix) == 0:
+            return None
+        dx, dy = self._xc[ix] - pose[0], self._yc[iy] - pose[1]
+        c, s = math.cos(pose[3]), math.sin(pose[3])
+        u, v = dx * c + dy * s, -dx * s + dy * c
+        m = (u > 0.0) & (np.hypot(u, v) <= max_r)
+        if half_width is not None:
+            m &= np.abs(v) <= half_width
+        return float(np.hypot(u[m], v[m]).min()) if m.any() else None
+
+    def nearest_any(self, mask: np.ndarray, pose, max_r: float) -> float | None:
+        """Distance (m) to the nearest True cell of `mask` in ANY direction from the dog, within max_r; None if there is none."""
+        iy, ix = np.nonzero(mask)
+        if len(ix) == 0:
+            return None
+        d = np.hypot(self._xc[ix] - pose[0], self._yc[iy] - pose[1])
+        d = d[d <= max_r]
+        return float(d.min()) if d.size else None
+
+    def cliff_ahead(self, pose, dist: float, half_width: float = 0.3) -> float | None:
+        """Distance ahead to the nearest drop-off inside a strip `half_width` m either side of where the dog is heading, or None."""
+        return self.nearest_ahead(self.cliff, pose, dist, half_width) if self.cliff.any() else None
+
+    def free_behind(self, pose, dist: float, half_width: float = 0.3) -> bool:
+        """Is the strip `dist` m behind the dog, `half_width` either side, free of obstacles and drop-offs? (Only what the map knows.)"""
+        iy, ix = np.nonzero(self.occupied() | self.occupied_high() | self.cliff)
+        if len(ix) == 0:
+            return True
+        dx, dy = self._xc[ix] - pose[0], self._yc[iy] - pose[1]
+        c, s = math.cos(pose[3]), math.sin(pose[3])
+        u, v = dx * c + dy * s, -dx * s + dy * c
+        return not bool(((u < 0.0) & (u > -dist) & (np.abs(v) <= half_width)).any())
+
     def costmap(self, pose=None, radius: float = 0.28, prefer: float = 0.8, wall_cost: float = 4.0,
-                allow_unknown: bool = True, unknown_cost: float = 2.0) -> tuple[np.ndarray, np.ndarray]:
-        """(cost, blocked). blocked = closer than `radius` m to an obstacle (the dog's half-width plus a margin).
-        cost >= 1 everywhere and rises toward `wall_cost` extra as a cell nears an obstacle, so the cheapest path runs down
-        the middle of a corridor. Cells nobody has looked at cost `unknown_cost` extra, or are blocked without allow_unknown."""
+                allow_unknown: bool = True, unknown_cost: float = 2.0, handler_radius: float = 0.35,
+                cliff_radius: float = 0.75) -> tuple[np.ndarray, np.ndarray]:
+        """(cost, blocked). blocked = closer than `radius` m to an obstacle (the dog's half-width plus a margin), closer than
+        `handler_radius` to anything that reaches person height (a person is wider than the dog and its hips and shoulders are what a
+        table edge or a counter hits), or closer than `cliff_radius` to a drop-off (the first cliff cell is about 0.1 m past the lip, and the dog's nose is 0.35 m ahead of its
+        centre, so 0.75 m keeps the dog's centre ~0.6 m and its nose ~0.25 m from the edge). cost >= 1 everywhere and rises toward `wall_cost`
+        extra as a cell nears an obstacle, so the cheapest path runs down the middle of a corridor. Cells nobody has looked at cost
+        `unknown_cost` extra, or are blocked without allow_unknown."""
         occ = self.occupied()
         dist = ndimage.distance_transform_edt(~occ) * self.res if occ.any() else np.full(occ.shape, 99.0)
         blocked = dist < radius
+        hi = self.occupied_high()
+        if hi.any():
+            blocked |= ndimage.distance_transform_edt(~hi) * self.res < handler_radius
         near = np.clip((prefer - dist) / (prefer - radius), 0.0, 1.0)
         cost = (1.0 + wall_cost * near ** 2).astype(np.float32)
         unseen = ~ndimage.binary_dilation(self.seen, iterations=max(1, round(0.3 / self.res)))   # a sparse scan leaves gaps: 0.3 m from a seen cell counts as seen
@@ -92,19 +198,32 @@ class RoomMap:
             iy, ix = np.ogrid[:self.ny, :self.nx]
             cx, cy = self.cell(pose[0], pose[1])
             blocked[(ix - cx) ** 2 + (iy - cy) ** 2 <= (0.5 / self.res) ** 2] = False
+        if self.cliff.any():                                         # ...but a drop-off stays a drop-off wherever the dog stands
+            dc = ndimage.distance_transform_edt(~self.cliff) * self.res
+            blocked |= dc < cliff_radius
+            cost += (wall_cost * np.clip((cliff_radius + 0.5 - dc) / 0.5, 0.0, 1.0) ** 2).astype(np.float32)
         return cost, blocked
 
     def save(self, path: str) -> None:
-        np.savez_compressed(path, hits=self.hits, seen=self.seen, meta=np.array(
-            [self.x0, self.y0, self.res, self.z_lo, self.z_hi, self.min_hits, self.decay_s or 0.0]))
+        np.savez_compressed(path, hits=self.hits, hits_hi=self.hits_hi, low=self.low, cliff=self.cliff, seen=self.seen, meta=np.array(
+            [self.x0, self.y0, self.res, self.z_lo, self.z_hi, self.min_hits, self.decay_s or 0.0, float(self.replace), self.hold_radius,
+             self.z_head, float(self.cliffs)]))
 
     @classmethod
     def load(cls, path: str) -> RoomMap:
         f = np.load(path)
-        x0, y0, res, z_lo, z_hi, min_hits, decay = (float(v) for v in f["meta"])
+        meta = [float(v) for v in f["meta"]]
+        meta += [0.0] * (9 - len(meta))                              # maps saved before replace / hold_radius existed lack those two
+        x0, y0, res, z_lo, z_hi, min_hits, decay, replace, hold = meta[:9]
+        z_head, cliffs = (meta[9], meta[10]) if len(meta) >= 11 else (0.45, 0.0)
         ny, nx = f["hits"].shape
-        m = cls((x0, y0, x0 + nx * res, y0 + ny * res), res, z_lo, z_hi, min_hits, decay or None)
+        m = cls((x0, y0, x0 + nx * res, y0 + ny * res), res, z_lo, z_hi, min_hits, decay or None, bool(replace), hold, z_head, bool(cliffs))
         m.hits, m.seen = f["hits"].astype(np.float32), f["seen"].astype(bool)
+        for name in ("hits_hi", "low"):
+            if name in f.files:
+                setattr(m, name, f[name].astype(np.float32))
+        if "cliff" in f.files:
+            m.cliff = f["cliff"].astype(bool)
         return m
 
 
@@ -247,11 +366,11 @@ class Navigator:
 
 
 def ascii_map(room: RoomMap, pose=None, path=None, goal=None, radius: float = 0.28, cols: int = 78) -> str:
-    """Terminal picture of the grid: # obstacle, + inside the safety margin, . free, blank never seen, * path, D dog, G goal."""
+    """Terminal picture of the grid: # obstacle, + inside the safety margin, v drop-off, . free, blank never seen, * path, D dog, G goal."""
     _, blocked = room.costmap(pose, radius=radius)
-    occ = room.occupied()
+    occ, cliff = room.occupied(), room.cliff
     k = max(1, math.ceil(room.nx / cols))
-    grid = [[" " if not room.seen[y, x] else "#" if occ[y, x] else "+" if blocked[y, x] else "." for x in range(0, room.nx, k)]
+    grid = [["v" if cliff[y, x] else " " if not room.seen[y, x] else "#" if occ[y, x] else "+" if blocked[y, x] else "." for x in range(0, room.nx, k)]
             for y in range(0, room.ny, k)]
 
     def put(xy, ch):
@@ -273,13 +392,21 @@ class Sim:
     points within 6 m each tick (no occlusion: it sees through walls, which is kinder than the real thing), and a dog that
     lags its commands (first-order, 0.25 s) like the real one."""
 
-    def __init__(self, boxes, start=(0.0, 0.0), yaw=0.0, seed=0):
+    def __init__(self, boxes, start=(0.0, 0.0), yaw=0.0, seed=0, blind: float = 0.0, pits=(), floor_per_m2: float | None = None,
+                 floor_half: float = 6.5, noise: float = 0.01):
+        """pits = [(x0, y0, x1, y1, depth)]: in that rectangle the floor is `depth` m lower (later entries win, so a staircase down is a few
+        overlapping rectangles of growing depth); the lidar cannot see it past the lip, as on the real dog. floor_per_m2: floor returns per m^2
+        (the default, 9000 over +-7 m, is only ~46/m^2, far sparser than the real dog: ~100% of 0.1 m cells out to 1.5 m). noise: floor z noise, m."""
+        self.blind = blind                                      # nothing standing up nearer than this to the dog is ever returned (the real lidar: ~1 m)
+        self.pits, self.noise = list(pits), noise
         self.rng = np.random.default_rng(seed)
         self.boxes = list(boxes)
         self.x, self.y, self.yaw = start[0], start[1], yaw
         self.v = np.zeros(3)
         self.t = 0.0
-        self.floor = np.stack((self.rng.uniform(-7, 7, 9000), self.rng.uniform(-7, 7, 9000), self.rng.normal(0, 0.01, 9000)), 1)
+        n, half = (int(floor_per_m2 * (2 * floor_half) ** 2), floor_half) if floor_per_m2 else (9000, 7.0)
+        fx, fy = self.rng.uniform(-half, half, n), self.rng.uniform(-half, half, n)
+        self.floor = np.stack((fx, fy, self._terrain(fx, fy) + self.rng.normal(0, noise, n)), 1)
         self.cloud = np.vstack((self.floor, *(self._points(b) for b in self.boxes))).astype(np.float32)
         self.track = [(self.x, self.y)]
         self.segs: list = []                                    # slanted walls: (a, b, height, thickness)
@@ -288,9 +415,49 @@ class Sim:
         n = max(40, int((b[2] - b[0]) * (b[3] - b[1]) * b[4] * 2500))
         return np.stack((self.rng.uniform(b[0], b[2], n), self.rng.uniform(b[1], b[3], n), self.rng.uniform(0, b[4], n)), 1)
 
+    def _terrain(self, x, y):
+        """Floor height at (x, y): 0, or minus the depth of the pit it is in."""
+        h = np.zeros(np.shape(x))
+        for x0, y0, x1, y1, depth in self.pits:
+            h = np.where((x >= x0) & (x <= x1) & (y >= y0) & (y <= y1), -depth, h)
+        return h
+
+    def _hidden(self, c):
+        """True where the sight line from the lidar (0.35 m up) to a point below floor level is cut by the lip of a pit."""
+        hid = np.zeros(len(c), bool)
+        if not self.pits or len(c) == 0:
+            return hid
+        idx = np.nonzero(c[:, 2] < -0.03)[0]
+        if len(idx) == 0:
+            return hid
+        q = c[idx]
+        f = np.linspace(0.0, 1.0, 41)[1:-1]                     # fractions of the way from the lidar to the point
+        xs, ys = self.x + (q[:, 0] - self.x)[:, None] * f, self.y + (q[:, 1] - self.y)[:, None] * f
+        ray = 0.35 + (q[:, 2] - 0.35)[:, None] * f
+        hid[idx] = (ray < self._terrain(xs, ys) - 0.005).any(1)
+        return hid
+
+    def pit_gap(self):
+        """Closest the dog's track came to a pit, m (negative: it went in)."""
+        best = 9.0
+        for x, y in self.track:
+            for x0, y0, x1, y1, _ in self.pits:
+                if x0 <= x <= x1 and y0 <= y <= y1:
+                    best = min(best, -min(x - x0, x1 - x, y - y0, y1 - y))
+                else:
+                    best = min(best, math.hypot(max(x0 - x, 0, x - x1), max(y0 - y, 0, y - y1)))
+        return best
+
     def add(self, b):
         self.boxes.append(b)
         self.cloud = np.vstack((self.cloud, self._points(b))).astype(np.float32)
+
+    def add_slab(self, x0, y0, x1, y1, z0, z1):
+        """Something that floats: a table top or shelf from height z0 to z1 with nothing under it."""
+        self.boxes.append((x0, y0, x1, y1, z1))
+        n = max(60, int((x1 - x0) * (y1 - y0) * 400))
+        pts = np.stack((self.rng.uniform(x0, x1, n), self.rng.uniform(y0, y1, n), self.rng.uniform(z0, z1, n)), 1)
+        self.cloud = np.vstack((self.cloud, pts)).astype(np.float32)
 
     def add_segment(self, a, b, h=1.8, thick=0.1):
         """A wall of any angle from point a to point b."""
@@ -312,8 +479,10 @@ class Sim:
 
     def scan(self):
         c = self.cloud[self.rng.random(len(self.cloud)) < 0.33]
-        c = c[np.hypot(c[:, 0] - self.x, c[:, 1] - self.y) < 6.0]
-        return c + self.rng.normal(0, 0.01, c.shape).astype(np.float32)
+        d = np.hypot(c[:, 0] - self.x, c[:, 1] - self.y)
+        c = c[(d < 6.0) & ~((c[:, 2] > 0.1) & (d < self.blind))]
+        c = c[~self._hidden(c)]
+        return c + self.rng.normal(0, self.noise, c.shape).astype(np.float32)
 
     def tick(self, cmd, dt=0.1):
         self.v += (np.asarray(cmd) - self.v) * (1 - math.exp(-dt / 0.25))
@@ -335,6 +504,46 @@ class Sim:
                 u = max(0.0, min(1.0, ((x - a[0]) * ab[0] + (y - a[1]) * ab[1]) / (ab[0] ** 2 + ab[1] ** 2)))
                 best = min(best, math.hypot(x - a[0] - u * ab[0], y - a[1] - u * ab[1]) - thick / 2)
         return best
+
+
+class PersistentSim(Sim):
+    """The real dog's lidar as the recordings showed it: each message is a persistent MAP (everything seen so far, not one scan),
+    nothing standing up is returned nearer than `blind` m, and an object that leaves lingers `ghost_s` s. Like Sim, the dog lags
+    its commands and the lidar sees through walls (but not over the lip of a pit). The floor is dense (`floor_per_m2`, default 250)."""
+
+    def __init__(self, boxes, start=(0.0, 0.0), yaw=0.0, seed=0, blind: float = 1.0, ghost_s: float = 40.0, forgets_blind: bool = False,
+                 floor_per_m2: float | None = 250.0, **kw):
+        super().__init__(boxes, start, yaw, seed, blind=blind, floor_per_m2=floor_per_m2, **kw)
+        self.ghost_s = ghost_s
+        self.forgets_blind = forgets_blind                  # the recordings can't say whether the dog's map keeps what it saw before it got within ~1 m: True = it doesn't
+        self.alive = np.ones(len(self.cloud), bool)
+        self.last = np.full(len(self.cloud), -1e9)          # when each point was last returned by the lidar
+        self.jit = self.rng.normal(0, self.noise, self.cloud.shape).astype(np.float32)      # a map's points don't jitter from message to message
+
+    def _sync(self):
+        n = len(self.cloud) - len(self.alive)
+        if n > 0:
+            self.alive = np.concatenate((self.alive, np.ones(n, bool)))
+            self.last = np.concatenate((self.last, np.full(n, -1e9)))
+            self.jit = np.concatenate((self.jit, self.rng.normal(0, self.noise, (n, 3)).astype(np.float32)))
+
+    def remove_last(self):
+        b = self.boxes.pop()
+        self.alive &= ~((self.cloud[:, 0] >= b[0]) & (self.cloud[:, 0] <= b[2]) & (self.cloud[:, 1] >= b[1]) & (self.cloud[:, 1] <= b[3]) & (self.cloud[:, 2] > 0.05))
+
+    def scan(self):
+        self._sync()
+        c = self.cloud
+        d = np.hypot(c[:, 0] - self.x, c[:, 1] - self.y)
+        zone = (d < 6.0) & ~((c[:, 2] > 0.1) & (d < self.blind))                 # where the lidar can see
+        cand = np.nonzero(self.alive & zone & (self.rng.random(len(c)) < 0.33))[0]
+        cand = cand[~self._hidden(c[cand])]                                       # the lip of a pit hides the ground past it
+        self.last[cand] = self.t
+        self.last[zone & (self.last > -1e8) & (self.t - self.last > self.ghost_s)] = -1e9   # should have been seen again and wasn't: forgotten for good
+        keep = self.last > -1e8
+        if self.forgets_blind:
+            keep &= ~((c[:, 2] > 0.1) & (d < self.blind))
+        return c[keep] + self.jit[keep]
 
 
 def run(sim: Sim, goal, seconds=60.0, events=(), verbose=False, **nav_kw):
@@ -376,7 +585,14 @@ def _selftest(verbose: bool) -> int:
     checks["a 5 cm ridge is walkable"] = not grid_with(box(1.0, 0.0, 0.5, 0.05)).occupied().any()
     checks["a 12 cm ridge is walkable, a 20 cm kerb is not"] = (
         not grid_with(box(1.0, 0.0, 0.5, 0.12)).occupied().any() and grid_with(np.stack((np.full(200, 1.0), np.full(200, 0.0), np.full(200, 0.2)), 1)).occupied().any())
-    checks["an overhang (table top at 1.2 m) does not block"] = not grid_with(np.stack((rng.uniform(.8, 1.4, 200), rng.uniform(-.3, .3, 200), np.full(200, 1.2)), 1)).occupied().any()
+    slab = lambda z, x=1.5, w=0.3, n=300: np.stack((x + (rng.random(n) - .5) * w, (rng.random(n) - .5) * w, np.full(n, z)), 1)  # noqa: E731
+    checks["a table top at 0.8 m (the dog fits under it, the person behind it does not) blocks"] = grid_with(slab(0.8)).occupied().any()
+    checks["a counter edge at 1.1 m, above the old 1.0 m limit, blocks too"] = grid_with(slab(1.1)).occupied().any()
+    checks["something at 1.6 m is above anything this lidar returns: not in the map (a hanging sign there is NOT seen)"] = not grid_with(slab(1.6)).occupied().any()
+    m_slab, m_box = grid_with(slab(0.8)), grid_with(box(1.5, 0.0, 0.3, 0.3))
+    cx, cy = m_slab.cell(1.97, 0.0)                                                  # 0.32 m from the edge of either
+    checks["a person-height obstacle keeps a person's width clear (0.35 m), a dog-height one only the dog's (0.28 m)"] = (
+        bool(m_slab.costmap()[1][cy, cx]) and not bool(m_box.costmap()[1][cy, cx]))
     checks["two stray points are noise"] = not grid_with(np.array([[1.0, 0.0, 0.5], [1.0, 0.02, 0.4]])).occupied().any()
     checks["the dog's own body is not an obstacle"] = not grid_with(box(0.0, 0.0, 0.3, 0.5, 200)).occupied().any()
     m = RoomMap(extent=(-4, -4, 4, 4), decay_s=2.0)
@@ -385,16 +601,71 @@ def _selftest(verbose: bool) -> int:
     early = m.occupied().any()
     m.update(floor.astype(np.float32), pose, 12.0)
     checks["a removed obstacle fades once it stops being seen (not at once, but within a few seconds)"] = early and not m.occupied().any()
+    # -- the real lidar: each message is a persistent map, and nothing standing up is returned nearer than ~1 m
+    obst = np.vstack((floor, box(1.5, 0.0, 0.3, 0.6))).astype(np.float32)
+    m = RoomMap(extent=(-4, -4, 4, 4), replace=True)
+    m.update(obst, pose, 0.0)
+    was = m.occupied().any()
+    m.update(floor.astype(np.float32), pose, 0.1)
+    checks["replace mode: a message that no longer has the obstacle removes it at once (the dog's own map already did the fading)"] = was and not m.occupied().any()
+    m = RoomMap(extent=(-4, -4, 4, 4), replace=True, hold_radius=1.1)
+    m.update(obst, pose, 0.0)
+    m.update(floor.astype(np.float32), (0.8, 0.0, STAND_HEIGHT, 0.0), 0.1)            # the dog walked up to it: the lidar can't see 0.7 m ahead
+    held = bool(m.occupied()[m.cell(1.5, 0.0)[1], m.cell(1.5, 0.0)[0]])
+    m.update(floor.astype(np.float32), (-1.0, 0.0, STAND_HEIGHT, 0.0), 0.2)           # stepped back out of the blind zone and it is not there
+    checks["hold radius: an obstacle seen from afar is remembered while the dog is too close to see it, and dropped once it is not there when it can look"] = (
+        held and not m.occupied().any())
+    m = RoomMap(extent=(-4, -4, 4, 4), replace=True, hold_radius=1.1)
+    m.update(floor.astype(np.float32), pose, 0.0)
+    m.update(np.vstack((floor, box(0.7, 0.0, 0.3, 0.6))).astype(np.float32), pose, 0.1)
+    checks["hold radius: something that does show up inside it still counts"] = bool(m.occupied()[m.cell(0.7, 0.0)[1], m.cell(0.7, 0.0)[0]])
+    m = RoomMap(extent=(-4, -4, 4, 4), decay_s=2.0, hold_radius=1.1)
+    m.update(np.vstack((floor, box(0.7, 0.0, 0.3, 0.6))).astype(np.float32), pose, 0.0)
+    m.update(floor.astype(np.float32), pose, 20.0)
+    checks["hold radius also stops the time decay of a close cell (accumulating mode)"] = bool(m.occupied()[m.cell(0.7, 0.0)[1], m.cell(0.7, 0.0)[0]])
     m = grid_with(box(1.5, 0.5, 0.3, 0.6))
     m.save("_room_test.npz")
     m2 = RoomMap.load("_room_test.npz")
-    import os
     os.remove("_room_test.npz")
     checks["a saved map loads back identical"] = bool(np.array_equal(m.hits, m2.hits) and np.array_equal(m.seen, m2.seen) and m2.res == m.res and m2.x0 == m.x0)
+    m = grid_with(box(1.5, 0.5, 0.3, 0.6), replace=True, hold_radius=1.1)
+    m.save("_room_test.npz")
+    m2 = RoomMap.load("_room_test.npz")
+    os.remove("_room_test.npz")
+    checks["...including whether it replaces and its hold radius"] = m2.replace and m2.hold_radius == 1.1
     m = RoomMap(extent=(-4, -4, 4, 4))
     m.update(floor[floor[:, 0] < 0.5].astype(np.float32), pose, 0.0)                    # only the left half was ever looked at
     checks["without allow_unknown a goal in unseen space has no path"] = plan(m, pose, (2.0, 0.0), allow_unknown=False) is None
     checks["with allow_unknown the same goal is reachable"] = plan(m, pose, (2.0, 0.0)) is not None
+
+    # -- drop-offs in the map: a step down 2 m ahead, seen from the start
+    def stairs_map(sim, seconds=2.0, **kw):
+        m = RoomMap(extent=(-4, -4, 7, 4), decay_s=None, replace=True, hold_radius=1.1, cliffs=True, **kw)
+        while sim.t < seconds:
+            m.update(sim.scan(), sim.pose(), sim.t)
+            sim.t += 0.1
+        return m
+    sim = PersistentSim([], pits=[(2.0, -4, 7, 4, 0.17)])
+    m = stairs_map(sim)
+    cx, cy = m.cell(2.1, 0.0)
+    checks["a step down 2 m ahead is in the map as a drop-off (with the real lidar's blind zone and floor density)"] = bool(m.cliff[cy, cx]) and not bool(m.cliff[m.cell(1.2, 0.0)[1], m.cell(1.2, 0.0)[0]])
+    blocked = m.costmap((0.0, 0.0, STAND_HEIGHT, 0.0))[1]
+    bx, by = m.cell(1.5, 0.0)
+    checks["...and the planner keeps 0.75 m off it (1.5 m: blocked; 1.0 m: free)"] = bool(blocked[by, bx]) and not bool(blocked[m.cell(1.0, 0.0)[1], m.cell(1.0, 0.0)[0]])
+    sim.x = 1.6                                                                       # walk up to it: it is now nearer than the detector looks
+    for _ in range(10):
+        m.update(sim.scan(), sim.pose(), sim.t)
+        sim.t += 0.1
+    checks["the dog is now 0.4 m from the edge, closer than it judges, and the map still remembers it"] = bool(m.cliff[cy, cx])
+    checks["cliff_ahead sees it 0.5 m in front of the dog"] = (m.cliff_ahead((1.6, 0.0, STAND_HEIGHT, 0.0), 1.0) or 9) < 0.7
+    m.save("_room_test.npz")
+    m2 = RoomMap.load("_room_test.npz")
+    os.remove("_room_test.npz")
+    checks["a saved map keeps its drop-offs and overhead layer"] = bool(np.array_equal(m.cliff, m2.cliff) and np.array_equal(m.hits_hi, m2.hits_hi) and m2.cliffs)
+    m = stairs_map(PersistentSim([]))
+    checks["flat dense floor: no drop-off in the map"] = not m.cliff.any()
+    m = stairs_map(Sim([]))
+    checks["a sparse floor (46 returns/m^2, single scans, nothing remembered) and no ledge: no drop-off either"] = not m.cliff.any()
 
     # -- A* and the smoothing
     cost = np.ones((20, 20), np.float32)

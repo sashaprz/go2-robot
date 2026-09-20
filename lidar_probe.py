@@ -7,8 +7,8 @@ It ALWAYS leaves two files next to this script, even if it fails or you close it
   lidar_probe_report.txt   everything printed, plus the result and any errors  (rewritten every second)
   lidar_recording.npz      the lidar frames (points within 4 m of the dog + its pose), when `save` is given (default in the .bat)
 
-Suggested 60 s: 0-10 s stand still 0.6 m beside the dog, 10-25 s walk slowly beside it, 25-35 s stand still near a wall,
-35-60 s nobody near the dog. The window prints the steps.
+Suggested 60 s: 0-10 s stand still 2 m in front of the dog, 10-25 s walk slowly round it at 2-3 m, 25-35 s stand still 1.5 m to its side,
+35-60 s nobody near the dog. The window prints the steps. (An earlier recording with the person 0.6 m beside the dog showed no sign of them.)
 """
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ SECONDS = float(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] != "save" else
 SAVE = "save" in sys.argv[1:]
 SAVE_PATH = os.path.join(HERE, "lidar_recording.npz")
 REPORT_PATH = os.path.join(HERE, "lidar_probe_report.txt")
-STAGES = [(0, "STAND still 0.6 m beside the dog (on its side)"), (10, "WALK slowly beside the dog"),
-          (25, "STAND still near a wall, with the dog next to you"), (35, "MOVE AWAY: nobody near the dog"), (50, "stay away, nearly done")]
+STAGES = [(0, "STAND still 2 m directly IN FRONT of the dog, facing it"), (10, "WALK slowly in a circle round the dog, 2-3 m away"),
+          (25, "STAND still 1.5 m to the dog's SIDE"), (35, "MOVE AWAY: nobody near the dog"), (50, "stay away, nearly done")]
 
 REPORT: list[str] = []
 
@@ -149,12 +149,21 @@ def main() -> int:
     subs = []
     try:
         subs = [c.raw_lidar_stream().subscribe(on_lidar), c.odom_stream().subscribe(on_pose)]
-        # the lidar only publishes once switched on (DimOS doesn't do this itself)
-        asyncio.run_coroutine_threadsafe(_switch_on(c, RTC_TOPIC["ULIDAR_SWITCH"]), c.loop).result(timeout=8)
+        # the lidar only publishes once switched on (DimOS doesn't do this itself). Off then on: a lidar left in an odd state by an
+        # earlier session (one run went silent after 49 s, the next never started) has to be reset, not just told "on" again.
+        topic = RTC_TOPIC["ULIDAR_SWITCH"]
+        kick_lidar(c, topic)
         say(f"listening for {SECONDS:.0f} s (never moves the dog)\n")
-        t0, shown = time.time(), set()
+        t0, shown, last_kick, kicks = time.time(), set(), time.time(), 0
         while time.time() - t0 < SECONDS:
             time.sleep(1.0)
+            with lock:
+                last_msg = state["lidar_t"][-1] if state["lidar_t"] else t0
+            if time.time() - last_msg > 4 and time.time() - last_kick > 6:      # silent: reset it again, and say so in the report
+                kicks += 1
+                last_kick = time.time()
+                say(f"  (lidar silent for {time.time() - last_msg:.0f} s: sent the lidar switch off, then on again [{kicks}])")
+                kick_lidar(c, topic)
             if SAVE and SECONDS >= 55:                           # tell the person what to do, and when
                 for at, what in STAGES:
                     if time.time() - t0 >= at and at not in shown:
@@ -190,8 +199,12 @@ def main() -> int:
     return 0
 
 
-async def _switch_on(c, topic: str) -> None:
-    c.conn.datachannel.pub_sub.publish_without_callback(topic, "on")
+def kick_lidar(c, topic: str) -> None:
+    """Reset the dog's lidar: switch it off, wait, switch it on."""
+    pub = c.conn.datachannel.pub_sub.publish_without_callback
+    c.loop.call_soon_threadsafe(pub, topic, "off")
+    time.sleep(0.8)
+    c.loop.call_soon_threadsafe(pub, topic, "on")
 
 
 if __name__ == "__main__":

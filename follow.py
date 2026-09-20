@@ -137,6 +137,19 @@ def _iou(a, b) -> float:
     return inter / union if union > 0 else 0.0
 
 
+@dataclass(frozen=True)
+class PhoneState:
+    """What the person's phone says about them right now (phonelink.PhoneLink makes it from the phone's motion sensors)."""
+    yaw_rate: float = 0.0        # rad/s turning about the vertical; + = turning LEFT (only meaningful when calibrated)
+    walking: bool = False        # walking, as opposed to standing
+    calibrated: bool = False     # the phone knows which way its turning sign goes (the page's one-time set-up)
+    age: float = 99.0            # seconds since the last update
+
+    @property
+    def fresh(self) -> bool:
+        return self.age < 0.6
+
+
 @dataclass
 class FollowConfig:
     max_forward: float = 0.35     # m/s  hard cap on walking speed
@@ -150,6 +163,13 @@ class FollowConfig:
     target_height: float = 0.60   # stop walking when the person fills this fraction of the frame height
     lost_after: float = 1.2       # seconds without a matching person before giving up
     min_iou_or_dist: float = 0.10 # IoU with the last box needed to keep the lock (else centre-distance test)
+    phone_ff: float = 0.0         # EXPERIMENTAL, off: turn along with the person's own turning rate from their phone (needs the turning set-up; no benefit shown in simulation, harmful if the sign is wrong)
+    phone_hold: float = 0.0       # s: if their phone says they have STOPPED but the camera lost them, wait this long instead of giving up (0 = off; heel/follow use 8)
+    phone_search: float = 1.5     # s: extra time to look for them when the phone says they are still walking
+    scan_for: float = 0.0         # s: when the camera loses them, TURN side to side on the spot for this long to find them again before giving up (0 = don't; follow/heel use 8)
+    scan_after: float = 0.6       # s: how long a dropout is just waited out (standing still) before the scan starts
+    scan_turn: float = 0.7        # rad/s while scanning
+    scan_swing: float = 1.3       # rad (~75 deg): how far each side it turns; it starts toward the side they were last seen on, then sweeps to the other
     lead_time: float = 0.0        # s: steer toward where they WILL be across the picture (their swing rate x this): makes up for lag; 0 = off (plain follow)
     fallback_height: float = 0.82 # lidar mode only: the box-height stop point used when there is no distance from the lidar-taught camera (~1.5 m, safer than 0.9)
     range_target: float = 0.0     # m from the dog's centre to hold, measured by the LIDAR along the camera's line of sight (0 = use the box height)
@@ -173,7 +193,7 @@ def follow_config(max_forward: float = 0.8, target_height: float = 0.78) -> "Fol
     """Plain 'follow me'. Stops closer than the old setting (0.78 of the picture height instead of 0.60: about 1.3 m from the dog's
     centre instead of 2.5 m), walks faster (0.8 m/s instead of 0.35, with a stiffer speed response), has a small integral so it keeps
     pace with a walking person instead of trailing 4-9 m behind, and backs away if someone walks right up to it."""
-    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=1.5, target_height=target_height, back_at=0.92, back_speed=0.5)
+    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=1.5, target_height=target_height, back_at=0.92, back_speed=0.5, phone_hold=8.0, scan_for=8.0)
 
 
 def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_height: float = 0.90, offset: float = 0.18,
@@ -187,7 +207,7 @@ def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_heig
     return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=2.5, target_height=target_height,
                         x_offset=offset * (1 if side == "left" else -1), lost_after=1.5, back_at=0.95,
                         k_turn=3.5, max_turn=1.0, lead_time=0.4, turn_deadband=0.03, back_speed=0.45,
-                        range_target=range_target, k_range=1.0, ki_range=0.8, range_back=0.45, k_back=3.0)
+                        range_target=range_target, k_range=1.0, ki_range=0.8, range_back=0.45, k_back=3.0, phone_hold=8.0, scan_for=8.0)
 
 
 def pick_target(dets, last_box, w: int, min_iou: float):
@@ -371,6 +391,13 @@ class Follower:
     range_src: str = "camera"
     range_m: float | None = None
     racc: float = 0.0
+    phone_resume: float = -1e9               # when their phone last said they started walking again (restarts the search clock)
+    phone_walk_prev: bool | None = None
+    last_err: float = 0.0                    # where they were across the picture when last seen (+ = right of where we hold them)
+    scan_yaw: float = 0.0                    # while scanning: how far we have turned from where the scan began (dead reckoning from what we commanded)
+    scan_dir: float = 0.0                    # while scanning: +1 turning left, -1 right, 0 = not scanning
+    scan_t: float | None = None              # time of the last scan step
+    scanning: bool = False
     pairs: list = field(default_factory=list)        # (time, feet row at 720p, 1 / forward distance by lidar): the camera's ruler
     cal: tuple | None = None                          # (a, b): 1 / forward distance = a * feet row + b, learned from the lidar
 
@@ -380,6 +407,8 @@ class Follower:
         self.prev_err, self.err_rate = None, 0.0
         self.range_src, self.range_m = "camera", None
         self.racc = 0.0
+        self.phone_resume, self.phone_walk_prev = -1e9, None
+        self.last_err, self.scan_yaw, self.scan_dir, self.scan_t, self.scanning = 0.0, 0.0, 0.0, None, False
         self.pairs, self.cal = [], None
         self.lock.reset()
 
@@ -444,21 +473,64 @@ class Follower:
         return self.range_m
 
     def _pick(self, dets, w, frame=None):
-        return self.lock.choose(dets, frame, self.last_box, w, self.cfg.min_iou_or_dist)
+        # while scanning they can reappear anywhere in the picture: the clothing colours decide, not where they last were
+        return self.lock.choose(dets, frame, None if self.scanning else self.last_box, w, self.cfg.min_iou_or_dist)
 
-    def step(self, dets, frame_shape, now: float | None = None, frame=None, cloud=None) -> FollowResult:
+    def _scan(self, now: float) -> tuple[float, str]:
+        """One step of 'turn side to side to find them': the yaw to command and what to say. Starts toward the side they were last seen,
+        turns until it is scan_swing away from where it began, then sweeps across to the other side, and back."""
+        c = self.cfg
+        if self.scan_dir == 0.0:
+            self.scan_dir = -1.0 if self.last_err > 0 else 1.0            # they were right of centre: turn right (negative yaw), else left
+            self.scan_yaw, self.scan_t = 0.0, now
+        dt = min(max(now - (self.scan_t if self.scan_t is not None else now), 0.0), 0.5)
+        self.scan_t = now
+        self.scan_yaw += self.scan_dir * c.scan_turn * dt
+        if self.scan_dir > 0 and self.scan_yaw >= c.scan_swing:
+            self.scan_dir = -1.0
+        elif self.scan_dir < 0 and self.scan_yaw <= -c.scan_swing:
+            self.scan_dir = 1.0
+        return self.scan_dir * c.scan_turn, ("left" if self.scan_dir > 0 else "right")
+
+    def step(self, dets, frame_shape, now: float | None = None, frame=None, cloud=None, phone: PhoneState | None = None) -> FollowResult:
         now = time.time() if now is None else now
         h, w = frame_shape[:2]
+        ph = phone if (phone is not None and phone.fresh) else None            # (walking / standing does not depend on the turning sign)
+        if ph is not None:
+            if self.phone_walk_prev is False and ph.walking:
+                self.phone_resume = now                              # they set off again: give the search a fresh start
+            self.phone_walk_prev = ph.walking
         c = self.cfg
         tgt = self._pick(dets, w, frame)
         if tgt is None:
             why = self.lock.why_none(len(dets))
-            if now - self.last_seen > c.lost_after:
+            gone = now - self.last_seen
+            if c.scan_for <= 0 and ph is not None and c.phone_hold > 0 and not ph.walking and self.last_box is not None:      # (with the scan on, the scan does the waiting)
+                if gone <= c.phone_hold:                             # their phone says they are standing: they are just out of the picture. Wait.
+                    return FollowResult(status=f"waiting: your phone says you've stopped, out of the camera's view ({gone:.0f} s) [phone]")
+            elif ph is not None and c.phone_ff > 0 and ph.calibrated and ph.walking and now - max(self.last_seen, self.phone_resume) <= c.lost_after + c.phone_search:
+                turn = float(np.clip(c.phone_ff * ph.yaw_rate, -c.max_turn, c.max_turn))     # still walking: turn the way they are turning
+                return FollowResult(cmd=(0.0, 0.0, turn), status=f"searching: your phone says you're walking ... ({why}) [phone]")
+            if c.scan_for > 0 and self.last_box is not None:
+                since = now - max(self.last_seen, self.phone_resume)         # (a phone that says they set off again restarts the search)
+                stood = ph is not None and c.phone_hold > 0 and not ph.walking
+                if since > c.scan_after + c.scan_for + (c.phone_hold if stood else 0.0):
+                    return FollowResult(status=f"lost the person: {why} (looked left and right for {c.scan_for:.0f} s)", lost=True)
+                if since <= c.scan_after:                                    # a brief dropout: stand still and wait
+                    return FollowResult(status=f"searching ... ({why})")
+                if since <= c.scan_after + c.scan_for:
+                    self.scanning = True
+                    turn, side = self._scan(now)
+                    return FollowResult(cmd=(0.0, 0.0, turn), status=f"lost you: turning {side} and back to find you ({since:.0f} s, {why})")
+                return FollowResult(status=f"waiting: your phone says you've stopped ({why}) [phone]")
+            if now - max(self.last_seen, self.phone_resume) > c.lost_after:
                 return FollowResult(status=f"lost the person: {why}", lost=True)
             return FollowResult(status=f"searching ... ({why})")      # brief dropout: stand still, keep the lock
         self.last_box, self.last_seen = tgt, now
+        self.scanning, self.scan_dir, self.scan_yaw, self.scan_t = False, 0.0, 0.0, None
 
         err = ((tgt[0] + tgt[2]) / 2 - w / 2) / w - c.x_offset   # + means the person is right of where we want them
+        self.last_err = err
         hr = (tgt[3] - tgt[1]) / h
         err_c = err
         if c.lead_time > 0:                                  # how fast they are swinging across the picture, smoothed
@@ -470,6 +542,8 @@ class Follower:
             self.prev_err, self.prev_err_t = err, now
             err_c = err + self.err_rate * c.lead_time
         yaw = 0.0 if abs(err_c) < c.turn_deadband else float(np.clip(-c.k_turn * err_c, -c.max_turn, c.max_turn))
+        if ph is not None and c.phone_ff > 0 and ph.calibrated:     # (off by default: it did not help in simulation, and a backwards turning sign makes it harmful)
+            yaw = float(np.clip(yaw + c.phone_ff * ph.yaw_rate, -c.max_turn, c.max_turn))
         vx = 0.0
         dt = 0.05 if self.last_step is None else min(max(now - self.last_step, 0.02), 0.5)
         self.last_step = now
