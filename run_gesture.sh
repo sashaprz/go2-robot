@@ -17,5 +17,14 @@ if [ -f ~/.dimos.env ]; then set -a; . ~/.dimos.env; set +a; fi
 # Get the directory where this script lives
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Find Python executable - try venv first, then system python3
+if [ -f "$SCRIPT_DIR/dimensional-applications/.venv/bin/python" ]; then
+  PYTHON="$SCRIPT_DIR/dimensional-applications/.venv/bin/python"
+elif [ -f "$SCRIPT_DIR/../dimensional-applications/.venv/bin/python" ]; then
+  PYTHON="$SCRIPT_DIR/../dimensional-applications/.venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
 # Run gesture control using the DimOS Python
-exec /Users/anastasiyavolgina/dimensional-applications/.venv/bin/python "$SCRIPT_DIR/gesture_robot.py" "${PASS[@]}"
+exec "$PYTHON" "$SCRIPT_DIR/gesture_robot.py" "${PASS[@]}"
