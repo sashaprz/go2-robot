@@ -169,6 +169,13 @@ class FollowResult:
     lost: bool = False                                  # True once the target has been missing too long
 
 
+def follow_config(max_forward: float = 0.8, target_height: float = 0.78) -> "FollowConfig":
+    """Plain 'follow me'. Stops closer than the old setting (0.78 of the picture height instead of 0.60: about 1.3 m from the dog's
+    centre instead of 2.5 m), walks faster (0.8 m/s instead of 0.35, with a stiffer speed response), has a small integral so it keeps
+    pace with a walking person instead of trailing 4-9 m behind, and backs away if someone walks right up to it."""
+    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=1.5, target_height=target_height, back_at=0.92, back_speed=0.5)
+
+
 def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_height: float = 0.90, offset: float = 0.18,
                        range_target: float = 0.0) -> "FollowConfig":
     """Heel = the same controller as 'follow me', holding the person a little off-centre so the dog walks at their side, and CLOSE

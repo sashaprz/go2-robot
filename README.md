@@ -137,9 +137,14 @@ firmware exposes beyond this command. `Handstand` (front legs) is deliberately n
 
 ## Follow mode (`T` or "follow me")
 
-Turns to keep the nearest person centred and walks toward them slowly (max 0.35 m/s), stopping when they fill ~60% of the
-frame height. Gives up after ~1.2 s without seeing them. **No obstacle avoidance**: keep the path clear. The detector is
-YOLOX-tiny on CPU (`follow.py`); no cloud. Tested on still photos and a fake robot only.
+Turns to keep the nearest person centred and walks toward them, stopping when they fill about **78% of the frame height** (about 1.3 m from the dog's
+centre; it used to be 60%, about 2.5 m: `--follow-height`). It walks at up to **0.8 m/s** (`--follow-speed`, it used to be 0.35), with a stiffer speed response
+and a small integral term so it keeps pace with a walking person instead of trailing 4-9 m behind, and it **backs away** if someone walks right up to it.
+In simulation it stops about 1.3 m from you and trails about 2 m behind a walking person (it was 5.7 m and 6.7-8.9 m), never lost the person across
+starts, stop-and-go and turns on a 15 or 10 fps detector, and kept a person walking straight at it at least 1.0 m away (the old settings touched them).
+It uses the clothing lock described under Heel (it will only follow the person it locked onto, and says what that is). Gives up after ~1.2 s without
+seeing them. **No obstacle avoidance**: keep the path clear, and remember it now moves faster. The detector is YOLOX-tiny on CPU (`follow.py`); no cloud.
+Not yet tried on the real dog at the new settings.
 
 ## Heel (`H` or "ernest, heel")
 

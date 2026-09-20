@@ -4,6 +4,9 @@ REM   go2.bat          -> connect to the dog
 REM   go2.bat --demo   -> preview the window with a fake robot (no dog needed)
 REM Settings live in OPTS below, so you can just double-click this file. Edit the line, save, relaunch.
 REM   --motion-mode mcf : the dog's motion mode (the back-leg stand, id 2050, belongs to it). Delete it to use the default.
+REM   "follow me" (T, or say it): --follow-speed 0.8 = fastest it walks, m/s (was 0.35).
+REM                                --follow-height 0.78 = how close it stops: higher = closer (0.60 was the old ~2.5 m, 0.78 is ~1.3 m,
+REM                                above ~0.9 the camera loses your feet).
 REM   --heel-speed 1.0  : fastest the dog walks while heeling, m/s (a strolling pace is ~1.0; it falls behind you above this).
 REM   heel = the "follow me" steering, holding you a little off-centre so the dog walks at your side, CLOSE (a leash length):
 REM     --heel-range 1.1   : distance to hold, metres from the dog's centre to you. The lidar teaches the camera how far you are

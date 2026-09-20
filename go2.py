@@ -522,7 +522,7 @@ class App:
         if self.upright:
             self.say("come down to four legs first (U / say 'come down')", WARN)
             return
-        cfg = follow_mod.FollowConfig(max_forward=self.args.follow_speed)
+        cfg = follow_mod.follow_config(self.args.follow_speed, self.args.follow_height)
         self.follower = follow_mod.Follower(cfg)
         self.follower.reset()
         self.follow_res = None
@@ -1785,7 +1785,9 @@ def main() -> int:
     p.add_argument("--box-wait", type=float, default=3.2, help="seconds 'box step' waits for the dog to finish standing up before balancing")
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
-    p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
+    p.add_argument("--follow-speed", type=float, default=0.8, help="max forward speed while following, m/s (it was 0.35; a strolling pace is ~1.0)")
+    p.add_argument("--follow-height", type=float, default=0.78,
+                   help="follow: stop closing in when you fill this share of the picture height. Higher = stops closer (0.60 was the old setting, ~2.5 m; 0.78 is ~1.3 m; above ~0.9 the camera loses your feet)")
     p.add_argument("--heel-side", choices=["left", "right"], default="left", help="which side of you the dog walks on when heeling")
     p.add_argument("--heel-speed", type=float, default=0.8, help="max forward speed while heeling, m/s (a slow walk is ~1.0; the dog trails you above this)")
     p.add_argument("--heel-lidar", dest="heel_lidar", action="store_true", default=True,

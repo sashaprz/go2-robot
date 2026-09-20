@@ -258,6 +258,40 @@ def unit_checks() -> int:
     return 0 if all(checks.values()) else 1
 
 
+def plain_follow_checks() -> int:
+    """Normal 'follow me' with the closer stop point and higher speed (follow.follow_config), against the old settings."""
+    import dataclasses
+
+    new = dict(dataclasses.asdict(follow.follow_config()), controller="follow", x_offset=0.0)
+    old = dict(controller="follow", x_offset=0.0, lost_after=1.2, target_height=0.60, max_forward=0.35, k_forward=1.0)
+    print()
+    print("normal follow, old settings (stop at 60% of the picture, 0.35 m/s) against the new (78%, 0.8 m/s), median distance to the person:")
+    print(f"  {'scenario':44s} {'old':>14s} {'new':>14s}   lost (new, fast / 10 fps link)")
+    lost_new = 0
+    stand_new = 9.0
+    for name in ("walk 8 s at 0.8 m/s, then stand still 8 s", "straight at 0.5 m/s, starting in position", "straight at 0.7 m/s, starting in position",
+                 "stop and go (5 s walk, 4 s stand, 5 s walk)", "90 deg turn to the left", "90 deg turn to the right", "S-bend: right then left"):
+        ro = [run(name, seed=sd, **old) for sd in (1, 2, 3)]
+        rn = [run(name, seed=sd, **new) for sd in (1, 2, 3)]
+        rm = [run(name, seed=sd, latency=0.22, det_hz=10.0, **new) for sd in (1, 2, 3)]
+        lf, lm = sum(r["lost_at"] is not None for r in rn), sum(r["lost_at"] is not None for r in rm)
+        lost_new += lf + lm
+        if name.startswith("walk 8 s"):
+            stand_new = sum(r["dist_med"] for r in rn) / 3
+        print(f"  {name:44s} {sum(r['dist_med'] for r in ro) / 3:11.2f} m {sum(r['dist_med'] for r in rn) / 3:11.2f} m   {lf}/3, {lm}/3")
+    at_dog = min(run("person walks straight AT the dog, dead ahead (0.4 m/s)", seed=sd, **new)["min_dist"] for sd in (1, 2, 3))
+    at_dog_old = min(run("person walks straight AT the dog, dead ahead (0.4 m/s)", seed=sd, **old)["min_dist"] for sd in (1, 2, 3))
+    print(f"  a person walking straight at the dog gets no closer than {at_dog:.2f} m (old settings: {at_dog_old:.2f} m)")
+    checks = {
+        "the new follow never lost the person (7 scenarios x 3 runs, fast and 10 fps links)": lost_new == 0,
+        "it stops closer: about 1.3 m standing (the old settings were still 5+ m away after the same walk)": stand_new < 1.6,
+        "a person walking straight at the dog is kept at least 0.8 m away": at_dog >= 0.8,
+    }
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
 def follow_style_checks() -> int:
     """The DEFAULT heel: the follow controller held off-centre, the lidar teaching the camera the distance (follow.heel_follow_config)."""
     import dataclasses
@@ -331,7 +365,7 @@ def main() -> int:
         slow_lost += lost
         print(f"  {name:44s} lost {lost}/3")
     print("\nlidar wait + loss reasons:")
-    rc = follow_style_checks() | unit_checks()
+    rc = follow_style_checks() | plain_follow_checks() | unit_checks()
     print(f"  {'PASS' if slow_lost == 0 else 'FAIL'}  the dog kept hold of the person through every turn on the slower link ({slow_lost} of 12 runs lost them)")
     return rc or (1 if slow_lost else 0)
 
