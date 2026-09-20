@@ -851,11 +851,41 @@ def _wake_regex(word: str):
     return re.compile(r"^(?:(?:hey|ok|okay|hi|yo)\s+)?(?:" + "|".join(re.escape(x) for x in variants) + r")\b\s*(.*)$")
 
 
+_WAKE_FILLER = {"hey", "ok", "okay", "hi", "yo"}
+# words that look like 'ernest' to the eye but are ordinary speech (a wake word here would open the command window by accident)
+_NOT_ERNEST = {"burnt", "harness", "internet", "turned", "learned", "concerned", "earning", "earnings", "turning", "burning", "returned", "governed", "modern"}
+
+
+def sounds_like_ernest(tok: str) -> bool:
+    """Whisper hears the name as 'bernest', 'burnest', 'earnest', 'airnest', 'ernst', 'burnett', 'ernie', 'er nest' ...: accept anything that is close to
+    'ernest' in spelling or in sound, has the 'rn' in it, and is 5+ letters (so 'turn', 'burn', 'earn', 'nest' and 'rest' never wake it)."""
+    import difflib
+
+    if len(tok) < 5 or "rn" not in tok or tok in _NOT_ERNEST:
+        return False
+
+    def phon(w: str) -> str:
+        w = re.sub(r"(ear|air|arn|ur|ir|er)", "er", w)                   # earnest / urnest / irnest / airnest -> ernest
+        return re.sub(r"^[bhkdgpt](?=er)", "", w)                        # bernest / hernest -> ernest
+
+    r = max(difflib.SequenceMatcher(None, tok, "ernest").ratio(), difflib.SequenceMatcher(None, phon(tok), phon("ernest")).ratio())
+    return r >= 0.72
+
+
 def strip_wake(text: str, word: str = WAKE_WORD) -> tuple[bool, str]:
-    """(True, rest) when the utterance STARTS with the wake word ('Ernest, sit down' -> 'sit down'); else (False, text)."""
+    """(True, rest) when the utterance STARTS with the wake word ('Ernest, sit down' -> 'sit down'); else (False, text).
+    For the default word, anything that sounds remotely like it counts ('Bernest, sit down', 'earnest', 'er nest, follow me')."""
     t = normalize(text)
     m = _wake_regex(word).match(t)
-    return (True, m.group(1).strip()) if m else (False, t)
+    if m:
+        return True, m.group(1).strip()
+    if word.lower() == "ernest":
+        toks = t.split()
+        i = 1 if toks and toks[0] in _WAKE_FILLER else 0
+        for span in (1, 2):                                              # one word, or two that Whisper split ('burn est')
+            if len(toks) >= i + span and (span == 1 or toks[i + 1] in ("est", "nest", "nist", "ist", "nes", "ness")) and sounds_like_ernest("".join(toks[i:i + span])):
+                return True, " ".join(toks[i + span:]).strip()
+    return False, t
 
 
 def is_confirm(text: str) -> bool:

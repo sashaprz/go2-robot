@@ -52,7 +52,6 @@ except Exception as _ve:  # noqa: BLE001
     _VOICE_ERR = str(_ve)
 
 try:
-<<<<<<< HEAD
     import phonelink as phonelink_mod  # the iPhone's motion sensors (phone_server.py on Windows -> here)
 except Exception as _pe:  # noqa: BLE001
     phonelink_mod = None
@@ -63,7 +62,8 @@ try:
 except Exception as _ge:  # noqa: BLE001
     guide_mod = None
     _GUIDE_ERR = str(_ge)
-=======
+
+try:
     import cv2
     import mediapipe as mp
     from mediapipe.tasks import python
@@ -73,7 +73,6 @@ except Exception as _ge:  # noqa: BLE001
 except Exception as _ge:  # noqa: BLE001
     _GESTURE_AVAILABLE = False
     _GESTURE_ERR = str(_ge)
->>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
 
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
@@ -115,12 +114,9 @@ VOICE_KEY = pygame.K_v   # hold to talk
 OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
 LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
-<<<<<<< HEAD
-LEAD_KEY = pygame.K_g     # lead: walk to a point, round obstacles, stopping at drop-offs (asks for Y, like follow)
+LEAD_KEY = pygame.K_b     # lead: walk to a point, round obstacles, stopping at drop-offs (asks for Y, like follow)
 LEAD_STALE = 0.7          # ignore a lead command older than this many seconds (the guide thread stalled): stand still
-=======
 GESTURE_KEY = pygame.K_g  # toggle hand gesture control
->>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
 WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
 
 
@@ -385,7 +381,7 @@ class LeadSimRobot(FakeRobot):
         if stairs:
             self.sim = PersistentSim(walls, pits=[(2.5, -4, 6, 4, 0.17), (3.2, -4, 6, 4, 0.34)], start=(-1.0, 0.0))
         else:
-            self.sim = PersistentSim(walls + [(1.6, -0.3, 2.2, 0.3, 0.6)], start=(-1.0, 0.0))      # a box 2.6 m ahead
+            self.sim = PersistentSim(walls + [(3.2, -0.3, 3.8, 0.3, 0.6)], start=(-1.0, 0.0), ghost_s=3.0)      # a box 4.2 m ahead
         self.cmd, self.cmd_at = (0.0, 0.0, 0.0), 0.0
 
     def move(self, vx: float, vy: float, yaw: float) -> None:
@@ -957,7 +953,7 @@ class App:
 
     # -- lead: A to B by lidar, round obstacles, stopping at drop-offs ----------------------------------------------
     def start_lead(self, arg: str = "") -> None:
-        """'ernest, lead me' / G: walk from where the dog stands to a point B (metres ahead, metres left; --lead-goal, or spoken: 'lead me five metres').
+        """'ernest, lead me' / B: walk from where the dog stands to a point B (metres ahead, metres left; --lead-goal, or spoken: 'lead me five metres').
         Built from the dog's lidar (guide.py): obstacles up to ~1.2 m are walked round, a DROP-OFF (stairs down, a ledge) is a no-go and stops it, and
         with no way through it waits (and backs away to look again). It does NOT watch for people, and it cannot see anything above ~1.2 m."""
         if guide_mod is None:
@@ -989,7 +985,7 @@ class App:
         self.lead_events.append(("start", (ahead, left)))
         self.ensure_lidar()
         side = "" if abs(left) < 0.05 else f", {abs(left):.1f} m to the {'left' if left > 0 else 'right'}"
-        self.say(f"> leading: {ahead:.1f} m ahead{side}. It walks round obstacles and STOPS at drop-offs; Space / G / 'stop' / any drive key ends it. "
+        self.say(f"> leading: {ahead:.1f} m ahead{side}. It STOPS if something is in the way or at a drop-off; Space / B / 'stop' / any drive key ends it. "
                  "It does not watch for people and cannot see above ~1.2 m", GOOD)
 
     def stop_lead(self, reason: str, quiet: bool = False) -> None:
@@ -1004,12 +1000,15 @@ class App:
     def _lead_announce(self, ld, g) -> None:
         """Say (on screen) when the guide's situation changes: a drop-off, waiting, backing away, the way clearing."""
         drop = g.state == "waiting" and "drop-off" in g.reason
-        key = (g.state, drop)
+        inway = g.state == "waiting" and "in the way" in g.reason
+        key = (g.state, drop, inway)
         if key == ld["key"]:
             return
         before, ld["key"] = ld["key"], key
         if drop:
             self.say(f"lead: DROP-OFF ahead ({g.reason}). Standing still: it will not go near it", BAD)
+        elif inway:
+            self.say(f"lead: STOPPED: {g.reason}. Waiting for it to clear, then it carries on", WARN)
         elif g.state == "waiting":
             self.say("lead: no way through right now: waiting for it to clear", WARN)
         elif g.state == "recovering":
@@ -1031,7 +1030,7 @@ class App:
                 if ld["guide"] is None:                  # "here" is wherever the dog is when the first fresh lidar message arrives
                     if lid is not None and now - lid[0] < 0.5:
                         ld["guide"] = guide_mod.Guide(lid[2], [ld["goal"]], vmax=self.args.lead_speed, patience=self.args.lead_patience,
-                                                      recover=not self.args.no_lead_recover)
+                                                      recover=not self.args.no_lead_recover, obstacle_stop=self.args.lead_stop_dist)
                         ld["pose"] = lid[2]
                         self.lead_events.append(("goal_world", ld["guide"].goals[0]))
                     elif now - ld["t0"] > 8.0:
@@ -1120,7 +1119,10 @@ class App:
                             kw["cloud"] = obstacles.to_dog_frame(lid[1], *lid[2])
                     if self.phone is not None and isinstance(self.follower, follow_mod.Follower):
                         kw["phone"] = self.phone.state()                           # walking / standing (None when the phone isn't sending)
+                    was_searching = bool(getattr(self.follower, "scanning", False))
                     res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape, **kw)
+                    if was_searching and not getattr(self.follower, "scanning", False) and not res.lost:
+                        self.say("found you again (the colours of your clothes matched)", GOOD)
                     self.follow_sources.add(getattr(self.follower, "source", getattr(self.follower, "range_src", "camera")))
                     self._det_times.append(time.time())
                     lk = self.follower.lock
@@ -1746,7 +1748,7 @@ class App:
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
         elif key == LEAD_KEY:
             if self.leading:
-                self.stop_lead("G pressed")
+                self.stop_lead("B pressed")
             elif guide_mod is not None:
                 self.pending = ("Lead: walk to the goal, round obstacles, stopping at drop-offs (does NOT watch for people)", self.start_lead, now + CONFIRM_SECS)
             else:
@@ -2049,7 +2051,6 @@ class App:
             banner = ((f"CALIBRATING {step}{how}: measuring, stand still ...  ({len(c['boxes'])} frames, {len(c['clouds'])} lidar scans)" if c["phase"] == "collect"
                        else f"CALIBRATION {step}{how}: {ask}, then press J   " + ("[I can see you]" if seen else "[I can't see you yet]")),
                       WARN if not seen else GOOD)
-<<<<<<< HEAD
         elif self.leading:
             ld = self.lead
             g = ld["guide"] if ld else None
@@ -2059,13 +2060,11 @@ class App:
                 to_go = math.hypot(g.goal[0] - ld["pose"][0], g.goal[1] - ld["pose"][1])
                 col = GOOD if g.state == "going" else BAD if "drop-off" in g.reason else WARN
                 banner = (f"LEADING to {ld['goal'][0]:.1f} m ahead, {ld['goal'][1]:+.1f} m left: {g.state}" + (f" - {g.reason}" if g.reason else "")
-                          + f"   [{to_go:.1f} m to go]   Space / G / 'stop' ends it", col)
-=======
+                          + f"   [{to_go:.1f} m to go]   Space / B / 'stop' ends it", col)
         elif self.gesture_mode:
             gest_text = f"gesture: {self.gesture_last}" if self.gesture_last != "unknown" else "no hand detected"
             action_text = f" → {self.gesture_action}" if self.gesture_action else ""
             banner = (f"GESTURE CONTROL: {gest_text}{action_text}     peace=stand, thumbs_down=lie, palm=sit, thumbs_up=walk", GOOD)
->>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
             dt = [t for t in self._det_times if now - t < 3]
@@ -2098,7 +2097,7 @@ class App:
             "DRIVE   W/S forward/back    Q/E strafe left/right    A/D turn left/right    Shift fast   Ctrl slow   SPACE = STOP",
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
-            "FOLLOW  T follow, H heel (each then Y): NO obstacle avoidance.   G LEAD (then Y): walk to a spot round obstacles, STOPS at drop-offs.  Space stops.",
+            "FOLLOW  T follow, H heel (each then Y): NO obstacle avoidance.   B LEAD (then Y): walk to a spot round obstacles, STOPS at drop-offs.  Space stops.",
             f"VOICE   say \"{self.args.wake_word}, <command>\" or hold V: \"ready to dance\" (stand up), \"sit\", \"dance two\", \"walk forward\", "
             "\"follow me\", \"heel\", \"lead\" / \"lead me 5 metres\", \"box step\".  \"stop\" always works."
             + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
@@ -2164,13 +2163,10 @@ class App:
         finally:
             print("Stopping and disconnecting ...", flush=True)
             self.stop_listener()
-<<<<<<< HEAD
             if self.phone is not None:
                 self.phone.close()
-=======
             if self.gesture_landmarker:
                 self.gesture_landmarker.close()
->>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
             self.stop_evt.set()
             self.abort.set()
             self.following = False
@@ -2269,6 +2265,10 @@ class App:
                     if t >= 11.5 and "p11" not in state:
                         state["p11"] = (sim.x, sim.y)
                         self.lead_events.append(("still", state["p9"], state["p11"]))
+                    if t >= 20.0 and "box_gone" not in state:      # the box is taken away: the dog, which stopped in front of it, should carry on
+                        state["box_gone"] = True
+                        self.lead_events.append(("box_removed", (sim.x, sim.y)))
+                        sim.remove_last()
                 if self.lead_result is not None and "esc" not in state:
                     state["esc"] = t + 2.0
                 if ("esc" in state and t >= state["esc"] and "esc_sent" not in state) or (t > 90 and "esc_sent" not in state):
@@ -2394,7 +2394,8 @@ LEAD_STAIRS_TEST = [(1.0, "Ernest, lead me six metres")]
 
 
 def _selftest_lead_verdict(app: "App") -> int:
-    """'Ernest, lead me' in a simulated room with a box in the way: it walks round it to B; 'stop' halts it mid-walk; a second 'lead me' finishes the job."""
+    """'Ernest, lead me' in a simulated room with a box in the way: it STOPS in front of it; 'stop' halts it mid-walk; a second 'lead me' walks up to the box and stops;
+    once the box is taken away it carries on to B."""
     r = app.robot
     log, sim = r.log, r.sim
     sports = [e[1] for e in log if e[0] == "sport"]
@@ -2402,6 +2403,7 @@ def _selftest_lead_verdict(app: "App") -> int:
     goal = next((e[1] for e in reversed(app.lead_events) if e[0] == "goal_world"), (0.0, 0.0))
     dist = math.hypot(sim.x - goal[0], sim.y - goal[1])
     still = next((e for e in app.lead_events if e[0] == "still"), None)
+    gone = next((e for e in app.lead_events if e[0] == "box_removed"), None)
     phrases = {"lead me five metres": ("lead", "5.00,0.00"), "lead me forward 4 metres and left 2": ("lead", "4.00,2.00"), "stop leading": ("stop_follow", ""),
                "follow me": ("follow", ""), "walk forward": ("move", "forward")}
     parsed = {t: (lambda i: (i.kind, i.arg) if i else None)(voice_mod.parse_command(t)) for t in phrases}
@@ -2414,7 +2416,10 @@ def _selftest_lead_verdict(app: "App") -> int:
             bool(still) and math.hypot(still[1][0] - still[2][0], still[1][1] - still[2][1]) < 0.1,
         f"the second lead arrived: {app.lead_result}": bool(app.lead_result) and app.lead_result[0] == "arrived",
         f"the simulated dog is {dist:.2f} m from B (world {goal[0]:.1f}, {goal[1]:.1f})": dist < 0.5,
-        f"it went round the box without touching it ({sim.gap():.2f} m clear)": sim.gap() > 0.18,
+        f"it stopped in front of the box and did not go round it (it was at x={gone[1][0]:.1f} when the box was taken away; the box starts at 3.2)" if gone else "the box was removed":
+            bool(gone) and 0.5 < gone[1][0] < 1.9 and abs(gone[1][1]) < 0.4,
+        "it said it had stopped because something is in the way": "something in the way" in " | ".join(app.messages_text()).lower(),
+        f"it never touched the box ({sim.gap():.2f} m clear)": sim.gap() > 0.18,
         "it never went faster than --lead-speed": bool(moves) and all(m[1] <= app.args.lead_speed + 1e-6 for m in moves),
         "the lead ended when it arrived: not leading, and the last thing sent was stop_move": not app.leading and log[-1] == ("stop_move",),
         "the phrase table: 'lead me five metres', 'forward 4 and left 2', 'stop leading', and follow / walk unchanged":
@@ -2515,8 +2520,16 @@ def _selftest_voicemove_verdict(app: "App") -> int:
     L, A = app.args.linear, app.args.angular
     expected = [(round(L, 2), 0.0, 0.0), (0.0, 0.0, round(A, 2)), (round(-L, 2), 0.0, 0.0),
                 (0.0, 0.0, round(-A, 2)), (0.0, round(L, 2), 0.0)]
+    steps = []                                              # a turn measured by the gyro eases off near its angle: several yaw speeds in a row are one step
+    for m in moves:
+        if steps and m[0] == 0.0 and m[1] == 0.0 and m[2] * steps[-1][2] > 0 and steps[-1][0] == 0.0 and steps[-1][1] == 0.0:
+            continue
+        steps.append(m)
+    right_turn = [m[2] for m in moves if m[0] == 0.0 and m[1] == 0.0 and m[2] < 0]
     checks = {
-        "each spoken move produced the right velocity, in order (fwd, left, back, right, strafe left)": moves == expected,
+        "each spoken move produced the right velocity, in order (fwd, left, back, right, strafe left)": steps == expected,
+        "'turn right 45 degrees' was measured by the (simulated) gyro: it started at full speed and eased off before stopping by itself": (
+            bool(right_turn) and right_turn[0] == round(-A, 2) and abs(right_turn[-1]) < 0.5 * A),
         "balanced once before the first move, then 'stop' sent StopMove": sports == ["BalanceStand", "StopMove"],
         "'stop' cancelled the step in progress (no moves afterwards)": after is not None and not any(e[0] == "move" for e in after),
         "no voice move left running": app.voice_move is None,
@@ -2630,9 +2643,11 @@ def main() -> int:
     p.add_argument("--selftest-calib", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-lead", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--selftest-lead-stairs", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--lead-goal", default=os.environ.get("GO2_LEAD_GOAL", "4,0"), metavar="AHEAD,LEFT",
-                   help="lead ('ernest, lead me' / G): where to walk, metres ahead and to the left of where the dog stands (default 4,0). "
+    p.add_argument("--lead-goal", default=os.environ.get("GO2_LEAD_GOAL", "6,0"), metavar="AHEAD,LEFT",
+                   help="lead ('ernest, lead me' / B): where to walk, metres ahead and to the left of where the dog stands (default 6,0). "
                         "Say 'lead me five metres' / 'lead me forward 4 metres and left 2' to choose one out loud")
+    p.add_argument("--lead-stop-dist", type=float, default=2.0,
+                   help="lead: STOP when something stands on the straight line to the goal within this many metres, and carry on once it has been clear for 1.5 s (default 2). 0 = walk round obstacles instead")
     p.add_argument("--lead-speed", type=float, default=0.3, help="lead: top forward speed, m/s (default 0.3; the drop-off check needs time to see a ledge, ~2 m ahead)")
     p.add_argument("--lead-patience", type=float, default=90.0,
                    help="lead: seconds to stand and wait with no way through before giving up (default 90: the dog's lidar map keeps a ghost ~40 s after something leaves)")
@@ -2654,6 +2669,8 @@ def main() -> int:
         [float(v) for v in args.lead_goal.split(",")][1]
     except (ValueError, IndexError):
         p.error(f"--lead-goal '{args.lead_goal}' is not AHEAD,LEFT in metres (for example 4,0 or 3,-2)")
+    if args.selftest_lead:
+        args.lead_goal = "4,0"                                   # (the second lead starts ~1.6 m along: 4 m from there is still inside the simulated room)
     if args.selftest_lead_stairs:
         args.lead_patience = 10.0                                # (don't wait 90 s for the test to conclude it can't get there)
     if follow_mod is not None and not any(k.startswith("selftest") and v for k, v in vars(args).items()) \

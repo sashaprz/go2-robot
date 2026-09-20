@@ -166,9 +166,11 @@ class FollowConfig:
     phone_ff: float = 0.0         # EXPERIMENTAL, off: turn along with the person's own turning rate from their phone (needs the turning set-up; no benefit shown in simulation, harmful if the sign is wrong)
     phone_hold: float = 0.0       # s: if their phone says they have STOPPED but the camera lost them, wait this long instead of giving up (0 = off; heel/follow use 8)
     phone_search: float = 1.5     # s: extra time to look for them when the phone says they are still walking
-    scan_for: float = 0.0         # s: when the camera loses them, TURN side to side on the spot for this long to find them again before giving up (0 = don't; follow/heel use 8)
+    scan_for: float = 0.0         # s: when the camera loses them, TURN side to side on the spot (turn a bit, stop and look, turn a bit ...) for this long to find them again before giving up (0 = don't; follow/heel use 12)
     scan_after: float = 0.6       # s: how long a dropout is just waited out (standing still) before the scan starts
     scan_turn: float = 0.7        # rad/s while scanning
+    scan_move: float = 0.7        # s of turning ...
+    scan_look: float = 0.45       # s of standing still to LOOK after each bit of turning: the picture is sharp and current, so the detector and the colour match get a fair chance
     scan_swing: float = 1.3       # rad (~75 deg): how far each side it turns; it starts toward the side they were last seen on, then sweeps to the other
     lead_time: float = 0.0        # s: steer toward where they WILL be across the picture (their swing rate x this): makes up for lag; 0 = off (plain follow)
     fallback_height: float = 0.82 # lidar mode only: the box-height stop point used when there is no distance from the lidar-taught camera (~1.5 m, safer than 0.9)
@@ -193,7 +195,7 @@ def follow_config(max_forward: float = 0.8, target_height: float = 0.78) -> "Fol
     """Plain 'follow me'. Stops closer than the old setting (0.78 of the picture height instead of 0.60: about 1.3 m from the dog's
     centre instead of 2.5 m), walks faster (0.8 m/s instead of 0.35, with a stiffer speed response), has a small integral so it keeps
     pace with a walking person instead of trailing 4-9 m behind, and backs away if someone walks right up to it."""
-    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=1.5, target_height=target_height, back_at=0.92, back_speed=0.5, phone_hold=8.0, scan_for=8.0)
+    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=1.5, target_height=target_height, back_at=0.92, back_speed=0.5, phone_hold=8.0, scan_for=12.0)
 
 
 def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_height: float = 0.90, offset: float = 0.18,
@@ -207,7 +209,7 @@ def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_heig
     return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=2.5, target_height=target_height,
                         x_offset=offset * (1 if side == "left" else -1), lost_after=1.5, back_at=0.95,
                         k_turn=3.5, max_turn=1.0, lead_time=0.4, turn_deadband=0.03, back_speed=0.45,
-                        range_target=range_target, k_range=1.0, ki_range=0.8, range_back=0.45, k_back=3.0, phone_hold=8.0, scan_for=8.0)
+                        range_target=range_target, k_range=1.0, ki_range=0.8, range_back=0.45, k_back=3.0, phone_hold=8.0, scan_for=12.0)
 
 
 def pick_target(dets, last_box, w: int, min_iou: float):
@@ -232,7 +234,7 @@ def pick_target(dets, last_box, w: int, min_iou: float):
 # matches, the person counts as "not seen" (the controller coasts, searches, then gives up): it NEVER switches to
 # someone else. Limits: two people dressed alike look the same to it, and a big lighting change can make the right person
 # stop matching (then it stops rather than guesses).
-def _region_hist(rgb: np.ndarray, box, y0: float, y1: float):
+def _region_hist(rgb: np.ndarray, box, y0: float, y1: float, gain: float = 1.0):
     import cv2
 
     h, w = rgb.shape[:2]
@@ -243,6 +245,8 @@ def _region_hist(rgb: np.ndarray, box, y0: float, y1: float):
     if xb - xa < 3 or yb - ya < 3:
         return None, None
     crop = np.ascontiguousarray(rgb[ya:yb, xa:xb])
+    if gain != 1.0:                                                                    # the camera changed its exposure: undo (half of) it
+        crop = np.clip(crop.astype(np.float32) * gain, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
     hue = (hsv[:, :, 0].astype(np.int16) + 7) % 180                                   # rotate so red (0 and 180) sits mid-bin, not on an edge
     hs = cv2.calcHist([hue.astype(np.uint8), hsv[:, :, 1]], [0, 1], None, [12, 6], [0, 180, 0, 256]).flatten()   # what colour ...
@@ -256,8 +260,11 @@ def _region_hist(rgb: np.ndarray, box, y0: float, y1: float):
 
 def signature(rgb: np.ndarray, box):
     """(upper-body histogram, lower-body histogram), or None when the box is too small to read."""
-    up, _ = _region_hist(rgb, box, 0.15, 0.50)
-    lo, _ = _region_hist(rgb, box, 0.55, 0.90)
+    # The dog's camera adjusts its exposure as the dog turns (a window, a dark corner), which shifts every colour in the picture together. Scale the person
+    # by (half of) how far the whole picture's brightness is from a typical 120, so the same clothes give similar fingerprints in a brighter or darker view.
+    gain = float(np.clip((120.0 / max(float(rgb[::16, ::16].mean()), 25.0)) ** 0.5, 0.6, 1.6))
+    up, _ = _region_hist(rgb, box, 0.15, 0.50, gain)
+    lo, _ = _region_hist(rgb, box, 0.55, 0.90, gain)
     return None if up is None or lo is None else (up, lo)
 
 
@@ -266,6 +273,19 @@ def signature_distance(a, b) -> float:
     import cv2
 
     return float(np.mean([cv2.compareHist(x, y, cv2.HISTCMP_BHATTACHARYYA) for x, y in zip(a, b)]))
+
+
+def signature_distance_partial(cand, ref) -> float:
+    """Like signature_distance, but also allows for the person being seen from CLOSE UP with only their legs in view (the box then shows trousers in both
+    of its halves): the candidate's two halves are also compared with the reference's TROUSERS half, at a small penalty. The smaller of the two wins."""
+    import cv2
+
+    def bh(x, y) -> float:
+        return float(cv2.compareHist(x, y, cv2.HISTCMP_BHATTACHARYYA))
+
+    full = (bh(cand[0], ref[0]) + bh(cand[1], ref[1])) / 2
+    legs = (bh(cand[0], ref[1]) + bh(cand[1], ref[1])) / 2 + 0.05
+    return min(full, legs)
 
 
 _HUES = ((10, "red"), (22, "orange"), (35, "yellow"), (85, "green"), (100, "teal"), (130, "blue"), (160, "purple"), (172, "pink"), (181, "red"))
@@ -305,16 +325,23 @@ class PersonLock:
     max_dist: float = 0.35        # a person elsewhere in the picture must match at least this well
     near_dist: float = 0.50       # right where the person just was: a little more forgiving (view changes)
     lock_frames: int = 4          # frames the same person must be the obvious candidate before it locks on
-    max_refs: int = 8
+    max_refs: int = 14
+    relax_by: float = 0.10        # while SEARCHING for a lost person the colour limits rise by up to this much (a new angle, different light, motion blur) ...
+    reacq_frames: int = 2         # ... but a match that only passes thanks to that must hold for this many frames in a row
+    learn_every: int = 5          # add a new view to the catalogue at most once per this many frames
     refs: list = field(default_factory=list)   # fingerprints; refs[0] is from lock time and is never replaced
     label: str = ""               # what it locked onto, e.g. "dark blue top, grey trousers"
     announced: bool = False
     rejected: int = 0             # how many people were turned down on the last call
     closest_reject: float = 1.0   # the best colour match among those turned down (for the "why did it lose me" message)
     confirming: bool = False      # still waiting for a steady candidate before locking
+    reacquiring: bool = False     # a person who looks like the target was just seen while searching: checking it holds for a few frames
     scores: list = field(default_factory=list)   # last call: (box, colour distance or None, "target" | "other" | "colour" | "jump")
     _cand: tuple | None = None
     _cand_n: int = 0
+    _calls: int = 0
+    _last_add: int = -999
+    _reacq_n: int = 0
 
     @property
     def ref(self):
@@ -323,18 +350,25 @@ class PersonLock:
     def reset(self) -> None:
         self.refs, self.label, self.announced, self.rejected, self.closest_reject = [], "", False, 0, 1.0
         self.confirming, self.scores, self._cand, self._cand_n = False, [], None, 0
+        self._calls, self._last_add, self._reacq_n = 0, -999, 0
 
     def why_none(self, n_dets: int) -> str:
+        if self.reacquiring:
+            return "someone who looks like you: checking it's you ..."
         if self.confirming:
             return "locking on: stand in front of the dog and hold still"
         if n_dets == 0:
             return "no person detected"
         return f"{self.rejected} person(s) seen but not matching the lock, closest colour match {self.closest_reject:.2f}"
 
-    def choose(self, dets, frame, last_box, w: int, min_iou: float, accept=None):
-        self.rejected, self.closest_reject, self.scores, self.confirming = 0, 1.0, [], False
+    def choose(self, dets, frame, last_box, w: int, min_iou: float, accept=None, relax: float = 0.0):
+        """relax 0..1: how hard the caller has been looking for a person it lost. It loosens the colour limits by up to relax_by (a person seen again
+        from a new angle, in different light, or a little blurred from the dog turning), asks for a match to hold for a couple of frames, and
+        accepts the closest person only if they are clearly closer than anyone else."""
+        self.rejected, self.closest_reject, self.scores, self.confirming, self.reacquiring = 0, 1.0, [], False, False
+        self._calls += 1
         if not dets:
-            self._cand, self._cand_n = None, 0
+            self._cand, self._cand_n, self._reacq_n = None, 0, 0
             return None
         if frame is None:                                          # no picture: position only
             return pick_target(dets, last_box, w, min_iou)
@@ -352,13 +386,16 @@ class PersonLock:
             self.refs, self.label = [sig], describe(frame, tgt)
             return tgt
         best, best_cost, best_dist, best_sig, best_iou, n_ok = None, 1e9, 1.0, None, 0.0, 0
+        best_limit, all_dists = 0.0, []
         eligible = []
         for d in dets:
             sig = signature(frame, d)
-            dist = 0.5 if sig is None else min(signature_distance(r, sig) for r in self.refs)
+            dist = 0.5 if sig is None else min(signature_distance_partial(sig, r) for r in self.refs)
+            all_dists.append((d, dist))
             iou = _iou(d, last_box) if last_box is not None else 0.0
             ok_pos = accept(d) if accept is not None else True
-            limit = self.near_dist if iou > 0.3 else self.max_dist
+            base = self.near_dist if iou > 0.3 else self.max_dist
+            limit = base + self.relax_by * min(max(relax, 0.0), 1.0)
             if dist > limit or (not ok_pos and dist >= 0.2):
                 self.rejected += 1
                 self.closest_reject = min(self.closest_reject, dist)
@@ -367,13 +404,32 @@ class PersonLock:
             eligible.append((d, dist))
             cost = dist + 0.6 * (1 - iou) + (0.0 if ok_pos else 0.5)
             if cost < best_cost:
-                best, best_cost, best_dist, best_sig, best_iou = d, cost, dist, sig, iou
+                best, best_cost, best_dist, best_sig, best_iou, best_limit = d, cost, dist, sig, iou, base
         for d, dist in eligible:
             self.scores.append((d[:4], dist, "target" if d is best else "other"))
-        if (best is not None and len(dets) == 1 and 0.15 < best_dist < self.max_dist and best_iou > 0.5
-                and best_sig is not None and len(self.refs) < self.max_refs):
-            self.refs.append(best_sig)      # a new view of the same person, learned ONLY when they are the only person in view (nobody to be
-                                            # confused with or to partly cover them and taint the fingerprint)
+        if best is not None and best_dist > best_limit:                # only passes thanks to the search: it has to hold for a few frames
+            searching_match = True
+            self._reacq_n += 1
+            if self._reacq_n < self.reacq_frames:
+                self.reacquiring = True
+                return None
+        else:
+            searching_match = False
+            self._reacq_n = 0
+        if best is not None and best_sig is not None:
+            # THE CATALOGUE: every so often, while the person is tracked clearly (a good match, and nobody else who could be mistaken for them in view),
+            # keep a new view of their clothes (nearer, further, turned, different light), so that when they are lost and found again one of the
+            # views fits. The first fingerprint (from lock time) is never replaced; a full catalogue drops its most redundant view.
+            others = [dd for d, dd in all_dists if d is not best]
+            alone = not others or min(others) >= 0.45
+            if ((0.07 < best_dist < 0.30 or searching_match) and alone and (best_iou > 0.3 or searching_match)
+                    and self._calls - self._last_add >= self.learn_every):
+                self._last_add = self._calls
+                if len(self.refs) < self.max_refs:
+                    self.refs.append(best_sig)
+                else:
+                    near = [min(signature_distance_partial(self.refs[i], self.refs[j]) for j in range(len(self.refs)) if j != i) for i in range(1, len(self.refs))]
+                    self.refs[1 + int(np.argmin(near))] = best_sig
         return best
 
 
@@ -396,6 +452,8 @@ class Follower:
     last_err: float = 0.0                    # where they were across the picture when last seen (+ = right of where we hold them)
     scan_yaw: float = 0.0                    # while scanning: how far we have turned from where the scan began (dead reckoning from what we commanded)
     scan_dir: float = 0.0                    # while scanning: +1 turning left, -1 right, 0 = not scanning
+    scan_looking: bool = False               # while scanning: standing still for a look between bits of turning
+    scan_phase_t0: float = 0.0
     scan_t: float | None = None              # time of the last scan step
     scanning: bool = False
     pairs: list = field(default_factory=list)        # (time, feet row at 720p, 1 / forward distance by lidar): the camera's ruler
@@ -409,6 +467,7 @@ class Follower:
         self.racc = 0.0
         self.phone_resume, self.phone_walk_prev = -1e9, None
         self.last_err, self.scan_yaw, self.scan_dir, self.scan_t, self.scanning = 0.0, 0.0, 0.0, None, False
+        self.scan_looking, self.scan_phase_t0 = False, 0.0
         self.pairs, self.cal = [], None
         self.lock.reset()
 
@@ -472,9 +531,9 @@ class Follower:
             self.range_src, self.range_m = "camera", None
         return self.range_m
 
-    def _pick(self, dets, w, frame=None):
+    def _pick(self, dets, w, frame=None, relax: float = 0.0):
         # while scanning they can reappear anywhere in the picture: the clothing colours decide, not where they last were
-        return self.lock.choose(dets, frame, None if self.scanning else self.last_box, w, self.cfg.min_iou_or_dist)
+        return self.lock.choose(dets, frame, None if self.scanning else self.last_box, w, self.cfg.min_iou_or_dist, relax=relax)
 
     def _scan(self, now: float) -> tuple[float, str]:
         """One step of 'turn side to side to find them': the yaw to command and what to say. Starts toward the side they were last seen,
@@ -482,9 +541,17 @@ class Follower:
         c = self.cfg
         if self.scan_dir == 0.0:
             self.scan_dir = -1.0 if self.last_err > 0 else 1.0            # they were right of centre: turn right (negative yaw), else left
-            self.scan_yaw, self.scan_t = 0.0, now
+            self.scan_yaw, self.scan_t, self.scan_looking, self.scan_phase_t0 = 0.0, now, False, now
         dt = min(max(now - (self.scan_t if self.scan_t is not None else now), 0.0), 0.5)
         self.scan_t = now
+        side = "left" if self.scan_dir > 0 else "right"
+        if self.scan_looking:                                            # standing still for a look
+            if now - self.scan_phase_t0 < c.scan_look:
+                return 0.0, side
+            self.scan_looking, self.scan_phase_t0 = False, now
+        elif now - self.scan_phase_t0 >= c.scan_move:
+            self.scan_looking, self.scan_phase_t0 = True, now
+            return 0.0, side
         self.scan_yaw += self.scan_dir * c.scan_turn * dt
         if self.scan_dir > 0 and self.scan_yaw >= c.scan_swing:
             self.scan_dir = -1.0
@@ -501,7 +568,8 @@ class Follower:
                 self.phone_resume = now                              # they set off again: give the search a fresh start
             self.phone_walk_prev = ph.walking
         c = self.cfg
-        tgt = self._pick(dets, w, frame)
+        relax = float(np.clip((now - self.last_seen - c.scan_after) / 3.0, 0.0, 1.0)) if (c.scan_for > 0 and self.last_box is not None) else 0.0
+        tgt = self._pick(dets, w, frame, relax)
         if tgt is None:
             why = self.lock.why_none(len(dets))
             gone = now - self.last_seen
@@ -521,13 +589,13 @@ class Follower:
                 if since <= c.scan_after + c.scan_for:
                     self.scanning = True
                     turn, side = self._scan(now)
-                    return FollowResult(cmd=(0.0, 0.0, turn), status=f"lost you: turning {side} and back to find you ({since:.0f} s, {why})")
+                    return FollowResult(cmd=(0.0, 0.0, turn), status=f"lost you: {'looking' if self.scan_looking else 'turning ' + side + ' and back'} to find you ({since:.0f} s, {why})")
                 return FollowResult(status=f"waiting: your phone says you've stopped ({why}) [phone]")
             if now - max(self.last_seen, self.phone_resume) > c.lost_after:
                 return FollowResult(status=f"lost the person: {why}", lost=True)
             return FollowResult(status=f"searching ... ({why})")      # brief dropout: stand still, keep the lock
         self.last_box, self.last_seen = tgt, now
-        self.scanning, self.scan_dir, self.scan_yaw, self.scan_t = False, 0.0, 0.0, None
+        self.scanning, self.scan_dir, self.scan_yaw, self.scan_t, self.scan_looking = False, 0.0, 0.0, None, False
 
         err = ((tgt[0] + tgt[2]) / 2 - w / 2) / w - c.x_offset   # + means the person is right of where we want them
         self.last_err = err

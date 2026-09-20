@@ -354,25 +354,27 @@ def scan_checks() -> int:
         f.reset()
         for i in range(6):
             f.step([(side_x - 60, 200, side_x + 60, 690, 0.9)], frame, now=i * 0.1)
-        return f, [(k / 10, f.step([], frame, now=0.6 + k / 10)) for k in range(1, 130)]
+        return f, [(k / 10, f.step([], frame, now=0.6 + k / 10)) for k in range(1, 170)]
 
     f, out = lose(1000.0)                                                       # last seen on the RIGHT of the picture
     res = {t: r for t, r in out}
     checks["a brief dropout (< 0.6 s) is just waited out: it stands still"] = all(res[t].cmd == (0.0, 0.0, 0.0) and not res[t].lost for t in (0.1, 0.2, 0.4))
-    checks["then it turns on the spot toward the side they were last seen (right = negative yaw here)"] = res[1.5].cmd[2] < -0.5 and res[1.5].cmd[:2] == (0.0, 0.0)
+    checks["then it turns on the spot toward the side they were last seen (right = negative yaw here)"] = res[1.0].cmd[2] < -0.5 and res[1.0].cmd[:2] == (0.0, 0.0)
+    checks["...for a bit, then stands still to LOOK (sharp picture), then turns on: it is not spinning constantly"] = (
+        sum(1 for t, r in out if r.cmd[2] == 0.0 and not r.lost and t > 0.7) >= 15 and any(r.cmd[2] < 0 for t, r in out[:20]) and "looking" in res[1.5].status)
     yaws = [r.cmd[2] for _, r in out if not r.lost]
     flips = sum(1 for a, b in zip(yaws, yaws[1:]) if a * b < 0)
-    checks["it sweeps to the other side and back (at least 2 direction changes in 8 s)"] = flips >= 2
+    checks["it sweeps to the other side and back (at least 2 direction changes)"] = flips >= 2
     turned = [0.0]
     for (t0, r0), (t1, _) in zip(out, out[1:]):
         turned.append(turned[-1] + r0.cmd[2] * (t1 - t0))
     checks["it never turns further than about 75 deg either side of where it started"] = max(abs(x) for x in turned) < 1.3 + 0.2
     checks["it never walks while searching (turns on the spot only)"] = all(r.cmd[0] == 0.0 and r.cmd[1] == 0.0 for _, r in out)
     last_t = max(t for t, r in out if not r.lost)
-    checks["it gives up only after the search time (about 0.6 + 8 s), not before"] = 8.0 <= last_t <= 9.0 and out[-1][1].lost
+    checks["it gives up only after the search time (about 0.6 + 12 s), not before"] = 12.0 <= last_t <= 13.0 and out[-1][1].lost
     checks["...and says it looked left and right"] = "left and right" in out[-1][1].status
     f2, out2 = lose(200.0)
-    checks["last seen on the LEFT: it starts turning left (positive yaw)"] = dict(out2)[1.5].cmd[2] > 0.5
+    checks["last seen on the LEFT: it starts turning left (positive yaw)"] = dict(out2)[1.0].cmd[2] > 0.5
     f3, _ = lose(1000.0)
     for k in range(1, 40):
         f3.step([], frame, now=0.6 + k / 10)

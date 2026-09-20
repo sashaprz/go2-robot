@@ -75,7 +75,7 @@ Preview mode (no dog needed):
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine (each needs a confirming Y within 4 s) |
 | T, then **Y** | follow the nearest person (T again / Space / any drive key stops it) |
 | H, then **Y** | **heel**: walk at your side (H again / Space / any drive key stops it) |
-| G, then **Y** | **lead**: walk to a spot (`--lead-goal`) round obstacles, stopping at drop-offs (G again / Space / any drive key stops it) |
+| B, then **Y** | **lead**: walk to a spot (`--lead-goal`) round obstacles, stopping at drop-offs (B again / Space / any drive key stops it) |
 | J | **calibrate heel's distance**: stand at three different distances in front of the dog, pressing J at each; uses the lidar, no tape (see Heel) |
 | O | toggle object-detection overlay |
 | U, then **Y** | stand on the **back legs** (U again = come down) |
@@ -89,7 +89,7 @@ Driving sends BalanceStand first, is locked out while a trick runs, and stops if
 
 Two ways to talk to it, both **offline** (local Whisper `small.en`; your audio never leaves the PC):
 
-- **Always-listening ear (on by default).** Say the wake word first: **"ernest, sit down"**. Say just "ernest" and then
+- **Always-listening ear (on by default).** Say the wake word first: **"ernest, sit down"** (anything that sounds remotely like it counts: "bernest", "earnest", "burnest", "ernst", "burnett", "ernie", "er nest" ...; ordinary words such as "turn", "nest", "rest" or "burn" never do: `python wake_test.py`). Say just "ernest" and then
   a command within 6 s also works. Ordinary conversation is ignored. A bare **"stop"** (or "stop following") works
   **without** the wake word, and a bare **"yes"** answers a pending confirmation. `L` turns the ear off; `--no-listen`
   starts with it off; `--wake-word rex` changes the word.
@@ -132,9 +132,10 @@ big unknown, and the level in the top bar will show it. It is off by default.
 | "ready to dance" (or "stand up") | stand up |
 | "sit", "lie down", "recover", "rise", "balance" | poses |
 | "say hello" / "wave", "stretch", "wiggle your hips", "make a heart", "good boy", "dance", "dance two", "greeting" | tricks |
-| "walk forward", "go back", "turn left/right", "turn around", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "turn right 45 degrees", "a little" (half), "a lot" (double). Capped at 5 s walking / 8 s turning. |
+| "walk forward", "go back", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "a little" (half), "a lot" (double). Capped at 5 s walking. |
+| "turn left" / "turn right" / "turn around" | **turns exactly 90 degrees left / 90 degrees right / 180 degrees**, measured by the dog's own gyro (its IMU heading, the same stream as the battery): it spins at full speed, eases off near the angle, waits for it to settle and creeps the last few degrees if it landed more than ~7 degrees off. "turn right 45 degrees" turns 45; "a little" halves and "a lot" doubles the angle; "turn left two seconds" stays a timed turn. If the gyro isn't readable, or disagrees with what the dog is doing (turning the wrong way, not turning at all), it says so and finishes by time (the old behaviour: 0.8 rad/s, so 90 degrees is 2.0 s). Simulated dogs with 0.15-0.5 s of lag landed within ~7 degrees (typically 3-4) and took 3-5 s for a 90 and 5-6 s for a 180 (`python turn_test.py`). |
 | "follow me", "stop following" | person-follow (starts straight away; keyboard `T` still asks for `Y`) |
-| "lead", "lead me", "lead me five metres", "lead me forward 4 metres and left 2", "stop leading" | walk to a spot round obstacles, **stopping at drop-offs** (see Lead; starts straight away; `G` still asks for `Y`) |
+| "lead", "lead me", "lead me five metres", "lead me forward 4 metres and left 2", "stop leading" | walk to a spot round obstacles, **stopping at drop-offs** (see Lead; starts straight away; `B` still asks for `Y`) |
 | "heel", "heel right", "walk beside me", "stop heeling" | walk at your side (default: dog on your left; starts straight away; `H` still asks for `Y`) |
 | "stand on your back legs" -> "yes" | back-leg stand (asks for a spoken "yes" or Y). "come down" / "four legs" returns |
 | "box step" | **up on the back legs, then step in a square until you say "stop"** (see below). No "yes" needed: it can fall, so clear the space first |
@@ -157,15 +158,15 @@ to **1050** if the dog refuses it (`--upright-api 1050` flips the order); the wi
 first), and **can fall**: use a soft floor, clear space, and a spotter. A steady two-legged balance isn't something the
 firmware exposes beyond this command. `Handstand` (front legs) is deliberately not included; neither are flips.
 
-## Lead (`G` or "ernest, lead")
+## Lead (`B` or "ernest, lead")
 
 Says "lead" and the dog walks from where it stands (A) to a point B, round obstacles, **and stops at drop-offs** (stairs down, a ledge, a hole). It is the guide mode
 below (`guide.py`, `pathplan.py`, `dropoff.py`) running inside this app, on the dog's lidar, in a background thread so the window stays smooth.
 
 - **Say it:** "ernest, lead" / "lead me" walks to the usual spot (`--lead-goal AHEAD,LEFT`, default `4,0` = 4 m ahead). **"ernest, lead me five metres"**, "lead me forward 4 metres and left 2",
   "guide me three metres to the right" and "lead me ten feet" choose the spot out loud (each number goes with the nearest direction word; a number with none is forward; capped at 15 m).
-  "Led" and "leed" (how Whisper often hears it) work. **"stop"**, **"stop leading"**, Space, `G` again, any drive key, or the window losing focus ends it. No confirmation for the voice command
-  (like "follow me"); `G` asks for `Y`.
+  "Led" and "leed" (how Whisper often hears it) work. **"stop"**, **"stop leading"**, Space, `B` again, any drive key, or the window losing focus ends it. No confirmation for the voice command
+  (like "follow me"); `B` asks for `Y`. (It was `G`, but the hand-gesture toggle took that key.)
 - **B is measured from where the dog is standing and facing when you say it**, so saying "lead me 4 metres" a second time walks 4 m further along whatever way it is now facing.
 - **What it does:** balances, waits for the dog's lidar, plans a path (A*) that keeps the dog's width off obstacles and a person's width off anything up to ~1.2 m high, and walks it at `--lead-speed` (0.3 m/s),
   re-planning twice a second. A drop-off is seen from about 2 m and is a no-go with a 0.75 m margin: **the dog stops about 1 m before it, says `DROP-OFF ahead` on screen, waits, and gives up after `--lead-patience`
@@ -188,8 +189,10 @@ starts, stop-and-go and turns on a 15 or 10 fps detector, and kept a person walk
 It uses the clothing lock described under Heel (it will only follow the person it locked onto, and says what that is).
 **When it loses you, it looks for you.** If the camera can't find you for over 0.6 s (you stepped out of the picture, walked past the dog, a fast turn),
 the dog does not give up: it turns on the spot toward the side you were last seen on, about 75 degrees, then sweeps across to the other side and back,
-for up to 8 s (`scan_for` in `follow.py`), and picks up again the moment your clothing colours reappear anywhere in the picture (it still never switches to
-someone else). It never walks while searching. With a phone streaming and saying you've stopped, it keeps looking 8 s longer. In simulation on a 10 fps
+for up to 12 s (`scan_for` in `follow.py`), **turning a little, then standing still to look** (a sharp, current picture for the detector and the colour match), and picks up
+again the moment your clothing colours reappear anywhere in the picture (it still never switches to someone else; the window says "found you again"). It never walks
+while searching. The longer it has searched, the more forgiving the colour match gets (up to 0.10 looser, and it must hold for 2 frames in a row), because the same clothes look
+different from a new angle or in other light; strangers were still refused in every test. With a phone streaming and saying you've stopped, it keeps looking 8 s longer. In simulation on a 10 fps
 link, in 9 runs of three losing situations (a quick step out of view, walking up level with the dog, a 90 degree turn) heel gave up in 5 without the scan and in
 0 with it (at 5 fps it rescues sharp turns too; the walk-up-level case at 5 fps additionally needs the phone). If nothing is found after the search it stops and says so.
 **No obstacle avoidance**: keep the path clear, and remember it now moves faster. The detector is YOLOX-tiny on CPU (`follow.py`); no cloud.
@@ -238,9 +241,11 @@ turns the lidar part off. **It is off by default in `go2.bat` now:** recordings 
 - **Once locked, it doesn't change person.** When heel or follow starts it looks for the person nearest the middle of the picture (not just the
   biggest), waits until the same person has been the clear candidate for a few frames, then takes a clothing fingerprint (colour of the top and of the
   trousers) and says what it locked onto ("locked onto: red top, blue trousers"). From then on:
-  - **Colour:** it keeps a small bank of fingerprints from different views (whole body far away, only legs and hips close up). The first is never
-    replaced. New views are learned only gradually and only while the person is the *only one in view*, so the bank cannot drift onto a stranger or
-    be tainted by someone walking in front of them. Someone standing where the person just was is judged a little more gently; everyone else strictly.
+  - **Colour:** it keeps a **catalogue of up to 14 fingerprints** from different views (whole body far away, only legs and hips close up, other angles and
+    lights). The first is never replaced. Every few frames, while you are tracked clearly and nobody who could be mistaken for you is in view, it adds a view
+    that differs from the ones it has (a full catalogue drops its most redundant view), so when you are lost and found again one of the views fits. A close-up
+    with only legs in view is also compared with the fingerprint's trousers half. Fingerprints are corrected for the camera changing its exposure. Someone
+    standing where the person just was is judged a little more gently; everyone else strictly (see the search above for how that eases while looking).
   - **Plausibility:** a detection somewhere the person could not have got to (measured in the dog's own frame, so the dog turning doesn't matter) is
     refused unless the clothes match almost exactly.
   - **If nobody matches** it treats the person as not seen (stops, searches, gives up after a moment). It never picks up a stranger.
@@ -424,6 +429,8 @@ in mind: they are the emergency stop.
 - `lidar_probe.py` / `lidar-probe.bat`: read-only check of what the dog's lidar delivers (never moves the dog)
 - `dogmic_probe.py` / `dogmic-probe.bat`: read-only check of the dog's own microphone (never moves the dog); `dogmic_test.py`: checks the dog-mic conversion with fake frames
 - `winmic.py` (Windows-side, started by `go2.bat`) / `winmic_test.py`: capture a named Windows microphone such as the AirPods and serve it to the app
+- `wake_test.py`: the fuzzy wake word (what wakes it, what must not)
+- `turn_test.py`: simulated dogs turning 45 / 90 / 180 / 360 degrees under `voice.TurnController` (`python turn_test.py`)
 - `phone_server.py` + `phone.html` + `phone_tls.py` (Windows-side, started by `go2.bat`), `phonelink.py` (the app's side), `phone-setup.txt`, `phone-firewall.bat`: the iPhone link; tests `phone_test.py`, `phonelink_test.py`, `phone_page_test.py` (run with `.venv\Scripts\python.exe`)
 - `voice.py`: microphone capture, wake word + always-listening, local Whisper (and optional ElevenLabs), phrase matcher
 - `dimos-go2.bat` / `run_dimos.sh`, `fetch-aes-key.bat` / `fetch_aes_key.sh`, `set-elevenlabs-key.bat` / `set_elevenlabs_key.sh`

@@ -5,6 +5,8 @@ Each 'person' is a box with a shirt colour on top and trouser colour below, on a
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 
 import follow
@@ -126,6 +128,61 @@ def main() -> int:
     swap = box(650)
     sudden = lock.choose([swap], scene([(swap, GREEN_BLACK, 0.5)]), last, W, 0.1)
     checks["but a sudden switch to a differently dressed person in the same spot is refused"] = sudden is None
+
+    # --- lost and found again: the dog turns to look for the person; they come back into view somewhere else, from another angle, in other light
+    def tracked():
+        lk, t0 = follow.PersonLock(), box(650)
+        lock_on(lk, [t0], scene([(t0, RED_BLUE)]))
+        return lk
+
+    def found(lk, dets, fr, relax, frames=2):
+        """The picks over `frames` consecutive frames while searching (no last position: they can be anywhere)."""
+        return [copy.deepcopy(lk).choose(dets, fr, None, W, 0.1, relax=relax)] if frames == 1 else _run(lk, dets, fr, relax, frames)
+
+    def _run(lk, dets, fr, relax, frames):
+        lk = copy.deepcopy(lk)
+        return [lk.choose(dets, fr, None, W, 0.1, relax=relax) for _ in range(frames)]
+
+    base = tracked()
+    legs = box(400, h=640, w=230, y=40)                                   # close up: only the legs are in view
+    dim = box(640)
+    far_dim = box(500, h=200, w=75, y=260)
+    edge = (0, 200, 90, 580, 0.9)                                          # cut by the frame's edge
+    p_legs = _run(base, [legs], scene([(legs, RED_BLUE, 0.0)]), 0.0, 2)
+    checks["found again from CLOSE UP with only their legs in view (the trousers still match the first fingerprint), straight away"] = p_legs[0] is not None
+    p_edge = _run(base, [edge], scene([(edge, RED_BLUE)]), 0.0, 2)
+    checks["found again half out of the picture at its edge"] = p_edge[0] is not None
+    fr_dim = scene([(dim, RED_BLUE)], light=0.5)
+    p0, p1 = _run(base, [dim], fr_dim, 0.0, 2), _run(base, [dim], fr_dim, 1.0, 2)
+    print(f"  same person in 50% light: picked at once? {p0[0] is not None}; after searching a while (relax 1): first frame {p1[0] is not None}, second frame {p1[1] is not None}")
+    checks["in much dimmer light (the camera's exposure changed) they are found once it has been searching a while, and only after 2 frames in a row"] = p1[0] is None and p1[1] is not None
+    p_far = _run(base, [far_dim], scene([(far_dim, RED_BLUE)], light=0.7), 0.5, 2)
+    checks["further away and in dimmer light: found"] = p_far[1] is not None
+    strangers = {"a similarly dressed stranger": NEAR_RED, "a differently dressed stranger": GREEN_BLACK, "someone in the same trousers but another top": ((40, 160, 60), (30, 40, 120))}
+    refused = {k: all(pk is None for pk in _run(base, [dim], scene([(dim, c)]), 1.0, 6)) for k, c in strangers.items()}
+    print("  refused after searching as long as it likes (6 frames):", refused)
+    checks["...but strangers are never taken for them, however long it has been searching (similar clothes, different clothes, same trousers)"] = all(refused.values())
+    a_, b_ = box(400), box(900, h=350, w=125, y=230)
+    both = _run(base, [b_, a_], scene([(a_, RED_BLUE), (b_, GREEN_BLACK)]), 1.0, 3)
+    checks["with the right person and a stranger in view together it picks the right one"] = all(pk == a_ for pk in both[1:])
+
+    # --- the catalogue of views grows while they are tracked, is capped, and never loses the first fingerprint
+    lk = follow.PersonLock()
+    t0 = box(650)
+    lock_on(lk, [t0], scene([(t0, RED_BLUE, 0.5)]))
+    first_ref, last = lk.ref, t0
+    sizes = []
+    for i in range(240):
+        frac = 0.5 - 0.5 * ((i // 4) % 11) / 10                              # 0.5 ... 0.0: whole body to legs only, and around again
+        light = 1.0 - 0.25 * ((i // 30) % 3)                                  # ... in three different lights
+        h = 380 + 12 * ((i // 4) % 11)
+        cur = box(650 + (i % 5) * 3, h=h, w=int(h * 0.37), y=200 + (380 - h) // 2)
+        pk = lk.choose([cur], scene([(cur, RED_BLUE, frac)], light=light), last, W, 0.1)
+        last = pk if pk is not None else last
+        sizes.append(len(lk.refs))
+    print(f"  catalogue of views over 240 frames of changing view and light: {sizes[0]} -> {max(sizes)} (cap {lk.max_refs})")
+    checks["the catalogue of views grows as the person is tracked through different views and lights"] = max(sizes) >= 3
+    checks["...never past its cap, and the first fingerprint is never replaced"] = max(sizes) <= lk.max_refs and lk.ref is first_ref
 
     # --- no picture: falls back to position only (never crashes)
     checks["without a picture it still works (position only)"] = follow.PersonLock().choose([a, b], None, None, W, 0.1) == a
