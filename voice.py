@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import threading
+import time
 import wave
 from dataclasses import dataclass
 
@@ -174,7 +175,7 @@ class ElevenLabsSTT:
 
 
 # ---- local Whisper speech-to-text (offline) ---------------------------------------------------------------
-WHISPER_MODEL = os.environ.get("GO2_WHISPER_MODEL", "base.en")   # measured: 32/32 commands, ~0.4 s per clip on CPU
+WHISPER_MODEL = os.environ.get("GO2_WHISPER_MODEL", "small.en")   # noisy-speech test: 71/108 vs base.en 61/108, ~2.4x slower. base.en is 32/32 on clean speech
 
 
 def whisper_model_path(name: str = WHISPER_MODEL) -> str | None:
@@ -234,7 +235,9 @@ class LocalWhisperSTT:
                                                  condition_on_previous_text=False, vad_filter=False,
                                                  without_timestamps=True,   # one decode pass, no multi-chunk re-tries
                                                  max_new_tokens=48)         # commands are short: bounds time and runaway output
-            text = " ".join(s.text for s in segments).strip()
+            # Whisper's own "this is noise, not speech" test: a segment it gave a high no-speech probability AND a poor
+            # confidence is a hallucination ("thank you.", "you", a repeated word), not something the person said.
+            text = " ".join(s.text for s in segments if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)).strip()
         return sane_transcript(text, len(audio) / RATE)
 
 
@@ -256,7 +259,7 @@ def sane_transcript(text: str, seconds: float) -> str:
 # ---- phrase matcher ---------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class Intent:
-    kind: str          # "stop" | "stop_follow" | "follow" | "sport" | "routine" | "move" | "upright" | "box_step"
+    kind: str          # "stop" | "stop_follow" | "follow" | "heel" | "sport" | "routine" | "move" | "upright" | "box_step"
     arg: str = ""      # sport command / routine name; move: forward|back|strafe_*|turn_*; upright: on|off
     label: str = ""    # for the on-screen message
     amount: float | None = None   # move only: the number that was spoken, if any
@@ -275,9 +278,13 @@ _UP_OFF = (r"\b(?:four|4)\s+(?:legs?|paws|feet)\b|\ball\s+fours?\b|\bcome down\b
 _UP_ON = (r"\b(?:stand|standing|walk|walking|balance|rear|rise|get|go|be|up)\b.*\b(?:" + _LEGS + r"|upright)\b"
           r"|\brear up\b|\bstand upright\b|\bwalk upright\b|\bbipedal\b|\bon (?:your )?(?:" + _LEGS + r")\b")
 
+_HEEL = (r"(?:\bheel\w*|\bheal\w*|\bhe ll\b|\b(?:walk|stay|come|be)\s+(?:with|beside|next to|by)\s+me\b"
+         r"|\bat my side\b|\bby my side\b|\bside by side\b)")
+
 # Ordered: the first matching rule wins, so the safety words come first.
 _RULES: list = [
-    (r"\b(stop|halt|freeze|emergency|abort)\b.*\bfollow|\bfollow\w*\b.*\b(stop|halt|off)\b|\b(don t|do not|quit|cancel) follow",
+    (r"\b(stop|halt|freeze|emergency|abort)\b.*\b(follow|heel|heal)|\b(follow|heel|heal)\w*\b.*\b(stop|halt|off)\b"
+     r"|\b(don t|do not|quit|cancel) (follow|heel|heal)",
      Intent("stop_follow", label="stop following")),
     # "box step" = up on the back legs and step in a square (Whisper also writes it as box stop/stap/tap, so those count too).
     # Ahead of the 'stop' rule.
@@ -287,6 +294,10 @@ _RULES: list = [
     (r"\b(stop|halt|freeze|emergency|abort|whoa)\b", Intent("stop", label="STOP")),
     # "ready to dance" = the voice command for standing up (alias; "stand up" still works). Before the 'dance' rules.
     (r"\bready (?:to|for) (?:the )?danc\w*\b|\bready to boogie\b", Intent("sport", "StandUp", "Stand up (ready to dance)")),
+    # "heel" = walk at my side. Whisper writes it as heal / he'll (-> "he ll"); "heel right" puts the dog on the right.
+    (_HEEL + r".*\bright\b", Intent("heel", "right", "heel (dog on your right)")),
+    (_HEEL + r".*\bleft\b", Intent("heel", "left", "heel (dog on your left)")),
+    (_HEEL, Intent("heel", "", "heel: walk at your side")),
     (r"\bfollow\w*\b", Intent("follow", label="follow the nearest person")),
     (r"\brecover\w*\b|\bget back up\b", Intent("sport", "RecoveryStand", "Recovery stand")),  # before 'back' = move back
     (_MOTION, None),
@@ -424,7 +435,7 @@ _WAKE_VARIANTS = {"ernest": ("ernest", "earnest", "ernst", "ernes", "urnest", "e
 
 def _wake_regex(word: str):
     variants = _WAKE_VARIANTS.get(word.lower(), (word.lower(),))
-    return re.compile(r"^(?:(?:hey|ok|okay|hi|yo)\s+)?(?:" + "|".join(re.escape(v) for v in variants) + r")\b\s*(.*)$")
+    return re.compile(r"^(?:(?:hey|ok|okay|hi|yo)\s+)?(?:" + "|".join(re.escape(x) for x in variants) + r")\b\s*(.*)$")
 
 
 def strip_wake(text: str, word: str = WAKE_WORD) -> tuple[bool, str]:
@@ -503,8 +514,10 @@ class AlwaysListener:
     """Keeps the mic open, cuts utterances, transcribes each one, and hands the text to on_text(text).
     Everything runs locally. Set `paused` (e.g. while push-to-talk is held) to drop utterances."""
 
-    def __init__(self, stt, on_text, on_error=None, mic=None, segmenter: UtteranceSegmenter | None = None):
+    def __init__(self, stt, on_text, on_error=None, mic=None, segmenter: UtteranceSegmenter | None = None,
+                 log_dir: str | None = None):
         self.stt, self.on_text, self.on_error = stt, on_text, on_error
+        self.log_dir = log_dir                                  # save every utterance (wav + transcript) here, to study misses
         self.mic = mic or MicStream()
         self.seg = segmenter or UtteranceSegmenter()
         self.paused = False
@@ -542,11 +555,25 @@ class AlwaysListener:
                 continue
             try:
                 text = self.stt.transcribe(utt)
+                self._log(utt, text)
                 if text:
                     self.on_text(text)
             except Exception as e:  # noqa: BLE001 - keep listening no matter what one utterance did
                 if self.on_error:
                     self.on_error(f"transcription failed: {e}")
+
+    def _log(self, utt: bytes, text: str) -> None:
+        if not self.log_dir:
+            return
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+            stem = os.path.join(self.log_dir, time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}")
+            with open(stem + ".wav", "wb") as f:
+                f.write(wav_bytes(utt))
+            with open(stem + ".txt", "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass                                                # logging must never stop the ear
 
     def stop(self) -> None:
         self._stop.set()

@@ -40,6 +40,12 @@ except Exception as _e:  # noqa: BLE001 - go2.py must still run without it
     _FOLLOW_ERR = str(_e)
 
 try:
+    import obstacles  # lidar point cloud -> dog-frame points (obstacles.py), used by heel --heel-lidar
+except Exception as _oe:  # noqa: BLE001
+    obstacles = None
+    _OBST_ERR = str(_oe)
+
+try:
     import voice as voice_mod  # push-to-talk mic + ElevenLabs speech-to-text + phrase matcher (voice.py)
 except Exception as _ve:  # noqa: BLE001
     voice_mod = None
@@ -76,6 +82,7 @@ CONFIRM_TRICKS = {
 }
 ROUTINE_KEY = pygame.K_r
 FOLLOW_KEY = pygame.K_t
+HEEL_KEY = pygame.K_h     # walk at the person's side (asks for Y, like follow)
 VOICE_KEY = pygame.K_v   # hold to talk
 OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
@@ -184,6 +191,25 @@ class Robot:
 
         self._subs.append(self.c.lowstate_stream().subscribe(handle))
 
+    def on_lidar(self, cb) -> None:
+        """cb(points_world (N, 3) float32, pose (x, y, z, yaw)) for every lidar message. Switches the dog's lidar on
+        (DimOS doesn't). If this dog sends no lidar, cb is simply never called."""
+        pose: dict = {}
+        self._subs.append(self.c.odom_stream().subscribe(
+            lambda p: pose.update(v=(p.position.x, p.position.y, p.position.z, p.yaw))))
+
+        def handle(msg):
+            try:
+                pts = np.asarray(msg["data"]["data"]["points"], dtype=np.float32).reshape(-1, 3)
+            except Exception:  # noqa: BLE001 - odd/partial message: just skip it
+                return
+            if "v" in pose:
+                cb(pts, pose["v"])
+
+        self._subs.append(self.c.raw_lidar_stream().subscribe(handle))
+        self.c.loop.call_soon_threadsafe(
+            self.c.conn.datachannel.pub_sub.publish_without_callback, self._topic["ULIDAR_SWITCH"], "on")
+
     def close(self) -> None:
         for s in self._subs:
             try:
@@ -246,6 +272,18 @@ class FakeRobot:
 
     def on_battery(self, cb) -> None:
         cb(87)
+
+    def on_lidar(self, cb) -> None:
+        """A pretend lidar (self-tests): a person-sized blob of points 1.8 m ahead and 0.45 m to the right, 8 times a second."""
+        rng = np.random.default_rng(3)
+        blob = np.stack((1.8 + rng.uniform(-.15, .15, 40), -0.45 + rng.uniform(-.15, .15, 40), rng.uniform(0.2, 1.7, 40)), axis=1)
+
+        def gen():
+            while not self._halt.is_set():
+                cb(blob.astype(np.float32), (0.0, 0.0, 0.32, 0.0))
+                time.sleep(0.125)
+
+        threading.Thread(target=gen, daemon=True).start()
 
     def close(self) -> None:
         self._halt.set()
@@ -327,6 +365,12 @@ class App:
         self._voice_deadline = 0.0
         self.heard_log: list = []           # (transcript, matched label) - used by the self-test
         self.follow_starts = 0              # how many times follow actually started - self-test
+        self._lock_warned = 0.0             # last time we said we were ignoring a stranger
+        self._lidar_on = False              # has the lidar feed been started?
+        self._lidar_check = None            # when to report whether lidar data is arriving
+        self.lidar = None                   # (time, points_world, pose) - the latest lidar message, when --heel-lidar
+        self.follow_sources: set = set()    # which sensors the heel controller has used (self-test)
+        self.follow_mode = "follow"          # "follow" (chase them) or "heel" (walk at their side); both run through self.follower
         # object detection overlay
         self.objects_on = False
         self.objects = None                 # (timestamp, [(x1, y1, x2, y2, score, class_id)], frame_shape)
@@ -465,10 +509,46 @@ class App:
         self.follower.reset()
         self.follow_res = None
         self.voice_move = None
+        self.follow_mode = "follow"
         self.following = True
         self.follow_starts += 1
         self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
         self.ensure_detector()
+
+    def start_heel(self, side: str = "") -> None:
+        """Walk at the person's side. Same plumbing as follow (self.follower.step() gives the velocity), different controller."""
+        if self.upright:
+            self.say("come down to four legs first (U / say 'come down')", WARN)
+            return
+        side = side or self.args.heel_side
+        cam = follow_mod.Camera(z=self.args.heel_cam_height, pitch=math.radians(self.args.heel_cam_pitch))
+        self.follower = follow_mod.Heeler(follow_mod.HeelConfig(side=side, max_forward=self.args.heel_speed, cam=cam, lead=self.args.heel_lead, gap=self.args.heel_gap,
+                                                             use_lidar=self.args.heel_lidar and obstacles is not None))
+        self.follower.reset()
+        self.follow_res = None
+        self.voice_move = None
+        self.follow_mode = "heel"
+        self.following = True
+        self.follow_starts += 1
+        use_lidar = self.args.heel_lidar and obstacles is not None
+        if use_lidar:
+            self.ensure_lidar()
+            self._lidar_check = time.time() + 3.0
+        self.say(f"> heeling: walking on your {side} (Space / H / any drive key stops). "
+                 + ("Camera finds and follows you; lidar only sharpens the distance" if use_lidar
+                    else "Camera only: it keeps ~1.3 m behind your hip"), GOOD)
+        self.ensure_detector()
+
+    def ensure_lidar(self) -> None:
+        """Start the dog's lidar feed the first time heel needs it (not at connect: it is extra traffic on the link)."""
+        if self._lidar_on or self.robot is None or not hasattr(self.robot, "on_lidar"):
+            return
+        self._lidar_on = True
+        try:
+            self.robot.on_lidar(lambda pts, pose: setattr(self, "lidar", (time.time(), pts, pose)))
+        except Exception as e:  # noqa: BLE001
+            self._lidar_on = False
+            self.say(f"couldn't start the lidar: {e}. Heel will use the camera only", WARN)
 
     def stop_follow(self, reason: str) -> None:
         if not self.following:
@@ -476,7 +556,7 @@ class App:
         self.following = False
         self.follow_res = None
         self.desired = (0.0, 0.0, 0.0)
-        self.say(f"follow stopped: {reason}", WARN)
+        self.say(f"{'heel' if self.follow_mode == 'heel' else 'follow'} stopped: {reason}", WARN)
 
     def vision_loop(self) -> None:
         """One inference per new frame, shared by person-follow and the object overlay."""
@@ -494,7 +574,20 @@ class App:
                     self.objects = (time.time(), dets, frame.shape)
                 res = None
                 if self.following:
-                    res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape)
+                    kw = {"frame": frame}                                          # the picture: for the clothing-colour lock
+                    if self.follow_mode == "heel" and self.args.heel_lidar and obstacles is not None:
+                        lid = self.lidar
+                        if lid is not None and time.time() - lid[0] < 0.5:      # a stale cloud is worse than none
+                            kw["cloud"] = obstacles.to_dog_frame(lid[1], *lid[2])
+                    res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape, **kw)
+                    self.follow_sources.add(getattr(self.follower, "source", "camera"))
+                    lk = self.follower.lock
+                    if lk.label and not lk.announced:
+                        lk.announced = True
+                        self.say(f"locked onto: {lk.label}. It will only follow someone who looks like this", GOOD)
+                    if lk.rejected and time.time() - self._lock_warned > 6:
+                        self._lock_warned = time.time()
+                        self.say("ignoring another person who isn't dressed like the one it locked onto", DIM)
             except Exception as e:  # noqa: BLE001
                 self.say(f"detector error: {e}", BAD)
                 self.objects_on = False
@@ -546,7 +639,7 @@ class App:
             return
         try:
             self.listener = voice_mod.AlwaysListener(self.stt, lambda t: self.voice_q.put(("ambient", t, -1)),
-                                                     on_error=self._ear_error)
+                                                     on_error=self._ear_error, log_dir=self.args.voice_log)
             self.listener.start()
         except Exception as e:  # noqa: BLE001
             self.listener, self.ear = None, "error"
@@ -697,6 +790,14 @@ class App:
                 self.pending = None
                 self.voice_move = None
                 self.start_follow()
+        elif intent.kind == "heel":
+            if self.following and self.follow_mode == "heel" and not intent.arg:
+                self.say("already heeling (say 'stop' to end it)")
+            elif self.follow_available():
+                self.pending = None
+                self.voice_move = None
+                self.stop_follow("switching")
+                self.start_heel(intent.arg)
         elif intent.kind == "move":
             self.start_voice_move(intent)
         elif intent.kind == "upright":
@@ -882,6 +983,11 @@ class App:
                 self.stop_follow("T pressed")
             elif self.follow_available():
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key == HEEL_KEY:
+            if self.following:
+                self.stop_follow("H pressed")
+            elif self.follow_available():
+                self.pending = ("Heel: walk at your side (NO obstacle avoidance)", self.start_heel, now + CONFIRM_SECS)
         elif key == VOICE_KEY:
             self.start_listening()
         elif key == OBJECTS_KEY:
@@ -944,6 +1050,12 @@ class App:
                     return
                 self.desired = vm["cmd"]
                 return
+        if self._lidar_check and now > self._lidar_check and self.following:
+            self._lidar_check = None
+            if self.lidar is None:
+                self.say("heel: NO lidar data from the dog, so it is heeling on the camera alone", WARN)
+            else:
+                self.say("heel: lidar is streaming (it sharpens the distance; the camera still decides)", GOOD)
         if self.following:
             if manual:
                 self.stop_follow("manual drive key")      # the human always wins; carry on as manual below
@@ -1063,7 +1175,8 @@ class App:
                       + "     say 'stop' / Space / any key cancels", GOOD)
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
-            banner = (f"FOLLOWING: {st}    (Space / T / any drive key stops)", GOOD)
+            banner = ((f"HEELING ({self.follower.cfg.side}): {st}    (Space / H / any drive key stops)" if self.follow_mode == "heel"
+                       else f"FOLLOWING: {st}    (Space / T / any drive key stops)"), GOOD)
         if banner:
             back = pygame.Surface((WIN_W, 40), pygame.SRCALPHA)
             back.fill((0, 0, 0, 150))
@@ -1085,9 +1198,9 @@ class App:
             "DRIVE   W/S forward/back    Q/E strafe left/right    A/D turn left/right    Shift fast   Ctrl slow   SPACE = STOP",
             "POSES   1 stand up   2 balance   3 lie down   4 recovery stand   5 sit   6 rise from sit",
             "TRICKS  7 hello   8 stretch   9 content   0 wiggle hips   F finger heart   N / M dance 1 / 2 (then Y)   R greeting routine (then Y)",
-            "FOLLOW  T follow the nearest person (then Y).  T again / Space / any drive key stops it.  No obstacle avoidance!",
+            "FOLLOW  T follow the nearest person, H heel (walk at your side), each then Y.  Again / Space / any drive key stops.  No obstacle avoidance!",
             f"VOICE   say \"{self.args.wake_word}, <command>\" or hold V: \"ready to dance\" (stand up), \"sit\", \"dance two\", \"walk forward\", "
-            "\"follow me\", \"box step\".  \"stop\" always works."
+            "\"follow me\", \"heel\", \"box step\".  \"stop\" always works."
             + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
             "BACK LEGS  U (then Y), or \"" + self.args.wake_word + ", stand on your back legs\" then \"yes\".  U / \"come down\" returns to four legs.  Can fall: soft floor!",
             "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
@@ -1109,7 +1222,7 @@ class App:
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
                                        objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove,
-                                       listen=self.args.selftest_listen)
+                                       listen=self.args.selftest_listen, heel=self.args.selftest_heel)
                   if self.is_selftest() else None)
         t0 = time.time()
         try:
@@ -1162,11 +1275,13 @@ class App:
             return _selftest_voicemove_verdict(self)
         if self.args.selftest_listen:
             return _selftest_listen_verdict(self)
+        if self.args.selftest_heel:
+            return _selftest_heel_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
     def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False, voicemove: bool = False,
-                        listen: bool = False):
+                        listen: bool = False, heel: bool = False):
         K = pygame
         if listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
             steps = [(19.3, K.KEYDOWN, K.K_ESCAPE)]
@@ -1187,8 +1302,8 @@ class App:
                 steps += [(0.5 + i * 0.7, K.KEYDOWN, K.K_v), (0.8 + i * 0.7, K.KEYUP, K.K_v)]
             steps.append((5.8, K.KEYDOWN, K.K_ESCAPE))
             shot_at = 3.6
-        elif follow:
-            steps = [(0.5, K.KEYDOWN, K.K_t), (0.7, K.KEYUP, K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
+        elif follow or heel:
+            steps = [(0.5, K.KEYDOWN, K.K_h if heel else K.K_t), (0.7, K.KEYUP, K.K_h if heel else K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
                      (4.5, K.KEYDOWN, K.K_SPACE), (7.0, K.KEYDOWN, K.K_ESCAPE)]
             shot_at = 3.5
         else:
@@ -1221,10 +1336,11 @@ class App:
                                   "/tmp/go2_selftest_voicemove.png" if voicemove else
                                   "/tmp/go2_selftest_objects.png" if objects else
                                   "/tmp/go2_selftest_voice.png" if voice else
+                                  "/tmp/go2_selftest_heel.png" if heel else
                                   "/tmp/go2_selftest_follow.png" if follow else "/tmp/go2_selftest.png")
             if objects and t >= 3.0 and self._obj_snapshot is None and self.objects:
                 self._obj_snapshot = list(self.objects[1])   # what the overlay held just before it was switched off
-            mark_at = 5.0 if follow else 8.0 if voicemove else None
+            mark_at = 5.0 if (follow or heel) else 8.0 if voicemove else None
             if mark_at and t >= mark_at and not state["marked"] and isinstance(self.robot, FakeRobot):
                 state["marked"] = True  # 0.5 s after Space / 'stop': nothing should move the dog from here on
                 self._log_len_after_stop = len(self.robot.log)
@@ -1267,6 +1383,27 @@ class App:
         for name, ok in checks.items():
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
+
+
+def _selftest_heel_verdict(app: "App") -> int:
+    log = app.robot.log if isinstance(app.robot, FakeRobot) else []
+    sports = [e[1] for e in log if e[0] == "sport"]
+    moves = [e for e in log if e[0] == "move"]
+    after = log[app._log_len_after_stop:] if app._log_len_after_stop is not None else None
+    checks = {
+        "balanced first, then e-stop (BalanceStand, StopMove)": sports == ["BalanceStand", "StopMove"],
+        "started heeling (H then Y), not plain follow": app.follow_starts == 1 and app.follow_mode == "heel",
+        "walked toward the person, who is further ahead than the heel spot (vx > 0.3)": any(m[1] > 0.3 for m in moves),
+        "never went faster than --heel-speed": all(m[1] <= app.args.heel_speed + 1e-6 for m in moves),
+        "never backed up (the person is ahead of the spot)": all(m[1] >= 0 for m in moves),
+        "no walking after Space": after is not None and not any(e[0] == "move" for e in after),
+        "heel ended": not app.following,
+        "the (pretend) lidar was used: the controller fused it with the camera": "camera+lidar" in app.follow_sources,
+    }
+    print("\nSELFTEST-HEEL command log:", log)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
 
 
 VOICE_TEST_LINES = ["say hello", "dance two", "follow me", "stop", "what is the weather", "stop following"]
@@ -1422,10 +1559,23 @@ def main() -> int:
     p.add_argument("--linear", type=float, default=LINEAR, help="forward/sideways speed, m/s")
     p.add_argument("--angular", type=float, default=ANGULAR, help="turn speed, rad/s")
     p.add_argument("--follow-speed", type=float, default=0.35, help="max forward speed while following, m/s")
+    p.add_argument("--heel-side", choices=["left", "right"], default="left", help="which side of you the dog walks on when heeling")
+    p.add_argument("--heel-speed", type=float, default=0.8, help="max forward speed while heeling, m/s (a slow walk is ~1.0; the dog trails you above this)")
+    p.add_argument("--heel-lidar", dest="heel_lidar", action="store_true", default=True,
+                   help="heel uses the camera AND the dog's lidar (the default): the camera decides who and where you are, the lidar only sharpens "
+                        "the distance. UNTESTED on the real dog. If the dog sends no lidar it says so and uses the camera alone")
+    p.add_argument("--no-heel-lidar", dest="heel_lidar", action="store_false", help="heel uses the camera only")
+    p.add_argument("--heel-lead", type=float, default=1.1, help="heel: how far ahead of the dog's centre you are, m. Smaller = the dog walks closer, but the camera sees less of you (try 0.9)")
+    p.add_argument("--heel-gap", type=float, default=0.5, help="heel: sideways distance between you and the dog, m")
+    p.add_argument("--heel-cam-height", type=float, default=0.35, help="ESTIMATE: camera height above the floor, m (sets how far away the dog thinks you are)")
+    p.add_argument("--heel-cam-pitch", type=float, default=0.0, help="ESTIMATE: degrees the camera looks down")
+    p.add_argument("--selftest-heel", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--stt", choices=["local", "elevenlabs"], default=os.environ.get("GO2_STT", "local"),
                    help="speech-to-text for the V key: 'local' = offline Whisper (default), 'elevenlabs' = cloud (needs internet + key)")
-    p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "base.en"),
-                   help="local Whisper model (base.en is fast and accurate for short commands; small.en is slower)")
+    p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "small.en"),
+                   help="local Whisper model (small.en, the default, copes better with noise; base.en is ~2.4x faster)")
+    p.add_argument("--voice-log", default=os.environ.get("GO2_VOICE_LOG"), metavar="DIR",
+                   help="save every utterance the always-on mic hears (wav + transcript) into DIR, to study what it gets wrong")
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
     args = p.parse_args()
@@ -1447,7 +1597,7 @@ def main() -> int:
             voice_mod.fetch_whisper_model(args.whisper_model)
         return rc
     image = None
-    if args.selftest_follow:
+    if args.selftest_follow or args.selftest_heel:
         image = _follow_test_canvas()
         if image is None:
             return 2
@@ -1457,6 +1607,7 @@ def main() -> int:
             return 2
     if any(k.startswith("selftest") and v for k, v in vars(args).items()):
         args.no_listen = True                                   # tests never open the mic
+        args.heel_lidar = args.heel_lidar or args.selftest_heel  # the heel test also exercises the (pretend) lidar
         args.box_wait = 0.4                                     # (and don't wait 3 s for a fake dog to stand)
     app = App(args, demo_image=image)
     if args.selftest_voice:
