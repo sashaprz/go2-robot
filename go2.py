@@ -52,6 +52,7 @@ except Exception as _ve:  # noqa: BLE001
     _VOICE_ERR = str(_ve)
 
 try:
+<<<<<<< HEAD
     import phonelink as phonelink_mod  # the iPhone's motion sensors (phone_server.py on Windows -> here)
 except Exception as _pe:  # noqa: BLE001
     phonelink_mod = None
@@ -62,6 +63,17 @@ try:
 except Exception as _ge:  # noqa: BLE001
     guide_mod = None
     _GUIDE_ERR = str(_ge)
+=======
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks import python
+    from mediapipe.tasks.python import vision
+    import math
+    _GESTURE_AVAILABLE = True
+except Exception as _ge:  # noqa: BLE001
+    _GESTURE_AVAILABLE = False
+    _GESTURE_ERR = str(_ge)
+>>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
 
 # ---- tunables ---------------------------------------------------------------------------------------------
 LINEAR = 0.4      # m/s forward / sideways
@@ -103,8 +115,12 @@ VOICE_KEY = pygame.K_v   # hold to talk
 OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
 UPRIGHT_KEY = pygame.K_u  # stand on the back legs (asks for Y) / come back down
 LISTEN_KEY = pygame.K_l   # toggle always-listening (wake word)
+<<<<<<< HEAD
 LEAD_KEY = pygame.K_g     # lead: walk to a point, round obstacles, stopping at drop-offs (asks for Y, like follow)
 LEAD_STALE = 0.7          # ignore a lead command older than this many seconds (the guide thread stalled): stand still
+=======
+GESTURE_KEY = pygame.K_g  # toggle hand gesture control
+>>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
 WAKE_WINDOW = 6.0         # seconds the wake word stays "open" after "ernest" on its own
 
 
@@ -425,6 +441,115 @@ def _class_color(class_id: int) -> tuple[int, int, int]:
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
+# ---- gesture recognition ----------------------------------------------------------------------------------
+def is_finger_extended(landmarks, tip_idx, pip_idx, mcp_idx, wrist_idx):
+    """Check if a finger is extended using distance-based detection."""
+    if not _GESTURE_AVAILABLE:
+        return False
+    tip = landmarks[tip_idx]
+    pip = landmarks[pip_idx]
+    wrist = landmarks[wrist_idx]
+    tip_dist = math.sqrt((tip.x - wrist.x)**2 + (tip.y - wrist.y)**2)
+    pip_dist = math.sqrt((pip.x - wrist.x)**2 + (pip.y - wrist.y)**2)
+    return tip_dist > pip_dist * 1.2
+
+
+def is_thumb_up(landmarks):
+    """Detect thumbs up gesture."""
+    if not _GESTURE_AVAILABLE:
+        return False
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    thumb_pointing_up = thumb_tip.y < thumb_ip.y - 0.05
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
+    return thumb_pointing_up and not index_ext and not middle_ext and not ring_ext and not pinky_ext
+
+
+def is_thumb_down(landmarks):
+    """Detect thumbs down gesture."""
+    if not _GESTURE_AVAILABLE:
+        return False
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+    thumb_pointing_down = thumb_tip.y > thumb_ip.y + 0.05
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
+    return thumb_pointing_down and not index_ext and not middle_ext and not ring_ext and not pinky_ext
+
+
+def gesture_from_landmarks(landmarks):
+    """Classify gesture from hand landmarks."""
+    if not _GESTURE_AVAILABLE:
+        return "unknown"
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
+
+    if is_thumb_up(landmarks):
+        return "thumbs_up"
+    if is_thumb_down(landmarks):
+        return "thumbs_down"
+    if index_ext and middle_ext and not ring_ext and not pinky_ext:
+        return "peace"
+    if index_ext and middle_ext and ring_ext and pinky_ext:
+        return "open_palm"
+    if not index_ext and not middle_ext and not ring_ext and not pinky_ext:
+        return "fist"
+    return "unknown"
+
+
+class GestureController:
+    """Process gestures and send commands to the robot."""
+    def __init__(self, robot, forward_speed: float = 0.4):
+        self.robot = robot
+        self.forward_speed = forward_speed
+        self.last_action = None
+        self.last_action_time = 0.0
+        self.last_gesture = None
+        self.last_gesture_time = 0.0
+
+    def _send_action(self, gesture: str) -> str:
+        """Send robot command for gesture. Returns action description."""
+        if gesture == "peace":
+            self.robot.sport("StandUp")
+            return "STAND UP"
+        elif gesture == "thumbs_down":
+            self.robot.sport("StandDown")
+            return "LIE DOWN"
+        elif gesture == "open_palm":
+            self.robot.sport("Sit")
+            return "SIT"
+        elif gesture == "thumbs_up":
+            self.robot.move(self.forward_speed, 0.0, 0.0)
+            return "WALK FORWARD"
+        return "NO COMMAND"
+
+    def decide(self, gesture: str) -> str:
+        """Process gesture with debouncing. Returns action description or empty string."""
+        now = time.time()
+        if gesture == "unknown":
+            self.last_gesture = "unknown"
+            self.last_gesture_time = now
+            return ""
+        if self.last_gesture != gesture:
+            self.last_gesture = gesture
+            self.last_gesture_time = now
+            return ""
+        if now - self.last_gesture_time < 0.25:
+            return ""
+        if self.last_action == gesture and now - self.last_action_time < 0.75:
+            return ""
+        self.last_action = gesture
+        self.last_action_time = now
+        return self._send_action(gesture)
+
+
 # ---- the app ----------------------------------------------------------------------------------------------
 class App:
     def __init__(self, args, demo_image=None):
@@ -507,6 +632,13 @@ class App:
         self.ear = "off"                    # "off" | "on" | "error"
         self.upright = False
         self.upright_api = args.upright_api   # the back-leg command that worked last (or the one to try first)
+        # gesture recognition
+        self.gesture_mode = False
+        self.gesture_controller = None
+        self.gesture_landmarker = None
+        self.gesture_frame_timestamp = 0
+        self.gesture_last = "unknown"
+        self.gesture_action = ""
         self.box_step = False               # True from "box step" until "stop"
         self.box_dancing = False            # True once it is up on the back legs: the box-step square runs
         self.box_t0 = None                  # when the current box-step square started
@@ -568,6 +700,9 @@ class App:
                 self.say(f"dog motion mode: {r.motion_mode()}")
             except Exception as e:  # noqa: BLE001
                 self.say(f"couldn't read the dog's motion mode: {e}", WARN)
+            # Auto-enable gesture mode if available
+            if _GESTURE_AVAILABLE:
+                self.toggle_gestures()
         except Exception as e:  # noqa: BLE001
             self.state, self.state_color = f"connection failed: {e}", BAD
             self.say(f"Connection failed: {e}", BAD)
@@ -1193,6 +1328,45 @@ class App:
         elif self.voice_ready():
             self.start_listener()
 
+    def toggle_gestures(self) -> None:
+        """Toggle hand gesture control mode."""
+        if not _GESTURE_AVAILABLE:
+            self.say("gesture control unavailable: install opencv-python and mediapipe", WARN)
+            return
+        if self.gesture_mode:
+            self.gesture_mode = False
+            if self.gesture_landmarker:
+                self.gesture_landmarker.close()
+                self.gesture_landmarker = None
+            self.gesture_controller = None
+            self.say("gesture control OFF", WARN)
+        else:
+            try:
+                # Download model if needed
+                if not os.path.exists('hand_landmarker.task'):
+                    self.say("downloading hand gesture model...", GOOD)
+                    import urllib.request
+                    url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+                    urllib.request.urlretrieve(url, "hand_landmarker.task")
+
+                # Initialize MediaPipe HandLandmarker
+                base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
+                options = vision.HandLandmarkerOptions(
+                    base_options=base_options,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.3,
+                    min_hand_presence_confidence=0.3,
+                    min_tracking_confidence=0.3,
+                    running_mode=vision.RunningMode.VIDEO
+                )
+                self.gesture_landmarker = vision.HandLandmarker.create_from_options(options)
+                self.gesture_controller = GestureController(self.robot, forward_speed=LINEAR)
+                self.gesture_frame_timestamp = 0
+                self.gesture_mode = True
+                self.say("gesture control ON: peace=stand, thumbs_down=lie, palm=sit, thumbs_up=walk", GOOD)
+            except Exception as e:
+                self.say(f"gesture control failed to start: {e}", WARN)
+
     def handle_ambient(self, text: str) -> None:
         """An utterance from the always-on mic. Only acts on the wake word (+ command), a bare 'stop', or a bare
         'yes' while something waits for confirmation. Everything else is conversation and is ignored."""
@@ -1595,6 +1769,8 @@ class App:
             self.stop_upright("U pressed") if self.upright else self.request_upright()
         elif key == LISTEN_KEY:
             self.toggle_listener()
+        elif key == GESTURE_KEY:
+            self.toggle_gestures()
         elif key in TRICKS:
             self.run_trick(*TRICKS[key])
         elif key in CONFIRM_TRICKS:
@@ -1616,6 +1792,44 @@ class App:
             self.pool.submit(self.send, "BalanceStand")
             return False
         return True
+
+    def update_gestures(self) -> None:
+        """Process hand gestures from the camera feed."""
+        if not self.gesture_mode or not self.gesture_landmarker or self.latest is None:
+            return
+
+        try:
+            # Get current frame
+            with self.frame_lock:
+                frame = self.latest.copy()
+
+            # Convert frame to RGB and create MediaPipe Image
+            # Robot frames are already in RGB format from raw_video_stream
+            if len(frame.shape) == 2:  # grayscale
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+            else:  # already RGB (robot streams RGB24)
+                frame_rgb = frame
+
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+
+            # Detect hand landmarks
+            self.gesture_frame_timestamp += 33  # Approximately 30 FPS
+            results = self.gesture_landmarker.detect_for_video(mp_image, self.gesture_frame_timestamp)
+
+            if results.hand_landmarks and len(results.hand_landmarks) > 0:
+                hand_landmarks = results.hand_landmarks[0]
+                gesture = gesture_from_landmarks(hand_landmarks)
+                self.gesture_last = gesture
+                if self.gesture_controller:
+                    action = self.gesture_controller.decide(gesture)
+                    if action:
+                        self.gesture_action = action
+            else:
+                self.gesture_last = "unknown"
+                if self.robot:
+                    self.robot.stop_move()
+        except Exception:  # noqa: BLE001
+            pass  # Don't crash the main loop on gesture errors
 
     def update_velocity(self) -> None:
         now, h = time.time(), self.held
@@ -1835,6 +2049,7 @@ class App:
             banner = ((f"CALIBRATING {step}{how}: measuring, stand still ...  ({len(c['boxes'])} frames, {len(c['clouds'])} lidar scans)" if c["phase"] == "collect"
                        else f"CALIBRATION {step}{how}: {ask}, then press J   " + ("[I can see you]" if seen else "[I can't see you yet]")),
                       WARN if not seen else GOOD)
+<<<<<<< HEAD
         elif self.leading:
             ld = self.lead
             g = ld["guide"] if ld else None
@@ -1845,6 +2060,12 @@ class App:
                 col = GOOD if g.state == "going" else BAD if "drop-off" in g.reason else WARN
                 banner = (f"LEADING to {ld['goal'][0]:.1f} m ahead, {ld['goal'][1]:+.1f} m left: {g.state}" + (f" - {g.reason}" if g.reason else "")
                           + f"   [{to_go:.1f} m to go]   Space / G / 'stop' ends it", col)
+=======
+        elif self.gesture_mode:
+            gest_text = f"gesture: {self.gesture_last}" if self.gesture_last != "unknown" else "no hand detected"
+            action_text = f" → {self.gesture_action}" if self.gesture_action else ""
+            banner = (f"GESTURE CONTROL: {gest_text}{action_text}     peace=stand, thumbs_down=lie, palm=sit, thumbs_up=walk", GOOD)
+>>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
             dt = [t for t in self._det_times if now - t < 3]
@@ -1881,6 +2102,7 @@ class App:
             f"VOICE   say \"{self.args.wake_word}, <command>\" or hold V: \"ready to dance\" (stand up), \"sit\", \"dance two\", \"walk forward\", "
             "\"follow me\", \"heel\", \"lead\" / \"lead me 5 metres\", \"box step\".  \"stop\" always works."
             + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
+            "GESTURES  G toggles hand gesture control: peace = stand up, thumbs down = lie down, open palm = sit, thumbs up = walk forward.",
             "BACK LEGS  U (then Y), or \"" + self.args.wake_word + ", stand on your back legs\" then \"yes\".  U / \"come down\" returns to four legs.  Can fall: soft floor!",
             "VISION  O toggles labelled boxes for 80 object types.   J = calibrate heel distance (stand at 3 different distances; uses the lidar, no tape).",
             "Click this window so it has keyboard focus.   Esc quits.",
@@ -1930,6 +2152,7 @@ class App:
                 if self.listener is not None:
                     self.listener.paused = bool(self.voice_state)   # hold-V push-to-talk takes priority over the ear
                 self.drain_voice()
+                self.update_gestures()
                 self.update_calibration(time.time())
                 self.update_dogmic(time.time())
                 self.update_winmic(time.time())
@@ -1941,8 +2164,13 @@ class App:
         finally:
             print("Stopping and disconnecting ...", flush=True)
             self.stop_listener()
+<<<<<<< HEAD
             if self.phone is not None:
                 self.phone.close()
+=======
+            if self.gesture_landmarker:
+                self.gesture_landmarker.close()
+>>>>>>> 1e2c261f455843016c19656ce346f9f42921ea8c
             self.stop_evt.set()
             self.abort.set()
             self.following = False
