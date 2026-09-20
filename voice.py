@@ -51,7 +51,13 @@ class MicRecorder:
     def _lib(self):
         if self._pa is None:
             try:
-                pa = ctypes.CDLL("libpulse-simple.so.0")
+                import sys
+                # macOS uses .dylib with full path, Linux uses .so
+                if sys.platform == "darwin":
+                    lib_name = "/opt/homebrew/lib/libpulse-simple.0.dylib"
+                else:
+                    lib_name = "libpulse-simple.so.0"
+                pa = ctypes.CDLL(lib_name)
             except OSError as e:
                 raise VoiceError(f"PulseAudio library not found: {e}") from e
             pa.pa_simple_new.restype = ctypes.c_void_p
