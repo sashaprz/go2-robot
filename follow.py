@@ -144,10 +144,21 @@ class FollowConfig:
     k_turn: float = 2.0           # rad/s per unit of horizontal error (error is -0.5..0.5 of frame width)
     turn_deadband: float = 0.05   # ignore errors smaller than 5% of the frame width
     turn_first: float = 0.28      # if the person is further off-centre than this, turn without walking
+    x_offset: float = 0.0         # where to hold the person across the picture, as a fraction of its width right of centre (heel uses this)
     k_forward: float = 1.0        # m/s per unit of (target_height - person_height), both as frame fractions
+    ki_forward: float = 0.0       # leaky integral of that gap: learns the person's walking speed so the dog doesn't trail them (heel uses it)
     target_height: float = 0.60   # stop walking when the person fills this fraction of the frame height
     lost_after: float = 1.2       # seconds without a matching person before giving up
     min_iou_or_dist: float = 0.10 # IoU with the last box needed to keep the lock (else centre-distance test)
+    lead_time: float = 0.0        # s: steer toward where they WILL be across the picture (their swing rate x this): makes up for lag; 0 = off (plain follow)
+    fallback_height: float = 0.82 # lidar mode only: the box-height stop point used when there is no distance from the lidar-taught camera (~1.5 m, safer than 0.9)
+    range_target: float = 0.0     # m from the dog's centre to hold, measured by the LIDAR along the camera's line of sight (0 = use the box height)
+    k_range: float = 1.5          # m/s per metre of distance error (lidar mode)
+    ki_range: float = 1.0         # leaky integral of it: learns the person's walking speed
+    k_back: float = 1.0           # gain when they are CLOSER than range_target (backing away): firmer than closing in
+    range_back: float = 0.3       # m/s: fastest it backs away when the lidar says they are closer than range_target
+    back_at: float = 0.0          # if the person fills more than this share of the frame height, back away (0 = never; heel uses ~0.93)
+    back_speed: float = 0.25      # m/s while backing away
 
 
 @dataclass
@@ -156,6 +167,20 @@ class FollowResult:
     box: tuple | None = None                            # the tracked person's box, if any
     status: str = ""
     lost: bool = False                                  # True once the target has been missing too long
+
+
+def heel_follow_config(side: str = "left", max_forward: float = 0.8, target_height: float = 0.90, offset: float = 0.18,
+                       range_target: float = 0.0) -> "FollowConfig":
+    """Heel = the same controller as 'follow me', holding the person a little off-centre so the dog walks at their side, and CLOSE
+    (a leash length). The person appears on the dog's RIGHT when the dog is on their left.
+    The camera decides who and which way. With range_target > 0 the LIDAR holds the distance (metres, dog centre to person) along the
+    camera's line of sight; without a lidar reading the box height (target_height) does it, less exactly. Steering is quicker than
+    plain follow and looks ahead at how fast the person is swinging across the picture, because up close they sweep across it fast.
+    A small integral keeps pace with a walking person; it backs away if they walk right up to the dog."""
+    return FollowConfig(max_forward=max_forward, k_forward=3.0, ki_forward=2.5, target_height=target_height,
+                        x_offset=offset * (1 if side == "left" else -1), lost_after=1.5, back_at=0.95,
+                        k_turn=3.5, max_turn=1.0, lead_time=0.4, turn_deadband=0.03, back_speed=0.45,
+                        range_target=range_target, k_range=1.0, ki_range=0.8, range_back=0.45, k_back=3.0)
 
 
 def pick_target(dets, last_box, w: int, min_iou: float):
@@ -242,57 +267,86 @@ def describe(rgb: np.ndarray, box) -> str:
 class PersonLock:
     """Chooses which detection is the locked person. Needs the camera picture; without one it falls back to position only.
 
-    Clothes look different as the view changes (whole body far away, only legs and hips up close), so colour alone would
-    drop the right person. Two rules: someone who stays right where the person just was is accepted unless they are dressed
-    clearly differently (`near_dist`), and the fingerprint keeps adapting to what the camera now sees of the person."""
-    max_dist: float = 0.40        # anywhere else in the picture: a stranger must look at least this different to be turned down
-    near_dist: float = 0.70       # right where the person just was: only someone clearly different (a stranger walking through) is refused
-    ref: tuple | None = None
+    Three defences against following the wrong person:
+      * COLOUR: a bank of clothing fingerprints of the person from different views (whole body far away, only legs and hips
+        up close). The first one, from lock time, is never replaced; new ones are added only from clear, gradual matches
+        while they are the ONLY person in view, so the bank can't drift onto a stranger or get tainted by someone covering them.
+      * PLAUSIBILITY: the caller can say whether a detection is somewhere the person could actually have got to
+        (`accept`); a stranger who appears across the room is refused unless the colours match almost exactly.
+      * CONTINUITY: whoever overlaps the person's last box is judged a little more gently, everyone else strictly.
+    The first lock takes the person nearest the middle of the picture who then holds still for a few frames."""
+    max_dist: float = 0.35        # a person elsewhere in the picture must match at least this well
+    near_dist: float = 0.50       # right where the person just was: a little more forgiving (view changes)
+    lock_frames: int = 4          # frames the same person must be the obvious candidate before it locks on
+    max_refs: int = 8
+    refs: list = field(default_factory=list)   # fingerprints; refs[0] is from lock time and is never replaced
     label: str = ""               # what it locked onto, e.g. "dark blue top, grey trousers"
     announced: bool = False
     rejected: int = 0             # how many people were turned down on the last call
     closest_reject: float = 1.0   # the best colour match among those turned down (for the "why did it lose me" message)
+    confirming: bool = False      # still waiting for a steady candidate before locking
+    scores: list = field(default_factory=list)   # last call: (box, colour distance or None, "target" | "other" | "colour" | "jump")
+    _cand: tuple | None = None
+    _cand_n: int = 0
+
+    @property
+    def ref(self):
+        return self.refs[0] if self.refs else None
 
     def reset(self) -> None:
-        self.ref, self.label, self.announced, self.rejected, self.closest_reject = None, "", False, 0, 1.0
+        self.refs, self.label, self.announced, self.rejected, self.closest_reject = [], "", False, 0, 1.0
+        self.confirming, self.scores, self._cand, self._cand_n = False, [], None, 0
 
     def why_none(self, n_dets: int) -> str:
+        if self.confirming:
+            return "locking on: stand in front of the dog and hold still"
         if n_dets == 0:
             return "no person detected"
         return f"{self.rejected} person(s) seen but not matching the lock, closest colour match {self.closest_reject:.2f}"
 
-    def choose(self, dets, frame, last_box, w: int, min_iou: float):
-        self.rejected, self.closest_reject = 0, 1.0
+    def choose(self, dets, frame, last_box, w: int, min_iou: float, accept=None):
+        self.rejected, self.closest_reject, self.scores, self.confirming = 0, 1.0, [], False
         if not dets:
+            self._cand, self._cand_n = None, 0
             return None
-        if self.ref is None or frame is None:
-            if self.ref is None:                                   # first lock: the biggest person, favouring the middle of the picture
-                tgt = max(dets, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]) * (1 - 0.6 * abs((d[0] + d[2]) / w - 1)))
-                if frame is not None:
-                    self.ref = signature(frame, tgt)
-                    self.label = describe(frame, tgt) if self.ref is not None else ""
+        if frame is None:                                          # no picture: position only
+            return pick_target(dets, last_box, w, min_iou)
+        if not self.refs:                                          # first lock
+            tall = max(d[3] - d[1] for d in dets)
+            tgt = min((d for d in dets if d[3] - d[1] >= 0.6 * tall), key=lambda d: abs((d[0] + d[2]) / 2 - w / 2))
+            self._cand_n = self._cand_n + 1 if self._cand is not None and _iou(tgt, self._cand) > 0.5 else 1
+            self._cand = tgt
+            if self._cand_n < self.lock_frames:
+                self.confirming = True
+                return None
+            sig = signature(frame, tgt)
+            if sig is None:
                 return tgt
-            return pick_target(dets, last_box, w, min_iou)         # no picture this time: position only
-        best, best_cost, best_dist = None, 1e9, 1.0
+            self.refs, self.label = [sig], describe(frame, tgt)
+            return tgt
+        best, best_cost, best_dist, best_sig, best_iou, n_ok = None, 1e9, 1.0, None, 0.0, 0
+        eligible = []
         for d in dets:
             sig = signature(frame, d)
-            dist = 0.5 if sig is None else signature_distance(self.ref, sig)
+            dist = 0.5 if sig is None else min(signature_distance(r, sig) for r in self.refs)
             iou = _iou(d, last_box) if last_box is not None else 0.0
-            lc = (last_box[0] + last_box[2]) / 2 if last_box is not None else w / 2
-            shift = abs((d[0] + d[2]) / 2 - lc) / (0.25 * w)       # 1.0 = a quarter of the picture away from where they were
-            continuous = last_box is not None and (iou > 0.3 or shift < 0.6)
-            if dist > (self.near_dist if continuous else self.max_dist):
+            ok_pos = accept(d) if accept is not None else True
+            limit = self.near_dist if iou > 0.3 else self.max_dist
+            if dist > limit or (not ok_pos and dist >= 0.2):
                 self.rejected += 1
                 self.closest_reject = min(self.closest_reject, dist)
+                self.scores.append((d[:4], dist, "colour" if dist > limit else "jump"))
                 continue
-            cost = dist + 0.6 * (1 - iou) + 0.5 * min(1.0, shift)
+            eligible.append((d, dist))
+            cost = dist + 0.6 * (1 - iou) + (0.0 if ok_pos else 0.5)
             if cost < best_cost:
-                best, best_cost, best_dist = d, cost, dist
-        if best is not None:                                       # keep the fingerprint current: faster when the view has changed a lot
-            sig = signature(frame, best)
-            if sig is not None:
-                k = 0.05 if best_dist < 0.25 else 0.15
-                self.ref = tuple((1 - k) * r + k * n for r, n in zip(self.ref, sig))
+                best, best_cost, best_dist, best_sig, best_iou = d, cost, dist, sig, iou
+        for d, dist in eligible:
+            self.scores.append((d[:4], dist, "target" if d is best else "other"))
+        if (best is not None and len(dets) == 1 and 0.15 < best_dist < self.max_dist and best_iou > 0.5
+                and best_sig is not None and len(self.refs) < self.max_refs):
+            self.refs.append(best_sig)      # a new view of the same person, learned ONLY when they are the only person in view (nobody to be
+                                            # confused with or to partly cover them and taint the fingerprint)
         return best
 
 
@@ -302,15 +356,90 @@ class Follower:
     last_box: tuple | None = None
     last_seen: float = field(default_factory=time.time)
     lock: PersonLock = field(default_factory=PersonLock)
+    acc: float = 0.0
+    last_step: float | None = None
+    prev_err: float | None = None
+    prev_err_t: float = 0.0
+    err_rate: float = 0.0
+    range_src: str = "camera"
+    range_m: float | None = None
+    racc: float = 0.0
+    pairs: list = field(default_factory=list)        # (time, feet row at 720p, 1 / forward distance by lidar): the camera's ruler
+    cal: tuple | None = None                          # (a, b): 1 / forward distance = a * feet row + b, learned from the lidar
 
     def reset(self) -> None:
         self.last_box, self.last_seen = None, time.time()
+        self.acc, self.last_step = 0.0, None
+        self.prev_err, self.err_rate = None, 0.0
+        self.range_src, self.range_m = "camera", None
+        self.racc = 0.0
+        self.pairs, self.cal = [], None
         self.lock.reset()
+
+    def _learn(self, now: float, row720: float, z: float) -> None:
+        """One lidar reading of how far away the person is, paired with where their feet are in the picture. From these the camera
+        learns its own ruler (1 / distance = a * row + b): robust to a wrong reading now and then, and it forgets slowly."""
+        self.pairs = [p for p in self.pairs if now - p[0] < 30.0][-120:] + [(now, row720, 1.0 / z)]
+        if len(self.pairs) < 8:
+            return
+        rows = np.array([p[1] for p in self.pairs])
+        inv = np.array([p[2] for p in self.pairs])
+        cy = 349.3
+        a0 = 1.0 / (796.5 * 0.35)                            # the nominal camera (0.35 m high, level): only a starting point
+        for _ in range(3):                                   # fit, drop the readings that disagree, fit again
+            if float(np.ptp(rows)) >= 40:                    # you have stood at different distances: learn both numbers
+                a, b = np.polyfit(rows, inv, 1)
+            else:                                            # one distance so far: learn the scale, keep the level-camera horizon
+                a = float(np.median(inv / np.maximum(rows - cy, 30.0)))
+                b = -a * cy
+            res = np.abs(inv - (a * rows + b))
+            keep = res < max(3 * 1.4826 * float(np.median(res)), 0.03)
+            if keep.all() or keep.sum() < 6:
+                break
+            rows, inv = rows[keep], inv[keep]
+        horizon = -b / a if a else 0.0
+        if 0.5 * a0 < a < 2.0 * a0 and cy - 200 < horizon < cy + 200:      # a believable camera, or keep what we had
+            self.cal = (float(a), float(b))
+
+    def _distance(self, tgt, frame_shape, cloud, now: float):
+        """Metres from the dog's centre to the person. The lidar gives a coarse reading that teaches the camera its ruler; the camera
+        (fast, smooth) then holds the distance; and if the lidar says the person is CLOSER than the camera thinks, believe the lidar."""
+        h, w = frame_shape[:2]
+        cam = Camera()
+        sc = w / cam.width
+        theta = math.atan((cam.cx * sc - (tgt[0] + tgt[2]) / 2) / (cam.fx * sc))                # + = left of the picture's middle
+        row720 = tgt[3] * (cam.height / h)
+        clipped = tgt[3] >= h - 3                                                                # feet out of the picture: no camera distance
+        d_lid = z_lid = None
+        if cloud is not None:
+            s_lid = obstacles.refine_range(cloud, (cam.x_off, 0.0), theta, 1.5, window=1.2)          # 0.3 .. 2.7 m from the lens
+            if s_lid is not None:
+                z_lid = s_lid * math.cos(theta)
+                d_lid = math.hypot(cam.x_off + z_lid, s_lid * math.sin(theta))
+        d_cam = None
+        taught = [p[1] for p in self.pairs]                     # the rows the camera's ruler was actually taught at
+        if self.cal is not None and not clipped and taught and min(taught) - 45 <= row720 <= max(taught) + 45:    # never extrapolate
+            inv = self.cal[0] * row720 + self.cal[1]
+            if inv > 0.05:
+                z_cam = min(max(1.0 / inv, 0.4), 5.0)
+                d_cam = math.hypot(cam.x_off + z_cam, z_cam * math.tan(theta))
+        if z_lid is not None and not clipped and 0.5 < z_lid < 3.5 and (d_cam is None or abs(d_cam - d_lid) < 0.6):
+            self._learn(now, row720, z_lid)                    # only readings that roughly agree with what we already believe
+        if d_cam is not None and d_lid is not None:
+            self.range_src = "calibrated camera" if d_cam <= d_lid + 0.05 else "lidar (closer)"
+            self.range_m = min(d_cam, d_lid) if abs(d_cam - d_lid) > 0.2 else d_cam           # they disagree: believe whichever says closer
+        elif d_cam is not None:
+            self.range_src, self.range_m = "calibrated camera", d_cam
+        elif d_lid is not None:
+            self.range_src, self.range_m = "lidar", d_lid
+        else:
+            self.range_src, self.range_m = "camera", None
+        return self.range_m
 
     def _pick(self, dets, w, frame=None):
         return self.lock.choose(dets, frame, self.last_box, w, self.cfg.min_iou_or_dist)
 
-    def step(self, dets, frame_shape, now: float | None = None, frame=None) -> FollowResult:
+    def step(self, dets, frame_shape, now: float | None = None, frame=None, cloud=None) -> FollowResult:
         now = time.time() if now is None else now
         h, w = frame_shape[:2]
         c = self.cfg
@@ -322,13 +451,39 @@ class Follower:
             return FollowResult(status=f"searching ... ({why})")      # brief dropout: stand still, keep the lock
         self.last_box, self.last_seen = tgt, now
 
-        err = ((tgt[0] + tgt[2]) / 2 - w / 2) / w            # + means the person is right of centre
+        err = ((tgt[0] + tgt[2]) / 2 - w / 2) / w - c.x_offset   # + means the person is right of where we want them
         hr = (tgt[3] - tgt[1]) / h
-        yaw = 0.0 if abs(err) < c.turn_deadband else float(np.clip(-c.k_turn * err, -c.max_turn, c.max_turn))
+        err_c = err
+        if c.lead_time > 0:                                  # how fast they are swinging across the picture, smoothed
+            if self.prev_err is not None and 0.01 < now - self.prev_err_t < 0.3:
+                gap_t = now - self.prev_err_t
+                self.err_rate += (1 - math.exp(-gap_t / 0.25)) * (float(np.clip((err - self.prev_err) / gap_t, -2.0, 2.0)) - self.err_rate)
+            else:
+                self.err_rate = 0.0
+            self.prev_err, self.prev_err_t = err, now
+            err_c = err + self.err_rate * c.lead_time
+        yaw = 0.0 if abs(err_c) < c.turn_deadband else float(np.clip(-c.k_turn * err_c, -c.max_turn, c.max_turn))
         vx = 0.0
-        if abs(err) <= c.turn_first and hr < c.target_height:
-            vx = float(np.clip(c.k_forward * (c.target_height - hr), 0.0, c.max_forward))
-        status = "close enough" if hr >= c.target_height else ("turning" if abs(err) > c.turn_first else "following")
+        dt = 0.05 if self.last_step is None else min(max(now - self.last_step, 0.02), 0.5)
+        self.last_step = now
+        th = min(c.target_height, c.fallback_height) if c.range_target > 0 else c.target_height     # with no lidar-taught distance, stop further off
+        gap = th - hr
+        self.acc = float(np.clip(self.acc * (1 - dt / 4.0) + gap * dt, 0.0, 1.0)) if abs(err) <= c.turn_first else self.acc
+        if abs(err) <= c.turn_first and hr < th:
+            vx = float(np.clip(c.k_forward * gap + c.ki_forward * self.acc, 0.0, c.max_forward))
+        self.range_src, self.range_m = "camera", None
+        if c.range_target > 0:
+            d = self._distance(tgt, frame_shape, cloud, now)
+            if d is not None:
+                e = d - c.range_target
+                self.racc = float(np.clip(self.racc * (1 - dt / 4.0) + e * dt, -0.5, 1.0))
+                eb = min(0.0, e + 0.12) if e < 0 else e                       # ignore being up to 12 cm too close: only back away for a real intrusion
+                vx = float(np.clip((c.k_back if e < 0 else c.k_range) * eb + c.ki_range * self.racc, -c.range_back, c.max_forward)) if abs(err) <= c.turn_first or e < 0 else 0.0
+        status = "close enough" if hr >= th else ("turning" if abs(err) > c.turn_first else "following")
+        if c.back_at and hr >= c.back_at:                    # they have walked right up to the dog: give them room
+            vx, status = -c.back_speed, "backing away (too close)"
+        if self.range_m is not None:
+            status = f"{status} [{self.range_src} {self.range_m:.2f} m]"
         return FollowResult(cmd=(vx, 0.0, yaw), box=tgt, status=status)
 
 
@@ -511,6 +666,15 @@ class Heeler:
         """Where the person should be, in the dog's frame: (ahead, left)."""
         return self.cfg.lead, (-self.cfg.gap if self.cfg.side == "left" else self.cfg.gap)
 
+    def _plausible(self, d, frame_shape, now: float) -> bool:
+        """Could this detection be the person? They can't be far from where they were (in the dog's own frame, so the dog
+        turning doesn't matter), allowing for how long ago that was."""
+        if self.pos is None:
+            return True
+        p = locate(d, frame_shape, self.cfg.cam)
+        gap = _clip(now - self.last_seen, 0.0, 2.0)
+        return math.hypot(p.x - self.pos[0], p.y - self.pos[1]) <= 0.7 + 1.2 * gap
+
     def step(self, dets, frame_shape, now: float | None = None, cloud=None, frame=None) -> FollowResult:
         """dets: person boxes from the camera. cloud: lidar points in the dog's frame (x ahead, y left, z up from the
         floor), or None when there is no fresh lidar."""
@@ -518,7 +682,8 @@ class Heeler:
         c = self.cfg
         dt = 0.05 if self.last_step is None else _clip(now - self.last_step, 0.02, 0.5)
         self.last_step = now
-        tgt = self.lock.choose(dets, frame, self.last_box, frame_shape[1], c.min_iou_or_dist)
+        tgt = self.lock.choose(dets, frame, self.last_box, frame_shape[1], c.min_iou_or_dist,
+                               accept=lambda d: self._plausible(d, frame_shape, now))
         if tgt is None:
             gone = now - self.last_seen
             why = self.lock.why_none(len(dets))

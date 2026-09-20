@@ -371,9 +371,11 @@ class App:
         self.follow_starts = 0              # how many times follow actually started - self-test
         self.all_said: list = []            # everything said (self-tests)
         self._lidar_times: deque = deque(maxlen=40)    # for the lidar rate readout
+        self._cands = None                  # (time, [(box, colour distance, verdict)]) - who the lock saw last frame, for the overlay
         self.cal_events: list = []          # (self-test) what calibration did
         self.cal = None                     # calibration in progress: {step, phase, boxes, samples, until, last}
         self._det_times: deque = deque(maxlen=30)   # when the detector last finished (for the fps readout)
+        self.heel_side = "left"             # which side of you the dog walks on, for the banner
         self._lock_warned = 0.0             # last time we said we were ignoring a stranger
         self._lidar_on = False              # has the lidar feed been started?
         self._lidar_check = None            # when to report whether lidar data is arriving
@@ -641,22 +643,30 @@ class App:
             self.say("come down to four legs first (U / say 'come down')", WARN)
             return
         side = side or self.args.heel_side
-        cam = follow_mod.Camera(z=self.args.heel_cam_height, pitch=math.radians(self.args.heel_cam_pitch))
-        self.follower = follow_mod.Heeler(follow_mod.HeelConfig(side=side, max_forward=self.args.heel_speed, cam=cam, lead=self.args.heel_lead, gap=self.args.heel_gap,
-                                                             use_lidar=self.args.heel_lidar and obstacles is not None))
+        self.heel_side = side
+        geometric = self.args.heel_style == "geometric"
+        if geometric:                                   # the older position controller (camera geometry + optional lidar)
+            cam = follow_mod.Camera(z=self.args.heel_cam_height, pitch=math.radians(self.args.heel_cam_pitch))
+            self.follower = follow_mod.Heeler(follow_mod.HeelConfig(side=side, max_forward=self.args.heel_speed, cam=cam, lead=self.args.heel_lead,
+                                                                 gap=self.args.heel_gap, use_lidar=self.args.heel_lidar and obstacles is not None))
+        else:                                           # follow, but holding the person a little off-centre, on the dog's side
+            want_lidar = self.args.heel_lidar and obstacles is not None and self.args.heel_range > 0
+            self.follower = follow_mod.Follower(follow_mod.heel_follow_config(
+                side, self.args.heel_speed, self.args.heel_height, self.args.heel_offset, self.args.heel_range if want_lidar else 0.0))
         self.follower.reset()
         self.follow_res = None
         self.voice_move = None
         self.follow_mode = "heel"
         self.following = True
         self.follow_starts += 1
-        use_lidar = self.args.heel_lidar and obstacles is not None
+        use_lidar = self.args.heel_lidar and obstacles is not None and (geometric or self.args.heel_range > 0)
         if use_lidar:
             self.ensure_lidar()
             self._lidar_check = time.time() + 3.0
         self.say(f"> heeling: walking on your {side} (Space / H / any drive key stops). "
-                 + ("Camera finds and follows you; lidar only sharpens the distance" if use_lidar
-                    else "Camera only: it keeps ~1.3 m behind your hip"), GOOD)
+                 + ("Geometric mode: camera + lidar" if geometric and use_lidar else "Geometric mode: camera only" if geometric
+                    else f"Camera steers like 'follow me' and holds you {self.args.heel_range:.1f} m away; the lidar teaches it the distance" if use_lidar
+                    else "Camera steers like 'follow me' and holds you a little to the dog's " + ("right" if side == "left" else "left")), GOOD)
         self.ensure_detector()
 
     def _on_lidar(self, pts, pose) -> None:
@@ -712,9 +722,10 @@ class App:
                         if lid is not None and time.time() - lid[0] < 0.5:      # a stale cloud is worse than none
                             kw["cloud"] = obstacles.to_dog_frame(lid[1], *lid[2])
                     res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape, **kw)
-                    self.follow_sources.add(getattr(self.follower, "source", "camera"))
+                    self.follow_sources.add(getattr(self.follower, "source", getattr(self.follower, "range_src", "camera")))
                     self._det_times.append(time.time())
                     lk = self.follower.lock
+                    self._cands = (time.time(), list(lk.scores))
                     if lk.label and not lk.announced:
                         lk.announced = True
                         self.say(f"locked onto: {lk.label}. It will only follow someone who looks like this", GOOD)
@@ -1194,9 +1205,9 @@ class App:
         if self._lidar_check and now > self._lidar_check and self.following:
             self._lidar_check = None
             if self.lidar is None:
-                self.say("heel: NO lidar data from the dog, so it is heeling on the camera alone", WARN)
+                self.say("heel: NO lidar data from the dog, so it holds the distance from the camera alone (less exact)", WARN)
             else:
-                self.say("heel: lidar is streaming (it sharpens the distance; the camera still decides)", GOOD)
+                self.say("heel: lidar is streaming (it teaches the camera how far you are and warns if you are closer; the camera steers)", GOOD)
         if self.following:
             if manual:
                 self.stop_follow("manual drive key")      # the human always wins; carry on as manual below
@@ -1269,12 +1280,29 @@ class App:
             ox, oy, sc = self._xf
             x1, y1, x2, y2 = self.cal["last"][1]
             pygame.draw.rect(screen, WARN, (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 3)
+        if self.following and self._cands and now - self._cands[0] < 1.0:      # everyone the lock considered, and its verdict
+            ox, oy, sc = self._xf
+            for (x1, y1, x2, y2), dist, verdict in self._cands[1]:
+                if verdict == "target":
+                    continue                                              # drawn below, thick and green
+                col = WARN if verdict == "other" else BAD
+                pygame.draw.rect(screen, col, (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 2)
+                tag = {"other": "also matches", "colour": "NOT you (clothes)", "jump": "NOT you (too far from where you were)"}[verdict]
+                label = self.font(20).render(f"{tag} {dist:.2f}", True, (10, 10, 10))
+                lw, lh = label.get_size()
+                pygame.draw.rect(screen, col, (ox + x1 * sc, max(60, oy + y1 * sc - lh), lw + 6, lh))
+                screen.blit(label, (ox + x1 * sc + 3, max(60, oy + y1 * sc - lh)))
         res = self.follow_res
         if self.following and res and res[1].box and now - res[0] < 1.0:  # box around the tracked person
             ox, oy, sc = self._xf
             x1, y1, x2, y2 = res[1].box[:4]
             pygame.draw.rect(screen, GOOD if res[1].status != "close enough" else WARN,
                              (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 3)
+            if self.follower.lock.label:
+                label = self.font(22).render("TARGET: " + self.follower.lock.label, True, (10, 10, 10))
+                lw, lh = label.get_size()
+                pygame.draw.rect(screen, GOOD, (ox + x1 * sc, max(60, oy + y1 * sc - lh), lw + 6, lh))
+                screen.blit(label, (ox + x1 * sc + 3, max(60, oy + y1 * sc - lh)))
 
         fps = 0.0
         if len(self.frame_times) > 2 and now - self.frame_times[-1] < 2:
@@ -1285,8 +1313,8 @@ class App:
         bat = f"{self.battery}%" if self.battery is not None else "?"
         self.text(screen, self.state, 12, 8, self.state_color, 24)
         lt = [t for t in self._lidar_times if now - t < 3]
-        lidar_txt = (f"    lidar {(len(lt) - 1) / max(lt[-1] - lt[0], 1e-3):.0f}/s" if len(lt) > 2 else "    lidar: no data") if self._lidar_on else ""
-        self.text(screen, f"video {fps:.0f} fps    battery {bat}{lidar_txt}", 360, 8, TXT, 24)
+        lidar_txt = (f"  lidar {(len(lt) - 1) / max(lt[-1] - lt[0], 1e-3):.0f}/s" if len(lt) > 2 else "  lidar: no data") if self._lidar_on else ""
+        self.text(screen, f"video {fps:.0f} fps  battery {bat}{lidar_txt}", 250, 8, TXT, 24)
         d = self.desired
         status = "BUSY" if now < self.busy_until else ("balancing" if self.armed else "will balance on first drive key")
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
@@ -1335,7 +1363,7 @@ class App:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
             dt = [t for t in self._det_times if now - t < 3]
             fps = f"  [detector {(len(dt) - 1) / max(dt[-1] - dt[0], 1e-3):.0f} fps]" if len(dt) > 2 else "  [detector: no frames]"
-            banner = ((f"HEELING ({self.follower.cfg.side}): {st}{fps}" if self.follow_mode == "heel"
+            banner = ((f"HEELING ({self.heel_side}): {st}{fps}" if self.follow_mode == "heel"
                        else f"FOLLOWING: {st}{fps}"), GOOD)
         if banner:
             back = pygame.Surface((WIN_W, 40), pygame.SRCALPHA)
@@ -1596,7 +1624,8 @@ def _selftest_heel_verdict(app: "App") -> int:
         "never backed up (the person is ahead of the spot)": all(m[1] >= 0 for m in moves),
         "no walking after Space": after is not None and not any(e[0] == "move" for e in after),
         "heel ended": not app.following,
-        "the (pretend) lidar was used: the controller fused it with the camera": "camera+lidar" in app.follow_sources,
+        "heel is the follow-style controller (camera steers), with the lidar teaching the camera the distance": isinstance(app.follower, follow_mod.Follower) and bool(app.follow_sources & {"lidar", "calibrated camera", "lidar (closer)"}),
+        "it held you off to one side: the yaw it commanded aimed to keep you right of centre (a positive x offset)": app.follower.cfg.x_offset > 0,
     }
     print("\nSELFTEST-HEEL command log:", log)
     for name, ok in checks.items():
@@ -1763,6 +1792,15 @@ def main() -> int:
                    help="heel uses the camera AND the dog's lidar (the default): the camera decides who and where you are, the lidar only sharpens "
                         "the distance. UNTESTED on the real dog. If the dog sends no lidar it says so and uses the camera alone")
     p.add_argument("--no-heel-lidar", dest="heel_lidar", action="store_false", help="heel uses the camera only")
+    p.add_argument("--heel-style", choices=["follow", "geometric"], default=os.environ.get("GO2_HEEL_STYLE", "follow"),
+                   help="follow (default): heel = the same controller as 'follow me' holding you a little off-centre, on the dog's side. "
+                        "geometric: the older camera-geometry (+lidar) position controller")
+    p.add_argument("--heel-range", type=float, default=1.1,
+                   help="heel (follow style): distance to hold between the dog's centre and you, metres, measured by the LIDAR (0 = don't use the lidar). "
+                        "Leash-length close; below ~0.9 m the camera loses your feet")
+    p.add_argument("--heel-offset", type=float, default=0.18, help="heel (follow style): how far off-centre to hold you, as a fraction of the picture width")
+    p.add_argument("--heel-height", type=float, default=0.90,
+                   help="heel (follow style): stop closing in when you fill this share of the picture height (higher = closer; 0.6 is where 'follow me' stops)")
     p.add_argument("--heel-lead", type=float, default=1.3, help="heel: how far ahead of the dog's centre you are, m. Smaller = the dog walks closer, but the camera sees less of you (try 0.9)")
     p.add_argument("--heel-gap", type=float, default=0.35, help="heel: sideways distance between you and the dog, m")
     p.add_argument("--heel-cam-height", type=float, default=0.35, help="ESTIMATE: camera height above the floor, m (sets how far away the dog thinks you are)")
@@ -1813,7 +1851,6 @@ def main() -> int:
             return 2
     if any(k.startswith("selftest") and v for k, v in vars(args).items()):
         args.no_listen = True                                   # tests never open the mic
-        args.heel_lidar = args.heel_lidar or args.selftest_heel  # the heel test also exercises the (pretend) lidar
         args.box_wait = 0.4                                     # (and don't wait 3 s for a fake dog to stand)
     app = App(args, demo_image=image)
     if args.selftest_voice:

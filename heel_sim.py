@@ -102,24 +102,34 @@ SCENARIOS = {
     "90 deg turn to the left": ((1.3, -0.6), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, math.pi / 2 / 1.6), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "90 deg turn to the right": ((1.3, -0.6), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "person walks TOWARD the dog (0.4 m/s)": ((2.5, -0.6), math.pi, walk([(10, 0.4, 0)]), 10, CAM.z, 0.0),
+    "person walks straight AT the dog, dead ahead (0.4 m/s)": ((2.5, 0.0), math.pi, walk([(10, 0.4, 0)]), 10, CAM.z, 0.0),
     "faster than the dog can go (1.3 m/s)": ((1.3, -0.6), 0.0, walk([(25, 1.3, 0)]), 25, CAM.z, 0.0),
     "sharp right turn (90 deg in 1 s)": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.0, 0.6, -math.pi / 2 / 1.0), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "S-bend: right then left": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (8, 0.6, 0), (9.6, 0.6, math.pi / 2 / 1.6), (18, 0.6, 0)]), 18, CAM.z, 0.0),
+    "brisk walk at 1.0 m/s": ((1.3, -0.35), 0.0, walk([(20, 1.0, 0)]), 20, CAM.z, 0.0),
+    "walk 8 s at 0.8 m/s, then stand still 8 s": ((1.3, -0.35), 0.0, walk([(8, 0.8, 0)]), 16, CAM.z, 0.0),
     "person near a wall, camera 10 cm lower than assumed": ((1.3, -0.6), 0.0, walk([(20, 0.5, 0)]), 20, CAM.z - 0.10, 0.0),
     "camera 5 cm lower and 4 deg more downward than assumed": ((1.3, -0.6), 0.0, walk([(20, 0.6, 0)]), 20, CAM.z - 0.05, math.radians(4)),
 }
 
 
 def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lidar: bool = False, wall_y: float | None = None,
-        latency: float | None = None, det_hz: float | None = None, **cfg) -> dict:
+        latency: float | None = None, det_hz: float | None = None, controller: str = "heel", lidar_bias: float = 0.0, lidar_until: float | None = None, cam_override: tuple | None = None, **cfg) -> dict:
     (ahead0, left0), rel_heading, path, dur, cam_z, cam_pitch = SCENARIOS[name]
     rng = random.Random(seed)
+    if cam_override:
+        cam_z, cam_pitch = cam_override
     w = World(dog=[0.0, 0.0, 0.0], person=[ahead0, left0, rel_heading], cam_z=cam_z, cam_pitch=cam_pitch)
     if side == "right":
         w.person[1] = -left0
-    heeler = follow.Heeler(follow.HeelConfig(side=side, use_lidar=lidar, **cfg))
-    heeler.reset()
-    tx, ty = heeler.target
+    if controller == "follow":                              # follow.Follower with a sideways offset: the simple, image-only way
+        heeler = follow.Follower(follow.FollowConfig(**cfg))
+        heeler.reset()
+        tx, ty = 0.0, 0.0
+    else:
+        heeler = follow.Heeler(follow.HeelConfig(side=side, use_lidar=lidar, **cfg))
+        heeler.reset()
+        tx, ty = heeler.target
     latency = LATENCY if latency is None else latency
     det_hz = DET_HZ if det_hz is None else det_hz
     dt, t, next_det = 0.02, 0.0, 0.0
@@ -127,7 +137,7 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
     pending: list = []                                    # (time it takes effect, cmd)
     cmd, cmd_at = (0.0, 0.0, 0.0), -1.0
     errs, seen, lost_at, min_d = [], 0, None, 9.0
-    yaws = []
+    yaws, dists, lats, vxs = [], [], [], []
     frames = 0
     while t < dur:
         if t >= next_det:
@@ -135,11 +145,14 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
             frames += 1
             box = project(w, rng) if rng.random() > 0.05 else None
             seen += box is not None
-            cloud = lidar_cloud(w, rng, wall_y) if lidar and frames % LIDAR_EVERY == 0 else None
+            cloud = lidar_cloud(w, rng, wall_y) if lidar and frames % LIDAR_EVERY == 0 and (lidar_until is None or t < lidar_until) else None
+            if cloud is not None and lidar_bias:                # the lidar sees the FRONT of the body: nearer than the feet
+                cloud[:, 0] -= lidar_bias
             res = heeler.step([box] if box else [], (CAM.height, CAM.width, 3), now=t, cloud=cloud)
             if res.lost and lost_at is None:
                 lost_at = t
             yaws.append(res.cmd[2])
+            vxs.append(res.cmd[0])
             pending.append((t + latency, (0.0, 0.0, 0.0) if res.lost else res.cmd))
             if verbose and frames % 8 == 0:
                 ahead, left = to_dog_frame(w)
@@ -162,6 +175,8 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
         min_d = min(min_d, math.hypot(ahead, left))
         if t > dur / 2:
             errs.append((abs(ahead - tx), abs(left - ty)))
+            dists.append(math.hypot(ahead, left))
+            lats.append(abs(left))
         t += dt
     errs.sort()
     ex = sorted(e[0] for e in errs)
@@ -169,7 +184,8 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
     return {"name": name, "seen": seen / max(frames, 1), "ex_med": ex[len(ex) // 2] if ex else float("nan"),
             "ex_p95": ex[int(len(ex) * .95)] if ex else float("nan"),
             "ey_med": ey[len(ey) // 2] if ey else float("nan"), "ey_p95": ey[int(len(ey) * .95)] if ey else float("nan"),
-            "min_dist": min_d, "lost_at": lost_at, "yaw_rms": float(np.sqrt(np.mean(np.square(yaws)))) if yaws else 0.0}
+            "min_dist": min_d, "lost_at": lost_at, "yaw_rms": float(np.sqrt(np.mean(np.square(yaws)))) if yaws else 0.0,
+            "vx_std": float(np.std(vxs[len(vxs) // 2:])) if vxs else 0.0, "dist_med": float(np.median(dists)) if dists else float("nan"), "lat_med": float(np.median(lats)) if lats else float("nan")}
 
 
 def unit_checks() -> int:
@@ -242,6 +258,49 @@ def unit_checks() -> int:
     return 0 if all(checks.values()) else 1
 
 
+def follow_style_checks() -> int:
+    """The DEFAULT heel: the follow controller held off-centre, the lidar teaching the camera the distance (follow.heel_follow_config)."""
+    import dataclasses
+
+    cfg = dict(dataclasses.asdict(follow.heel_follow_config(max_forward=1.2, range_target=1.1)), controller="follow", lidar=True)
+    links = {"fast (0.15 s, 15 fps)": {}, "medium (0.22 s, 10 fps)": dict(latency=0.22, det_hz=10.0), "slow (0.3 s, 8 fps)": dict(latency=0.3, det_hz=8.0)}
+    print()
+    print("the default heel (camera steers, the lidar teaches the camera the distance, target 1.1 m), 3 random runs per cell:")
+    print(f"  {'scenario':44s} " + " ".join(f"{k:>30s}" for k in links))
+    lost_fast = lost_medium = 0
+    for name in ("walk 8 s at 0.8 m/s, then stand still 8 s", "straight at 0.7 m/s, starting in position", "brisk walk at 1.0 m/s",
+                 "stop and go (5 s walk, 4 s stand, 5 s walk)", "90 deg turn to the left", "90 deg turn to the right",
+                 "sharp right turn (90 deg in 1 s)", "S-bend: right then left"):
+        cells = []
+        for k, kw in links.items():
+            rs = [run(name, seed=sd, **cfg, **kw) for sd in (1, 2, 3)]
+            lost = sum(r["lost_at"] is not None for r in rs)
+            if k.startswith("fast"):
+                lost_fast += lost
+            elif k.startswith("medium"):
+                lost_medium += lost
+            cells.append(f"lost {lost}/3, {sum(r['dist_med'] for r in rs) / 3:.2f} m from you")
+        print(f"  {name:44s} " + " ".join(f"{c:>30s}" for c in cells))
+    W = math.radians
+    mis = [run("walk 8 s at 0.8 m/s, then stand still 8 s", seed=sd, **cfg, cam_override=(0.25, W(6))) for sd in (1, 2, 3)]
+    mis_d = sum(r["dist_med"] for r in mis) / 3
+    print(f"  camera badly mis-set (10 cm low, 6 deg tilt), lidar on, fast link: standing {mis_d:.2f} m from you, lost {sum(r['lost_at'] is not None for r in mis)}/3")
+    walls = [run("straight at 0.7 m/s, starting in position", seed=sd, **cfg, wall_y=-1.0, lidar_bias=0.10) for sd in (1, 2, 3)]
+    print(f"  wall 0.4 m behind you AND the lidar reading the front of your body: walking {sum(r['dist_med'] for r in walls) / 3:.2f} m, lost {sum(r['lost_at'] is not None for r in walls)}/3")
+    toward = min(run("person walks straight AT the dog, dead ahead (0.4 m/s)", seed=sd, **cfg)["min_dist"] for sd in (1, 2, 3))
+    print(f"  a person walking straight at the dog, dead ahead, gets no closer to it than {toward:.2f} m")
+    checks = {
+        "fast link (15 fps): never lost the person in any start, stop-and-go or turn": lost_fast == 0,
+        f"medium link (10 fps): regression guard, at most 3 of 24 runs lost (now {lost_medium}); the slow link (8 fps) is worse and only reported": lost_medium <= 3,
+        "holds you close: about 1.1 m standing even when the camera is badly mis-set (the lidar taught it)": 0.9 <= mis_d <= 1.3 and all(r["lost_at"] is None for r in mis),
+        "a wall behind you and a lidar that reads the front of your body change nothing": all(r["lost_at"] is None for r in walls) and sum(r["dist_med"] for r in walls) / 3 < 1.8,
+        "a person walking straight at the dog, dead ahead, is kept at least 0.6 m away (it backs off; without it they reached 0.11 m)": toward >= 0.6,
+    }
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
 def main() -> int:
     verbose = "-v" in sys.argv
     print(f"{'scenario':58s} {'seen':>5s}  {'ahead err m (med/p95)':>22s}  {'side err m (med/p95)':>21s}  {'closest':>7s}  gave up")
@@ -272,7 +331,7 @@ def main() -> int:
         slow_lost += lost
         print(f"  {name:44s} lost {lost}/3")
     print("\nlidar wait + loss reasons:")
-    rc = unit_checks()
+    rc = follow_style_checks() | unit_checks()
     print(f"  {'PASS' if slow_lost == 0 else 'FAIL'}  the dog kept hold of the person through every turn on the slower link ({slow_lost} of 12 runs lost them)")
     return rc or (1 if slow_lost else 0)
 

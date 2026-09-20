@@ -145,6 +145,22 @@ YOLOX-tiny on CPU (`follow.py`); no cloud. Tested on still photos and a fake rob
 
 The dog walks at your side and keeps pace as you walk, stop, and turn. `heel right` (or `--heel-side right`) puts it on your right.
 
+> **What heel is now.** Heel uses the **steering of "follow me"** (which works well), holding you a little off-centre in the picture so the dog
+> walks at your side, and it holds you **close, about a leash length** (`--heel-range 1.1`, metres from the dog's centre to you).
+> - The **camera** decides who you are and which way to turn, and does the distance control (fast and smooth).
+> - The **lidar** is coarse, so it doesn't drive the dog. Whenever it gets a reading of how far away you are, that teaches the camera how your feet's
+>   position in the picture maps to distance (a small self-calibration; no tape, no `J`). If the lidar says you're *closer* than the camera thinks, the
+>   dog believes the lidar. If the lidar drops out, the camera keeps going on what it learned, and where it has learned nothing it stops further off (~1.5 m).
+> - The dog **backs away firmly** if you walk up to it. Below about 0.9 m from the dog's centre the camera loses your feet, so don't set the range much lower.
+> - In simulation: on a 15 fps detector it never lost the person in starts, stop-and-go, 90-degree turns, a sharp turn or an S-bend; it holds about 1.1 m
+>   standing and 1.25-1.4 m while you walk (including at 1.0 m/s), even with the camera badly mis-set, a wall behind you and a lidar that sees the front of your
+>   body; a person walking straight at it stays at least 0.6 m away. **At 10 fps some turns lose you (3 of 24 runs), and at 8 fps many do**: the detector's speed
+>   (in the banner) matters more than any setting. Not tried on the real dog. Your own lidar recording showed it sees a person in *front* of the dog but not
+>   beside it, which is why it is used only for distance, along the camera's line of sight.
+> - `--heel-offset` sets how far to the side, `--heel-range 0` ignores the lidar, `--no-heel-lidar` switches it off entirely, and `--heel-style geometric`
+>   selects the older controller described below. Everything below this box (geometry, calibration with **J**) applies to that older style only. The clothing
+>   lock, the on-screen TARGET label and the loss messages apply to both.
+
 **How does it know it's beside you? It doesn't, exactly, and that is the honest limit.** The only sensor used is the front camera, and it
 is about **78 degrees wide** (calibration file: 1280x720, fx 797), so a person directly beside the dog (90 degrees) is out of frame. What it
 does instead: it keeps you near the edge of the picture on your side, works out how far away you are from where your feet meet the floor,
@@ -153,7 +169,7 @@ and holds that spot. So it walks at your side but about **1.3 m behind your hip*
 distance from your feet. If the dog is sending lidar (heel says after 3 seconds whether it is), the lidar may *sharpen that distance* along the
 same line of sight, but only if it finds a compact, person-sized blob close to the camera's own estimate that does not continue sideways
 the way a wall does. It cannot track you on its own: if the camera loses you the dog stops. `--no-heel-lidar` (in the `OPTS` line of `go2.bat`)
-turns the lidar part off.
+turns the lidar part off. **It is off by default in `go2.bat` now:** recordings show the lidar can't see a person closer than ~1 m and keeps a ghost of one for ~40 s, so it can't help heel.
 
 > An earlier version let the lidar track you by itself so the dog could walk level with you. On the real dog it locked onto a wall instead of
 > the person, so it was removed. Walking truly beside you (out of the camera's view) would need a lidar person-tracker that has been checked
@@ -165,12 +181,21 @@ turns the lidar part off.
   from how wide you look (assumes ~0.5 m, so +-0.1 m), and the person detector still fired on legs-and-hips-only crops in a one-photo test.
   Genuinely level with you needs a sensor that sees sideways: the lidar. `lidar-probe.bat 60 save` records what it sees (`lidar_recording.npz`)
   so a leg tracker can be built against real data this time.
-- **Once locked, it doesn't change person.** When heel or follow starts it takes a clothing fingerprint (colour of your top and of your
-  trousers) and says what it locked onto ("locked onto: red top, blue trousers"). From then on it only accepts someone who matches. If nobody
-  does it treats you as not seen (stops, searches, gives up after a moment); it never picks up a stranger. Clothes look different as the dog
-  closes in (whole body far away, only legs and hips up close), so someone who stays right where you were is kept unless dressed clearly
-  differently, and the fingerprint keeps adapting. Tested with synthetic people crossing paths (0 switches) and on a real photo cropped to
-  legs-only. Limits: someone dressed the same looks the same to it; a big lighting change can make you stop matching (it then stops rather than guesses).
+- **Once locked, it doesn't change person.** When heel or follow starts it looks for the person nearest the middle of the picture (not just the
+  biggest), waits until the same person has been the clear candidate for a few frames, then takes a clothing fingerprint (colour of the top and of the
+  trousers) and says what it locked onto ("locked onto: red top, blue trousers"). From then on:
+  - **Colour:** it keeps a small bank of fingerprints from different views (whole body far away, only legs and hips close up). The first is never
+    replaced. New views are learned only gradually and only while the person is the *only one in view*, so the bank cannot drift onto a stranger or
+    be tainted by someone walking in front of them. Someone standing where the person just was is judged a little more gently; everyone else strictly.
+  - **Plausibility:** a detection somewhere the person could not have got to (measured in the dog's own frame, so the dog turning doesn't matter) is
+    refused unless the clothes match almost exactly.
+  - **If nobody matches** it treats the person as not seen (stops, searches, gives up after a moment). It never picks up a stranger.
+  - **The window shows its decisions:** a green box labelled `TARGET: <clothes>` on the person it follows; other people get a red box saying
+    "NOT you (clothes) 0.62" or "NOT you (too far from where you were)", or an orange "also matches".
+  Tested with synthetic people: crossing paths, a look-alike beside the target, the view changing gradually to legs-only, a stranger who appears
+  far away, a stranger who takes the place of someone who left (0 switches). **Known limit:** someone dressed like the target *and* standing where they
+  were can still be accepted (similar clothes scored 0.46 against the 0.50 limit). A big lighting change can make the right person stop matching (it
+  then stops rather than guesses). Not yet tried on the dog.
 - **When the camera loses you** (you end up level with the dog, out of its view) and the lidar still sees someone where you were, the dog
   **stands still and waits** up to 6 s instead of giving up. The lidar only answers "is someone there?"; it never steers the dog. A wall is
   not mistaken for a person. If the camera loses you for another reason, the window says why (for example "no person detected" or "1 person(s)
@@ -206,7 +231,11 @@ Bends need a corridor at least ~1 m wide (the safety strip is 0.6 m). Close the 
 1. `corridor-dry.bat`: with the dog standing in a corridor, prints the left / right distances, how much room there is in the direction it would steer, and the command it *would* send. Never moves the dog. Check the numbers against a tape measure.
 2. `corridor.bat`: really walks (0.2 m/s, 40 s max; change `--speed` in its `OPTS` line). **Ctrl-C** stops it; it also stands still if the lidar goes quiet for half a second.
 
-Tested only against simulated corridors (`python corridor.py`), never on the real dog. Whether the lidar messages hold one scan or a cumulative map, and how dense they are near the dog, is still unchecked: run `lidar-probe.bat` first.
+Tested against simulated corridors (`python corridor.py`) and briefly on the real dog. **What recordings of the dog's lidar (`lidar-probe.bat`) showed:**
+each message is a persistent map (~13-40k points, ~7.7 per second), not one scan; nothing above ~1.2 m comes back; a person standing 2 m away shows up as a
+solid blob, but one walking about barely registers, and a "ghost" of someone who left lingers for ~40 s; and nothing standing up was ever seen closer than
+~1 m to the dog (a person 0.6 m beside it never appeared). So walls closer than ~1 m may be invisible to the corridor walker, and lidar can't track a person
+at heel or guide-dog distance. The lidar also went silent once after 49 s and once never started: `lidar-probe.bat` and `corridor.bat` now reset it (off, then on) when that happens.
 
 ## Object detection (`O`)
 
