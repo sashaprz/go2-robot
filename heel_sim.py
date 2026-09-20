@@ -103,13 +103,15 @@ SCENARIOS = {
     "90 deg turn to the right": ((1.3, -0.6), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (16, 0.6, 0)]), 16, CAM.z, 0.0),
     "person walks TOWARD the dog (0.4 m/s)": ((2.5, -0.6), math.pi, walk([(10, 0.4, 0)]), 10, CAM.z, 0.0),
     "faster than the dog can go (1.3 m/s)": ((1.3, -0.6), 0.0, walk([(25, 1.3, 0)]), 25, CAM.z, 0.0),
+    "sharp right turn (90 deg in 1 s)": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.0, 0.6, -math.pi / 2 / 1.0), (16, 0.6, 0)]), 16, CAM.z, 0.0),
+    "S-bend: right then left": ((1.3, -0.35), 0.0, walk([(4, 0.6, 0), (5.6, 0.6, -math.pi / 2 / 1.6), (8, 0.6, 0), (9.6, 0.6, math.pi / 2 / 1.6), (18, 0.6, 0)]), 18, CAM.z, 0.0),
     "person near a wall, camera 10 cm lower than assumed": ((1.3, -0.6), 0.0, walk([(20, 0.5, 0)]), 20, CAM.z - 0.10, 0.0),
     "camera 5 cm lower and 4 deg more downward than assumed": ((1.3, -0.6), 0.0, walk([(20, 0.6, 0)]), 20, CAM.z - 0.05, math.radians(4)),
 }
 
 
 def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lidar: bool = False, wall_y: float | None = None,
-        **cfg) -> dict:
+        latency: float | None = None, det_hz: float | None = None, **cfg) -> dict:
     (ahead0, left0), rel_heading, path, dur, cam_z, cam_pitch = SCENARIOS[name]
     rng = random.Random(seed)
     w = World(dog=[0.0, 0.0, 0.0], person=[ahead0, left0, rel_heading], cam_z=cam_z, cam_pitch=cam_pitch)
@@ -118,15 +120,18 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
     heeler = follow.Heeler(follow.HeelConfig(side=side, use_lidar=lidar, **cfg))
     heeler.reset()
     tx, ty = heeler.target
+    latency = LATENCY if latency is None else latency
+    det_hz = DET_HZ if det_hz is None else det_hz
     dt, t, next_det = 0.02, 0.0, 0.0
     vel = [0.0, 0.0, 0.0]
     pending: list = []                                    # (time it takes effect, cmd)
     cmd, cmd_at = (0.0, 0.0, 0.0), -1.0
     errs, seen, lost_at, min_d = [], 0, None, 9.0
+    yaws = []
     frames = 0
     while t < dur:
         if t >= next_det:
-            next_det += 1 / DET_HZ
+            next_det += 1 / det_hz
             frames += 1
             box = project(w, rng) if rng.random() > 0.05 else None
             seen += box is not None
@@ -134,7 +139,8 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
             res = heeler.step([box] if box else [], (CAM.height, CAM.width, 3), now=t, cloud=cloud)
             if res.lost and lost_at is None:
                 lost_at = t
-            pending.append((t + LATENCY, (0.0, 0.0, 0.0) if res.lost else res.cmd))
+            yaws.append(res.cmd[2])
+            pending.append((t + latency, (0.0, 0.0, 0.0) if res.lost else res.cmd))
             if verbose and frames % 8 == 0:
                 ahead, left = to_dog_frame(w)
                 print(f"  t={t:5.1f}  person ({ahead:+.2f},{left:+.2f})  cmd ({res.cmd[0]:+.2f},{res.cmd[1]:+.2f},{res.cmd[2]:+.2f})  {res.status}")
@@ -163,7 +169,7 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
     return {"name": name, "seen": seen / max(frames, 1), "ex_med": ex[len(ex) // 2] if ex else float("nan"),
             "ex_p95": ex[int(len(ex) * .95)] if ex else float("nan"),
             "ey_med": ey[len(ey) // 2] if ey else float("nan"), "ey_p95": ey[int(len(ey) * .95)] if ey else float("nan"),
-            "min_dist": min_d, "lost_at": lost_at}
+            "min_dist": min_d, "lost_at": lost_at, "yaw_rms": float(np.sqrt(np.mean(np.square(yaws)))) if yaws else 0.0}
 
 
 def unit_checks() -> int:
@@ -259,8 +265,16 @@ def main() -> int:
     r = run("straight at 0.7 m/s, starting in position", side="right")
     print(f"{'(mirror check) same walk, dog on the person\'s right':58s} {r['seen']:5.0%}  {r['ex_med']:10.2f} /{r['ex_p95']:6.2f}  "
           f"{r['ey_med']:10.2f} /{r['ey_p95']:6.2f}  {r['min_dist']:6.2f}m  " + (f"at {r['lost_at']:.1f} s" if r["lost_at"] else "no"))
+    print("\nturns on a slower link (0.3 s lag, 8 fps detector), 3 random runs each; 'lost' = the dog gave up on the person:")
+    slow_lost = 0
+    for name in ("90 deg turn to the left", "90 deg turn to the right", "sharp right turn (90 deg in 1 s)", "S-bend: right then left"):
+        lost = sum(run(name, seed=sd, latency=0.3, det_hz=8.0)["lost_at"] is not None for sd in (1, 2, 3))
+        slow_lost += lost
+        print(f"  {name:44s} lost {lost}/3")
     print("\nlidar wait + loss reasons:")
-    return unit_checks()
+    rc = unit_checks()
+    print(f"  {'PASS' if slow_lost == 0 else 'FAIL'}  the dog kept hold of the person through every turn on the slower link ({slow_lost} of 12 runs lost them)")
+    return rc or (1 if slow_lost else 0)
 
 
 if __name__ == "__main__":

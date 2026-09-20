@@ -176,8 +176,12 @@ turns the lidar part off.
   not mistaken for a person. If the camera loses you for another reason, the window says why (for example "no person detected" or "1 person(s)
   seen but not matching the lock, closest colour match 0.52"), and the banner shows the detector's speed in fps.
 - It follows your pace up to `--heel-speed` (default 0.8 m/s). Walk faster and it falls behind, then gives up ("lost the person") and stands.
-- **Turning away from the dog's side** (you turn right, dog on your left) swings you out of its view: it stops and searches, then gives up
-  after 1.5 s. Turning toward it works. Simulated in `heel_sim.py`; not yet tried on the dog.
+- **Turning.** The camera is narrow, so when you turn you swing toward the edge of its picture. The dog now turns faster (up to 1.0 rad/s) and
+  steers toward where you're heading in the picture, not where you were, which makes up for the delay between the camera, the detector and the dog.
+  In simulation it kept hold of you through 90-degree turns either way, a sharp turn (90 degrees in one second) and an S-bend, including on a slower
+  link (8 fps detector, 0.3 s lag). If the detector runs at only ~5 fps it loses you on turns anyway: the fps is in the banner, and the voice model
+  competes with the detector for the CPU (`--whisper-model base.en` or `--no-listen` in the `OPTS` line of `go2.bat` frees some). A turn *toward*
+  the dog still crowds it (personal-space rule backs it off). Not yet tried on the dog.
 - **Calibrating the distance, no tape: press `J`** (in `go2.bat`, no flags). Stand about 2 m in front of the dog in the open (a metre from walls and
   furniture) with your feet in the picture and press J; the camera sees where your feet land and the **lidar measures how far away you are**. Then move to
   a clearly different distance (at least 0.5 m further or closer, between 1 and 3.5 m) and press J again; three spots in all. It works out the camera's

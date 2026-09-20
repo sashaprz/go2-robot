@@ -453,12 +453,13 @@ class HeelConfig:
     max_forward: float = 0.8     # m/s hard caps
     max_back: float = 0.25
     max_strafe: float = 0.4
-    max_turn: float = 0.6        # rad/s
+    max_turn: float = 1.0        # rad/s
     kx: float = 1.2              # m/s per metre of along-track error
     ix: float = 0.5              # leaky integral term: learns the person's walking speed so the dog doesn't trail them
     ky: float = 1.0              # m/s per metre of sideways error
-    k_turn: float = 1.5          # rad/s per rad the person is outside the turn window
-    turn_window: float = math.radians(12)   # only turn to keep them in view; the dog otherwise keeps its own heading
+    k_turn: float = 3.0          # rad/s per rad the person is outside the turn window
+    turn_window: float = math.radians(6)    # only turn to keep them in view; the dog otherwise keeps its own heading
+    lead_time: float = 0.4       # s: steer toward where they WILL be in the picture (their swing rate x this): makes up for detector + network lag
     dead_x: float = 0.10
     dead_y: float = 0.08
     accel: float = 1.5           # m/s^2 limit on speeding up (slowing down is immediate)
@@ -493,12 +494,16 @@ class Heeler:
     last_bearing: float = 0.0
     last_step: float | None = None
     source: str = "camera"                   # "camera" or "camera+lidar" (the lidar sharpened the distance this step)
+    prev_bearing: float | None = None
+    prev_bearing_t: float = 0.0
+    bearing_rate: float = 0.0                # how fast they swing across the picture, rad/s (smoothed)
     lock: PersonLock = field(default_factory=PersonLock)
 
     def reset(self) -> None:
         self.last_box, self.last_seen = None, time.time()
         self.pos, self.acc, self.last_cmd, self.last_step = None, 0.0, (0.0, 0.0, 0.0), None
         self.source = "camera"
+        self.prev_bearing, self.bearing_rate = None, 0.0
         self.lock.reset()
 
     @property
@@ -531,6 +536,13 @@ class Heeler:
 
         p = locate(tgt, frame_shape, c.cam)
         self.last_bearing = p.bearing
+        if self.prev_bearing is not None and 0.01 < now - self.prev_bearing_t < 0.3:      # how fast they are swinging across the picture
+            gap = now - self.prev_bearing_t
+            k = 1 - math.exp(-gap / 0.25)
+            self.bearing_rate += k * (_clip((p.bearing - self.prev_bearing) / gap, -2.0, 2.0) - self.bearing_rate)
+        elif self.prev_bearing is None or now - self.prev_bearing_t >= 0.3:
+            self.bearing_rate = 0.0
+        self.prev_bearing, self.prev_bearing_t = p.bearing, now
         x, y, self.source = p.x, p.y, "camera"
         if c.use_lidar and cloud is not None:
             lens_x = c.cam.x_off
@@ -554,7 +566,8 @@ class Heeler:
         if self.pos[0] > 0:
             vx = min(vx, max(0.0, d - 0.4))                          # someone in front and close: no forward speed left
         want = math.atan2(ty, tx - c.cam.x_off)                      # the bearing that spot has from the lens
-        yaw = _clip(c.k_turn * _dead(p.bearing - want, c.turn_window), -c.max_turn, c.max_turn)   # turn only to keep them in view
+        ahead = p.bearing + self.bearing_rate * c.lead_time             # where they will be in the picture by the time the dog acts
+        yaw = _clip(c.k_turn * _dead(ahead - want, c.turn_window), -c.max_turn, c.max_turn)   # turn only to keep them in view
         cmd = tuple(n if abs(n) <= abs(o) or n * o < 0 else o + math.copysign(min(abs(n - o), lim * dt), n - o)
                     for n, o, lim in zip((vx, vy, yaw), self.last_cmd, (c.accel, c.accel, 3.0)))
         self.last_cmd = cmd
