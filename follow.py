@@ -240,19 +240,29 @@ def describe(rgb: np.ndarray, box) -> str:
 
 @dataclass
 class PersonLock:
-    """Chooses which detection is the locked person. Needs the camera picture; without one it falls back to position only."""
-    max_dist: float = 0.40        # a stranger must look at least this different to be turned down (far-away lookalikes are not)
-    near_dist: float = 0.55       # more forgiving when the box sits right where the person just was (lighting changes)
+    """Chooses which detection is the locked person. Needs the camera picture; without one it falls back to position only.
+
+    Clothes look different as the view changes (whole body far away, only legs and hips up close), so colour alone would
+    drop the right person. Two rules: someone who stays right where the person just was is accepted unless they are dressed
+    clearly differently (`near_dist`), and the fingerprint keeps adapting to what the camera now sees of the person."""
+    max_dist: float = 0.40        # anywhere else in the picture: a stranger must look at least this different to be turned down
+    near_dist: float = 0.70       # right where the person just was: only someone clearly different (a stranger walking through) is refused
     ref: tuple | None = None
     label: str = ""               # what it locked onto, e.g. "dark blue top, grey trousers"
     announced: bool = False
     rejected: int = 0             # how many people were turned down on the last call
+    closest_reject: float = 1.0   # the best colour match among those turned down (for the "why did it lose me" message)
 
     def reset(self) -> None:
-        self.ref, self.label, self.announced, self.rejected = None, "", False, 0
+        self.ref, self.label, self.announced, self.rejected, self.closest_reject = None, "", False, 0, 1.0
+
+    def why_none(self, n_dets: int) -> str:
+        if n_dets == 0:
+            return "no person detected"
+        return f"{self.rejected} person(s) seen but not matching the lock, closest colour match {self.closest_reject:.2f}"
 
     def choose(self, dets, frame, last_box, w: int, min_iou: float):
-        self.rejected = 0
+        self.rejected, self.closest_reject = 0, 1.0
         if not dets:
             return None
         if self.ref is None or frame is None:
@@ -268,19 +278,22 @@ class PersonLock:
             sig = signature(frame, d)
             dist = 0.5 if sig is None else signature_distance(self.ref, sig)
             iou = _iou(d, last_box) if last_box is not None else 0.0
-            if dist > (self.near_dist if iou > 0.5 else self.max_dist):
-                self.rejected += 1
-                continue
             lc = (last_box[0] + last_box[2]) / 2 if last_box is not None else w / 2
-            cost = dist + 0.6 * (1 - iou) + 0.5 * min(1.0, abs((d[0] + d[2]) / 2 - lc) / (0.25 * w))
+            shift = abs((d[0] + d[2]) / 2 - lc) / (0.25 * w)       # 1.0 = a quarter of the picture away from where they were
+            continuous = last_box is not None and (iou > 0.3 or shift < 0.6)
+            if dist > (self.near_dist if continuous else self.max_dist):
+                self.rejected += 1
+                self.closest_reject = min(self.closest_reject, dist)
+                continue
+            cost = dist + 0.6 * (1 - iou) + 0.5 * min(1.0, shift)
             if cost < best_cost:
                 best, best_cost, best_dist = d, cost, dist
-        if best is not None and best_dist < 0.25:                  # the same person, clearly: keep the fingerprint fresh (light changes)
+        if best is not None:                                       # keep the fingerprint current: faster when the view has changed a lot
             sig = signature(frame, best)
             if sig is not None:
-                self.ref = tuple(0.95 * r + 0.05 * n for r, n in zip(self.ref, sig))
+                k = 0.05 if best_dist < 0.25 else 0.15
+                self.ref = tuple((1 - k) * r + k * n for r, n in zip(self.ref, sig))
         return best
-
 
 
 @dataclass
@@ -303,9 +316,10 @@ class Follower:
         c = self.cfg
         tgt = self._pick(dets, w, frame)
         if tgt is None:
+            why = self.lock.why_none(len(dets))
             if now - self.last_seen > c.lost_after:
-                return FollowResult(status="lost the person", lost=True)
-            return FollowResult(status="searching ...")      # brief dropout: stand still, keep the lock
+                return FollowResult(status=f"lost the person: {why}", lost=True)
+            return FollowResult(status=f"searching ... ({why})")      # brief dropout: stand still, keep the lock
         self.last_box, self.last_seen = tgt, now
 
         err = ((tgt[0] + tgt[2]) / 2 - w / 2) / w            # + means the person is right of centre
@@ -373,6 +387,56 @@ def locate(box, frame_shape, cam: Camera | None = None) -> Placement:
     return Placement(x=cam.x_off + fwd * t, y=-X * t, bearing=math.atan(-X), feet_clipped=clipped)
 
 
+CAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "heel_calibration.json")
+
+
+def solve_camera(samples, frame_h: int = 720, cam: Camera | None = None):
+    """Work out the camera height (m) and downward tilt (rad) from people standing at KNOWN distances.
+
+    samples: [(row of the person's feet in the picture, their distance straight ahead of the lens in m), ...]. Two or more
+    at clearly different distances give both numbers; a single one assumes the camera is level. Returns (height, tilt, rms
+    error in m) or None when the numbers make no physical sense (someone measured wrong, feet not actually visible)."""
+    cam = cam or Camera()
+    sc = frame_h / cam.height
+    fy, cy = cam.fy * sc, cam.cy * sc
+    ys = [(row - cy) / fy for row, _ in samples]
+    ds = [d for _, d in samples]
+    tilts = [0.0] if len(samples) == 1 else [math.radians(t / 4) for t in range(-40, 101)]      # -10 .. +25 degrees
+    best = None
+    for tilt in tilts:
+        sp, cp = math.sin(tilt), math.cos(tilt)
+        if any(y * cp + sp <= 1e-3 for y in ys):
+            continue
+        ks = [(cp - y * sp) / (y * cp + sp) for y in ys]                     # forward distance = height * k
+        z = sum(d * k for d, k in zip(ds, ks)) / sum(k * k for k in ks)
+        err = sum((d - z * k) ** 2 for d, k in zip(ds, ks)) + 1e-3 * tilt ** 2   # (tiny pull toward level: measurement noise)
+        if best is None or err < best[0]:
+            best = (err, z, tilt)
+    if best is None or not (0.15 <= best[1] <= 0.6) or not (math.radians(-8) <= best[2] <= math.radians(22)):
+        return None
+    rms = math.sqrt(best[0] / len(samples))
+    return None if rms > 0.12 else (best[1], best[2], rms)      # the numbers don't fit any camera: a measurement was wrong
+
+
+def load_calibration(path: str = CAL_PATH):
+    """(camera height m, tilt degrees) saved by the in-app calibration, or None."""
+    try:
+        import json
+
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return float(d["cam_height"]), float(d["cam_pitch_deg"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def save_calibration(height: float, pitch_deg: float, path: str = CAL_PATH) -> None:
+    import json
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"cam_height": round(height, 3), "cam_pitch_deg": round(pitch_deg, 2)}, f)
+
+
 def _dead(e: float, d: float) -> float:
     return 0.0 if abs(e) <= d else e - math.copysign(d, e)
 
@@ -384,8 +448,8 @@ def _clip(v: float, lo: float, hi: float) -> float:
 @dataclass
 class HeelConfig:
     side: str = "left"           # the side of the PERSON the dog walks on ("left" is the traditional heel side)
-    lead: float = 1.1            # m the person is ahead of the dog's centre. Smaller = closer, but more of them is out of the picture
-    gap: float = 0.5             # m sideways between them
+    lead: float = 1.3            # m the person is ahead of the dog's centre. Smaller = closer, but more of them is out of the picture
+    gap: float = 0.35            # m sideways between them (bigger = more beside you, but nearer the edge of the picture)
     max_forward: float = 0.8     # m/s hard caps
     max_back: float = 0.25
     max_strafe: float = 0.4
@@ -407,6 +471,7 @@ class HeelConfig:
     # lidar: an optional distance sharpener (needs a cloud passed to step()); the CAMERA still decides who and where
     use_lidar: bool = False
     lidar_window: float = 0.6    # m: the lidar may move the camera's distance estimate by at most this much
+    beside_hold: float = 6.0     # s: if the camera loses them but the lidar sees someone where they were, stand still this long before giving up
     personal_space: float = 0.55  # m: closer than this the dog backs away from the person, whatever else it is doing
     max_repel: float = 0.5       # m/s: fastest it will back off (a person stepping toward it is faster than the normal backing cap)
 
@@ -451,12 +516,17 @@ class Heeler:
         tgt = self.lock.choose(dets, frame, self.last_box, frame_shape[1], c.min_iou_or_dist)
         if tgt is None:
             gone = now - self.last_seen
-            if gone > c.lost_after:
-                return FollowResult(status="lost the person", lost=True)
+            why = self.lock.why_none(len(dets))
             if gone <= c.coast:
-                return FollowResult(cmd=self.last_cmd, status="searching ...")     # one missed frame: keep walking
+                return FollowResult(cmd=self.last_cmd, status=f"searching ... ({why})")     # one missed frame: keep walking
+            if (c.use_lidar and cloud is not None and self.pos is not None and gone <= c.beside_hold
+                    and obstacles.person_near(cloud, self.pos, radius=1.3)):   # they've walked on/back to the dog's side since
+                self.last_cmd = (0.0, 0.0, 0.0)                    # the lidar sees someone right where they were: wait, don't give up
+                return FollowResult(status="waiting: the lidar sees someone where you were (out of the camera's view)")
+            if gone > c.lost_after:
+                return FollowResult(status=f"lost the person: {why}", lost=True)
             self.last_cmd = (0.0, 0.0, 0.0)
-            return FollowResult(cmd=(0.0, 0.0, math.copysign(c.search_turn, self.last_bearing)), status="searching ...")
+            return FollowResult(cmd=(0.0, 0.0, math.copysign(c.search_turn, self.last_bearing)), status=f"searching ... ({why})")
         self.last_box, self.last_seen = tgt, now
 
         p = locate(tgt, frame_shape, c.cam)

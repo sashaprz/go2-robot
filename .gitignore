@@ -8,3 +8,7 @@ wheel_tmp/
 .env
 *.env
 .dimos.env
+
+lidar_recording.npz
+lidar_probe_report.txt
+heel_calibration.json

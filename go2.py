@@ -82,6 +82,10 @@ CONFIRM_TRICKS = {
 }
 ROUTINE_KEY = pygame.K_r
 FOLLOW_KEY = pygame.K_t
+CALIB_KEY = pygame.K_j    # teach the dog how far away you are (two marked spots), for heel
+CAL_SPOTS = (1.2, 2.4)    # metres straight ahead of the dog's nose (where the camera is) to stand for calibration
+CAL_LIDAR_SPOTS = 3       # calibrating by lidar: this many spots at clearly different distances
+CAL_SECS = 1.5            # how long to watch you at each spot
 HEEL_KEY = pygame.K_h     # walk at the person's side (asks for Y, like follow)
 VOICE_KEY = pygame.K_v   # hold to talk
 OBJECTS_KEY = pygame.K_o  # toggle the object-detection overlay
@@ -365,6 +369,11 @@ class App:
         self._voice_deadline = 0.0
         self.heard_log: list = []           # (transcript, matched label) - used by the self-test
         self.follow_starts = 0              # how many times follow actually started - self-test
+        self.all_said: list = []            # everything said (self-tests)
+        self._lidar_times: deque = deque(maxlen=40)    # for the lidar rate readout
+        self.cal_events: list = []          # (self-test) what calibration did
+        self.cal = None                     # calibration in progress: {step, phase, boxes, samples, until, last}
+        self._det_times: deque = deque(maxlen=30)   # when the detector last finished (for the fps readout)
         self._lock_warned = 0.0             # last time we said we were ignoring a stranger
         self._lidar_on = False              # has the lidar feed been started?
         self._lidar_check = None            # when to report whether lidar data is arriving
@@ -391,7 +400,12 @@ class App:
         return any(k.startswith("selftest") and v for k, v in vars(self.args).items())
 
     # -- feedback ---------------------------------------------------------------------------------------
+    def messages_text(self) -> list:
+        return [m[1] for m in self.messages] + list(getattr(self, "all_said", []))
+
     def say(self, text: str, color=TXT) -> None:
+        if _SELFTEST:
+            self.all_said.append(text)
         print(text, flush=True)
         self.messages.append((time.time(), text, color))
 
@@ -421,6 +435,8 @@ class App:
             self.robot = r
             self.state, self.state_color = ("DEMO (fake robot)" if isinstance(r, FakeRobot) else "connected"), GOOD
             self.say("Connected. Keep the area around the dog clear.", GOOD)
+            if getattr(self.args, "cal_loaded", None):
+                self.say(f"heel: using your saved camera calibration ({self.args.cal_loaded[0] * 100:.0f} cm high, tilted {self.args.cal_loaded[1]:.1f} deg). J recalibrates")
             try:
                 self.say(f"dog motion mode: {r.motion_mode()}")
             except Exception as e:  # noqa: BLE001
@@ -515,6 +531,110 @@ class App:
         self.say("> following the nearest person (Space / T / any drive key stops)", GOOD)
         self.ensure_detector()
 
+    # -- calibration: teach the dog how far away you are (camera height / tilt), no tape-and-flags needed ------
+    def start_calibration(self) -> None:
+        if not self.follow_available():
+            return
+        if self.robot is None or self.latest is None:
+            self.say("not connected / no video yet", WARN)
+            return
+        self.stop_follow("calibrating")
+        self.cal = {"step": 0, "phase": "wait", "mode": None, "total": CAL_LIDAR_SPOTS, "boxes": [], "clouds": [], "samples": [],
+                    "until": 0.0, "last": None, "h": 0}
+        self.ensure_detector()
+        if obstacles is not None:
+            self.ensure_lidar()
+        self.say("CALIBRATION: stand about 2 m in front of the dog, in the open (a metre from walls and furniture), feet in the picture, "
+                 "then press J. Space cancels.", WARN)
+
+    def _lidar_fresh(self) -> bool:
+        lid = self.lidar
+        return lid is not None and time.time() - lid[0] < 1.0
+
+    def calibration_press(self) -> None:
+        cal = self.cal
+        if cal is None or cal["phase"] != "wait":
+            return
+        if cal["mode"] is None:                          # first press: use the lidar if the dog is sending it, else the tape
+            if obstacles is not None and self._lidar_fresh():
+                cal["mode"], cal["total"] = "lidar", CAL_LIDAR_SPOTS
+                self.say(f"calibration by LIDAR (no tape): {CAL_LIDAR_SPOTS} spots, each at a clearly different distance (at least 0.5 m apart, "
+                         "between 1 and 3.5 m)")
+            else:
+                cal["mode"], cal["total"] = "tape", len(CAL_SPOTS)
+                self.say("no lidar data from the dog, so calibration needs a TAPE. " + f"Stand {CAL_SPOTS[0]} m straight in front of its nose, then press J", WARN)
+                return
+        cal["phase"], cal["boxes"], cal["clouds"], cal["until"] = "collect", [], [], time.time() + CAL_SECS
+        self.say("measuring: stand still ...")
+
+    def update_calibration(self, now: float) -> None:
+        cal = self.cal
+        if cal is None or cal["phase"] != "collect":
+            return
+        if self._lidar_fresh() and obstacles is not None and len(cal["clouds"]) < 12 and (not cal["clouds"] or cal["clouds"][-1][0] != self.lidar[0]):
+            cal["clouds"].append((self.lidar[0], obstacles.to_dog_frame(self.lidar[1], *self.lidar[2])))
+        if now < cal["until"]:
+            return
+        boxes, cal["phase"] = cal["boxes"], "wait"
+        if len(boxes) < 5:
+            self.say(f"calibration: only saw you in {len(boxes)} frames (need 5+). Is the detector loaded and your whole body in view? Press J to retry", WARN)
+            return
+        h, w = boxes[0][1]
+        rows = sorted(b[0][3] for b in boxes)
+        row = rows[len(rows) // 2]                                   # median row of the feet
+        if row > h - 6:
+            self.say("calibration: your feet are cut off at the bottom of the picture. Step back so they show, then press J", WARN)
+            return
+        if cal["mode"] == "lidar":
+            xs = sorted((b[0][0] + b[0][2]) / 2 for b in boxes)
+            cam = follow_mod.Camera()
+            bearing = math.atan((cam.cx * w / cam.width - xs[len(xs) // 2]) / (cam.fx * w / cam.width))     # + = left of the picture's centre
+            ranges = [r for r in (obstacles.refine_range(c[1], (cam.x_off, 0.0), bearing, 2.5, window=2.0) for c in cal["clouds"]) if r is not None]
+            if len(ranges) < 3:
+                self.say(f"calibration: the lidar gave {len(cal['clouds'])} scans but only {len(ranges)} showed a person-sized blob where the camera sees you. "
+                         "Stand in the open (a metre from walls and furniture), 1 to 3.5 m ahead, then press J. "
+                         + ("(No lidar scans arrived at all: is the lidar on?)" if not cal["clouds"] else ""), WARN)
+                return
+            dist = sorted(ranges)[len(ranges) // 2] * math.cos(bearing)     # straight ahead of the lens, as the solver wants
+            if any(abs(dist - d) < 0.5 for _, d in cal["samples"]):
+                self.cal_events.append(("same_distance",))
+                self.say(f"that's about the same distance as a spot already recorded ({dist:.2f} m by the lidar). Move at least 0.5 m closer or "
+                         "further, then press J", WARN)
+                return
+            cal["samples"].append((row, dist))
+            self.say(f"spot {len(cal['samples'])} of {cal['total']}: the lidar puts you {dist:.2f} m ahead (feet at picture row {row:.0f}).")
+        else:
+            cal["samples"].append((row, CAL_SPOTS[cal["step"]]))
+        self.cal_events.append(("spot", row))
+        cal["h"] = h
+        cal["step"] += 1
+        if cal["step"] < cal["total"]:
+            self.say(("Now stand at a clearly different distance" if cal["mode"] == "lidar" else f"Now stand {CAL_SPOTS[cal['step']]} m straight in front of its nose")
+                     + f" (spot {cal['step'] + 1} of {cal['total']}), then press J", WARN)
+            return
+        if self.finish_calibration(cal["samples"], h):
+            self.cal = None
+        else:
+            cal["step"], cal["samples"] = 0, []
+
+    def finish_calibration(self, samples, frame_h: int) -> bool:
+        """Solve for the camera height / tilt from the measurements, apply them now and save them. False = refused."""
+        res = follow_mod.solve_camera(samples, frame_h=frame_h)
+        self.cal_events.append(("solved" if res else "refused",))
+        if res is None:
+            self.say("calibration: those two measurements don't fit any camera (a distance measured wrong, or your feet weren't really visible). "
+                     f"Nothing was changed. Start again: stand {CAL_SPOTS[0]} m in front of its nose and press J", BAD)
+            return False
+        z, tilt, rms = res
+        self.args.heel_cam_height, self.args.heel_cam_pitch = z, math.degrees(tilt)
+        try:
+            follow_mod.save_calibration(z, math.degrees(tilt), **({"path": "/tmp/go2_cal_test.json"} if self.is_selftest() else {}))
+            saved = "Saved: go2.bat loads it automatically from now on."
+        except OSError as e:
+            saved = f"(couldn't save it: {e})"
+        self.say(f"CALIBRATED: camera {z * 100:.0f} cm off the floor, tilted {math.degrees(tilt):.1f} deg down (fit error {rms * 100:.0f} cm). {saved}", GOOD)
+        return True
+
     def start_heel(self, side: str = "") -> None:
         """Walk at the person's side. Same plumbing as follow (self.follower.step() gives the velocity), different controller."""
         if self.upright:
@@ -539,13 +659,17 @@ class App:
                     else "Camera only: it keeps ~1.3 m behind your hip"), GOOD)
         self.ensure_detector()
 
+    def _on_lidar(self, pts, pose) -> None:
+        self.lidar = (time.time(), pts, pose)
+        self._lidar_times.append(self.lidar[0])
+
     def ensure_lidar(self) -> None:
         """Start the dog's lidar feed the first time heel needs it (not at connect: it is extra traffic on the link)."""
         if self._lidar_on or self.robot is None or not hasattr(self.robot, "on_lidar"):
             return
         self._lidar_on = True
         try:
-            self.robot.on_lidar(lambda pts, pose: setattr(self, "lidar", (time.time(), pts, pose)))
+            self.robot.on_lidar(self._on_lidar)
         except Exception as e:  # noqa: BLE001
             self._lidar_on = False
             self.say(f"couldn't start the lidar: {e}. Heel will use the camera only", WARN)
@@ -563,13 +687,21 @@ class App:
         last_seq = -1
         while not self.stop_evt.is_set():
             det = self.detector
-            if not (self.following or self.objects_on) or det is None or self.latest is None or self.frame_seq == last_seq:
+            if not (self.following or self.objects_on or self.cal) or det is None or self.latest is None or self.frame_seq == last_seq:
                 time.sleep(0.03)
                 continue
             with self.frame_lock:
                 frame, last_seq = self.latest, self.frame_seq
             try:
                 dets = det.detect_objects(frame)
+                cal = self.cal
+                if cal is not None:
+                    ppl = follow_mod.people(dets, frame.shape[0])
+                    if ppl:
+                        big = max(ppl, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
+                        cal["last"] = (time.time(), big[:4])
+                        if cal["phase"] == "collect":
+                            cal["boxes"].append((big[:4], frame.shape[:2]))
                 if self.objects_on:
                     self.objects = (time.time(), dets, frame.shape)
                 res = None
@@ -581,6 +713,7 @@ class App:
                             kw["cloud"] = obstacles.to_dog_frame(lid[1], *lid[2])
                     res = self.follower.step(follow_mod.people(dets, frame.shape[0]), frame.shape, **kw)
                     self.follow_sources.add(getattr(self.follower, "source", "camera"))
+                    self._det_times.append(time.time())
                     lk = self.follower.lock
                     if lk.label and not lk.announced:
                         lk.announced = True
@@ -958,6 +1091,9 @@ class App:
         self.busy_until = 0.0
         self.desired = (0.0, 0.0, 0.0)
         self.stop_follow("SPACE")
+        if self.cal is not None:
+            self.cal = None
+            self.say("calibration cancelled", WARN)
         self.say("STOP", BAD)
         self.pool.submit(self.send, "StopMove")
         self.box_step, self.box_dancing, self.box_t0 = False, False, None    # 'stop' ends a box-step session (dog stays as it is)
@@ -983,6 +1119,11 @@ class App:
                 self.stop_follow("T pressed")
             elif self.follow_available():
                 self.pending = ("Follow the nearest person (NO obstacle avoidance)", self.start_follow, now + CONFIRM_SECS)
+        elif key == CALIB_KEY:
+            if self.cal is None:
+                self.start_calibration()
+            else:
+                self.calibration_press()
         elif key == HEEL_KEY:
             if self.following:
                 self.stop_follow("H pressed")
@@ -1124,6 +1265,10 @@ class App:
         elif self.objects_on:
             self.text(screen, "object detection: " + ("loading detector ..." if self.detector is None else "no frames yet"),
                       WIN_W - 330, VIDEO_H - 32, WARN, 24)
+        if self.cal is not None and self.cal["last"] is not None and now - self.cal["last"][0] < 1.0:   # who the calibration is looking at
+            ox, oy, sc = self._xf
+            x1, y1, x2, y2 = self.cal["last"][1]
+            pygame.draw.rect(screen, WARN, (ox + x1 * sc, oy + y1 * sc, (x2 - x1) * sc, (y2 - y1) * sc), 3)
         res = self.follow_res
         if self.following and res and res[1].box and now - res[0] < 1.0:  # box around the tracked person
             ox, oy, sc = self._xf
@@ -1139,7 +1284,9 @@ class App:
         screen.blit(bar, (0, 0))
         bat = f"{self.battery}%" if self.battery is not None else "?"
         self.text(screen, self.state, 12, 8, self.state_color, 24)
-        self.text(screen, f"video {fps:.0f} fps    battery {bat}", 360, 8, TXT, 24)
+        lt = [t for t in self._lidar_times if now - t < 3]
+        lidar_txt = (f"    lidar {(len(lt) - 1) / max(lt[-1] - lt[0], 1e-3):.0f}/s" if len(lt) > 2 else "    lidar: no data") if self._lidar_on else ""
+        self.text(screen, f"video {fps:.0f} fps    battery {bat}{lidar_txt}", 360, 8, TXT, 24)
         d = self.desired
         status = "BUSY" if now < self.busy_until else ("balancing" if self.armed else "will balance on first drive key")
         self.text(screen, f"{status}    vx {d[0]:+.2f}  vy {d[1]:+.2f}  yaw {d[2]:+.2f}", 640, 8, TXT if any(d) else DIM, 24)
@@ -1173,10 +1320,23 @@ class App:
             vm = self.voice_move
             banner = (f"VOICE MOVE: {vm['label']}" + ("" if vm["start"] else "  (getting ready ...)")
                       + "     say 'stop' / Space / any key cancels", GOOD)
+        elif self.cal is not None:
+            c = self.cal
+            seen = c["last"] is not None and now - c["last"][0] < 1.0
+            step = f"{min(c['step'] + 1, c['total'])} of {c['total']}"
+            how = {"lidar": " (lidar, no tape)", "tape": " (tape)"}.get(c["mode"], "")
+            ask = ("stand at a clearly different distance, in the open" if c["mode"] == "lidar" and c["step"] else
+                   "stand ~2 m in front of the dog, in the open" if c["mode"] in (None, "lidar") else
+                   f"stand {CAL_SPOTS[min(c['step'], len(CAL_SPOTS) - 1)]} m in front of the dog's NOSE")
+            banner = ((f"CALIBRATING {step}{how}: measuring, stand still ...  ({len(c['boxes'])} frames, {len(c['clouds'])} lidar scans)" if c["phase"] == "collect"
+                       else f"CALIBRATION {step}{how}: {ask}, then press J   " + ("[I can see you]" if seen else "[I can't see you yet]")),
+                      WARN if not seen else GOOD)
         elif self.following:
             st = res[1].status if res else ("loading detector ..." if self.detector is None else "looking for a person ...")
-            banner = ((f"HEELING ({self.follower.cfg.side}): {st}    (Space / H / any drive key stops)" if self.follow_mode == "heel"
-                       else f"FOLLOWING: {st}    (Space / T / any drive key stops)"), GOOD)
+            dt = [t for t in self._det_times if now - t < 3]
+            fps = f"  [detector {(len(dt) - 1) / max(dt[-1] - dt[0], 1e-3):.0f} fps]" if len(dt) > 2 else "  [detector: no frames]"
+            banner = ((f"HEELING ({self.follower.cfg.side}): {st}{fps}" if self.follow_mode == "heel"
+                       else f"FOLLOWING: {st}{fps}"), GOOD)
         if banner:
             back = pygame.Surface((WIN_W, 40), pygame.SRCALPHA)
             back.fill((0, 0, 0, 150))
@@ -1203,7 +1363,7 @@ class App:
             "\"follow me\", \"heel\", \"box step\".  \"stop\" always works."
             + ("" if self.args.stt == "local" else "  (ElevenLabs: needs internet)"),
             "BACK LEGS  U (then Y), or \"" + self.args.wake_word + ", stand on your back legs\" then \"yes\".  U / \"come down\" returns to four legs.  Can fall: soft floor!",
-            "VISION  O toggles labelled boxes for 80 everyday object types (person, chair, cup, ball, tv, ...).  Small model: misses far/small things.",
+            "VISION  O toggles labelled boxes for 80 object types.   J = calibrate heel distance (stand at 3 different distances; uses the lidar, no tape).",
             "Click this window so it has keyboard focus.   Esc quits.",
         ]
         for i, line in enumerate(lines):
@@ -1222,7 +1382,7 @@ class App:
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
                                        objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove,
-                                       listen=self.args.selftest_listen, heel=self.args.selftest_heel)
+                                       listen=self.args.selftest_listen, heel=self.args.selftest_heel, calib=self.args.selftest_calib)
                   if self.is_selftest() else None)
         t0 = time.time()
         try:
@@ -1247,6 +1407,7 @@ class App:
                 if self.listener is not None:
                     self.listener.paused = bool(self.voice_state)   # hold-V push-to-talk takes priority over the ear
                 self.drain_voice()
+                self.update_calibration(time.time())
                 self.update_velocity()
                 self.draw(screen)
                 pygame.display.flip()
@@ -1277,11 +1438,13 @@ class App:
             return _selftest_listen_verdict(self)
         if self.args.selftest_heel:
             return _selftest_heel_verdict(self)
+        if self.args.selftest_calib:
+            return _selftest_calib_verdict(self)
         return self.selftest_verdict() if self.args.selftest else 0
 
     # -- headless self-tests (development only) ---------------------------------------------------------
     def selftest_script(self, follow: bool = False, voice: bool = False, objects: bool = False, voicemove: bool = False,
-                        listen: bool = False, heel: bool = False):
+                        listen: bool = False, heel: bool = False, calib: bool = False):
         K = pygame
         if listen:  # utterances are injected as if the always-on mic had heard them (see LISTEN_TEST)
             steps = [(19.3, K.KEYDOWN, K.K_ESCAPE)]
@@ -1302,6 +1465,10 @@ class App:
                 steps += [(0.5 + i * 0.7, K.KEYDOWN, K.K_v), (0.8 + i * 0.7, K.KEYUP, K.K_v)]
             steps.append((5.8, K.KEYDOWN, K.K_ESCAPE))
             shot_at = 3.6
+        elif calib:  # J starts, J measures spot 1, J measures spot 2 (same picture: so the two spots can't fit a camera), Esc
+            steps = [(0.8, K.KEYDOWN, K.K_j), (1.0, K.KEYUP, K.K_j), (3.5, K.KEYDOWN, K.K_j), (3.7, K.KEYUP, K.K_j),
+                     (6.0, K.KEYDOWN, K.K_j), (6.2, K.KEYUP, K.K_j), (9.0, K.KEYDOWN, K.K_ESCAPE)]
+            shot_at = 4.5
         elif follow or heel:
             steps = [(0.5, K.KEYDOWN, K.K_h if heel else K.K_t), (0.7, K.KEYUP, K.K_h if heel else K.K_t), (0.9, K.KEYDOWN, K.K_y), (1.1, K.KEYUP, K.K_y),
                      (4.5, K.KEYDOWN, K.K_SPACE), (7.0, K.KEYDOWN, K.K_ESCAPE)]
@@ -1332,7 +1499,7 @@ class App:
                     pygame.event.post(pygame.event.Event(typ, key=key, mod=0, unicode="", scancode=0))
             if t >= shot_at and not state["shot"]:
                 state["shot"] = True
-                pygame.image.save(screen, "/tmp/go2_selftest_listen.png" if listen else
+                pygame.image.save(screen, "/tmp/go2_selftest_calib.png" if calib else "/tmp/go2_selftest_listen.png" if listen else
                                   "/tmp/go2_selftest_voicemove.png" if voicemove else
                                   "/tmp/go2_selftest_objects.png" if objects else
                                   "/tmp/go2_selftest_voice.png" if voice else
@@ -1383,6 +1550,37 @@ class App:
         for name, ok in checks.items():
             print(("  PASS  " if ok else "  FAIL  ") + name)
         return 0 if all(checks.values()) else 1
+
+
+def _selftest_calib_verdict(app: "App") -> int:
+    import heel_sim
+
+    ev = app.cal_events
+    spots = [e for e in ev if e[0] == "spot"]
+    # the last step, driven with measurements from a known camera (0.31 m high, tilted 5 deg): must be recovered and applied
+    import random as _random
+
+    rng = _random.Random(2)
+    rows = []
+    for d in CAL_SPOTS:
+        w = heel_sim.World(dog=[0, 0, 0], person=[heel_sim.CAM.x_off + d, 0.0, 0.0], cam_z=0.31, cam_pitch=math.radians(5))
+        rows.append((heel_sim.project(w, rng, noise=0)[3], d))
+    before = (app.args.heel_cam_height, app.args.heel_cam_pitch)          # what the refused attempt left behind
+    ok_fit = app.finish_calibration(rows, 720)
+    checks = {
+        "J then J: the real detector saw the person and recorded spot 1 (feet row near the bottom of the test picture)": bool(spots) and 400 < spots[0][1] < 700,
+        "the pretend lidar located them (about 1.5 m ahead) and calibration went by LIDAR": bool(spots) and ("lidar" in " ".join(app.messages_text())),
+        "a second press at the same distance was NOT taken as a new spot (needs a clearly different distance)": ("same_distance",) in ev and len(spots) == 1,
+        "...and it changed nothing (height/tilt still the defaults before the good measurements)": before == (0.35, 0.0),
+        "measurements from a known camera (0.31 m, 5 deg) are solved and applied": ok_fit and abs(app.args.heel_cam_height - 0.31) < 0.01
+                                                                                  and abs(app.args.heel_cam_pitch - 5.0) < 0.5,
+        "the result was written to the (temp) calibration file, never the real one": os.path.exists("/tmp/go2_cal_test.json"),
+        "Esc left no calibration half-done that could move the dog": not any(e[0] in ("move", "sport") for e in getattr(app.robot, "log", [])),
+    }
+    print("\nSELFTEST-CALIB events:", ev)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
 
 
 def _selftest_heel_verdict(app: "App") -> int:
@@ -1565,11 +1763,12 @@ def main() -> int:
                    help="heel uses the camera AND the dog's lidar (the default): the camera decides who and where you are, the lidar only sharpens "
                         "the distance. UNTESTED on the real dog. If the dog sends no lidar it says so and uses the camera alone")
     p.add_argument("--no-heel-lidar", dest="heel_lidar", action="store_false", help="heel uses the camera only")
-    p.add_argument("--heel-lead", type=float, default=1.1, help="heel: how far ahead of the dog's centre you are, m. Smaller = the dog walks closer, but the camera sees less of you (try 0.9)")
-    p.add_argument("--heel-gap", type=float, default=0.5, help="heel: sideways distance between you and the dog, m")
+    p.add_argument("--heel-lead", type=float, default=1.3, help="heel: how far ahead of the dog's centre you are, m. Smaller = the dog walks closer, but the camera sees less of you (try 0.9)")
+    p.add_argument("--heel-gap", type=float, default=0.35, help="heel: sideways distance between you and the dog, m")
     p.add_argument("--heel-cam-height", type=float, default=0.35, help="ESTIMATE: camera height above the floor, m (sets how far away the dog thinks you are)")
     p.add_argument("--heel-cam-pitch", type=float, default=0.0, help="ESTIMATE: degrees the camera looks down")
     p.add_argument("--selftest-heel", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--selftest-calib", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--stt", choices=["local", "elevenlabs"], default=os.environ.get("GO2_STT", "local"),
                    help="speech-to-text for the V key: 'local' = offline Whisper (default), 'elevenlabs' = cloud (needs internet + key)")
     p.add_argument("--whisper-model", default=os.environ.get("GO2_WHISPER_MODEL", "small.en"),
@@ -1579,6 +1778,13 @@ def main() -> int:
     p.add_argument("--motion-mode", choices=["normal", "ai", "mcf"], default=None,
                    help="optional, UNTESTED: switch the dog's motion controller at connect (DimOS notes 'mcf' is the one that traverses stairs)")
     args = p.parse_args()
+    args.cal_loaded = None
+    if follow_mod is not None and not any(k.startswith("selftest") and v for k, v in vars(args).items()) \
+            and args.heel_cam_height == 0.35 and args.heel_cam_pitch == 0.0:           # (only if nothing was set by hand)
+        saved = follow_mod.load_calibration()
+        if saved:
+            args.heel_cam_height, args.heel_cam_pitch = saved
+            args.cal_loaded = saved
     if args.fetch_model:  # everything that needs the internet, done once, so the dog's Wi-Fi is enough afterwards
         rc = 0
         if follow_mod is None:
@@ -1597,7 +1803,7 @@ def main() -> int:
             voice_mod.fetch_whisper_model(args.whisper_model)
         return rc
     image = None
-    if args.selftest_follow or args.selftest_heel:
+    if args.selftest_follow or args.selftest_heel or args.selftest_calib:
         image = _follow_test_canvas()
         if image is None:
             return 2

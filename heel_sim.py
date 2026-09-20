@@ -166,6 +166,76 @@ def run(name: str, verbose: bool = False, side: str = "left", seed: int = 1, lid
             "min_dist": min_d, "lost_at": lost_at}
 
 
+def unit_checks() -> int:
+    """The lidar 'someone is beside me' wait, and the loss reasons."""
+    rng = random.Random(5)
+    frame = (CAM.height, CAM.width, 3)
+    checks = {}
+
+    def run_case(cloud_fn, label):
+        h = follow.Heeler(follow.HeelConfig(use_lidar=True))
+        h.reset()
+        w = World(dog=[0.0, 0.0, 0.0], person=[1.3, -0.35, 0.0])
+        for i in range(8):                                     # the camera sees them for a while ...
+            h.step([project(w, rng)], frame, now=i * 0.07, cloud=cloud_fn(w))
+        out, t = [], 8 * 0.07
+        w.person[:2] = [0.2, -0.45]                            # ... then they end up level with the dog: out of the camera's view
+        for k in (0.4, 1.0, 3.0, 5.5, 7.0):
+            r = h.step([], frame, now=t + k, cloud=cloud_fn(w))
+            out.append((k, r))
+        return out
+
+    beside = run_case(lambda w: lidar_cloud(w, rng), "person beside")
+    checks["camera loses them but the lidar sees someone beside: the dog waits (no movement) for up to 6 s"] = all(
+        r.status.startswith("waiting") and r.cmd == (0.0, 0.0, 0.0) and not r.lost for k, r in beside if 0.4 <= k <= 5.5)
+    checks["...then gives up if they never come back into view"] = beside[-1][1].lost
+    gone = run_case(lambda w: lidar_cloud(w, rng, wall_y=-0.7) if False else np.zeros((0, 3), np.float32), "nobody")
+    checks["camera loses them and the lidar sees nobody: gives up after 1.5 s, saying why"] = (
+        gone[3][1].lost and "no person detected" in gone[3][1].status)
+
+    def wall_only(w):
+        far = World(dog=w.dog, person=[9.0, 9.0, 0.0])         # nobody near the dog, but a long wall where they were
+        return lidar_cloud(far, rng, wall_y=-0.7)
+    wall = run_case(wall_only, "wall")
+    checks["a wall where they were does NOT make the dog wait: it gives up as usual"] = wall[3][1].lost
+    # camera calibration from people standing at two known distances
+    def feet_row(z, tilt_deg, d, noise):
+        w = World(dog=[0, 0, 0], person=[CAM.x_off + d, 0.0, 0.0], cam_z=z, cam_pitch=math.radians(tilt_deg))
+        return project(w, rng, noise=noise)[3]
+
+    def worst_distance_error(noise, trials=20):
+        """Height and tilt trade off against each other, so judge the fit by what the dog uses: the distance it then predicts."""
+        worst, refused = 0.0, 0
+        for z_true, t_true in ((0.35, 0.0), (0.31, 5.0), (0.38, 8.0), (0.28, 2.0), (0.34, 12.0)):
+            for _ in range(trials):
+                r = follow.solve_camera([(feet_row(z_true, t_true, d, noise), d) for d in (1.2, 2.4)], frame_h=CAM.height)
+                if r is None:
+                    refused += 1
+                    continue
+                fitted = follow.Camera(z=r[0], pitch=r[1])
+                for d in (0.9, 1.2, 1.6, 2.0):                                 # judged over the range heel actually works in (beyond ~2 m 1 px is 10+ cm)
+                    row = feet_row(z_true, t_true, d, 0.0)
+                    box = (600, 100, 700, row, 0.9)
+                    worst = max(worst, abs(follow.locate(box, (720, 1280, 3), fitted).x - CAM.x_off - d))
+        return worst, refused
+
+    single, r1 = worst_distance_error(4.0)                    # one noisy frame per spot
+    averaged, r2 = worst_distance_error(1.0)                  # the app averages ~20 frames per spot
+    print(f"  calibration from 2 spots: worst distance error {single * 100:.0f} cm (one frame, +-4 px jitter), {averaged * 100:.0f} cm (averaged), refused {r1 + r2}")
+    checks["calibrated distances are within 16 cm everywhere from 0.9 to 2 m even from single noisy frames"] = single < 0.16 and r1 == 0
+    checks["...and within 6 cm when the box jitter is averaged, as the app does"] = averaged < 0.06 and r2 == 0
+    exact = follow.solve_camera([(feet_row(0.31, 5.0, d, 0.0), d) for d in (1.2, 2.4)], frame_h=CAM.height)
+    checks[f"noise-free it is exact (got {exact and (round(exact[0], 3), round(math.degrees(exact[1]), 2))}, want 0.31 m and 5 deg)"] = (
+        exact is not None and abs(exact[0] - 0.31) < 0.005 and abs(math.degrees(exact[1]) - 5.0) < 0.3)
+    one = follow.solve_camera([(feet_row(0.31, 0.0, 1.5, 0.0), 1.5)], frame_h=CAM.height)
+    checks["one spot (assumes a level camera) also works when the camera really is level"] = one is not None and abs(one[0] - 0.31) < 0.005
+    checks["a mistaken measurement (same feet row at two different distances) is refused, not applied"] = (
+        follow.solve_camera([(500, 1.2), (500, 2.4)], frame_h=CAM.height) is None)
+    for name, ok in checks.items():
+        print(("  PASS  " if ok else "  FAIL  ") + name)
+    return 0 if all(checks.values()) else 1
+
+
 def main() -> int:
     verbose = "-v" in sys.argv
     print(f"{'scenario':58s} {'seen':>5s}  {'ahead err m (med/p95)':>22s}  {'side err m (med/p95)':>21s}  {'closest':>7s}  gave up")
@@ -189,7 +259,8 @@ def main() -> int:
     r = run("straight at 0.7 m/s, starting in position", side="right")
     print(f"{'(mirror check) same walk, dog on the person\'s right':58s} {r['seen']:5.0%}  {r['ex_med']:10.2f} /{r['ex_p95']:6.2f}  "
           f"{r['ey_med']:10.2f} /{r['ey_p95']:6.2f}  {r['min_dist']:6.2f}m  " + (f"at {r['lost_at']:.1f} s" if r["lost_at"] else "no"))
-    return 0
+    print("\nlidar wait + loss reasons:")
+    return unit_checks()
 
 
 if __name__ == "__main__":

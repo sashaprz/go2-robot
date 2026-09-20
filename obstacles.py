@@ -109,6 +109,27 @@ def refine_range(pts: np.ndarray, lens: tuple[float, float], bearing: float, s_c
     return s_lid
 
 
+def person_near(pts: np.ndarray, near: tuple[float, float], radius: float = 0.9, z_min: float = 0.2, z_max: float = 1.3,
+                min_points: int = 12, body: tuple[float, float] = (0.35, 0.25)) -> bool:
+    """Is a person-sized blob standing around `near` (x ahead, y left, dog frame)? PRESENCE ONLY: it says where to look and
+    yes/no, it never gives a position to steer to. Used to tell "the person is beside me, out of the camera's view" from
+    "the person is gone". Refuses something that keeps going (a wall): a dense patch with more points around it than in it."""
+    if len(pts) == 0:
+        return False
+    h = pts[:, 2]
+    m = (h > z_min) & (h < z_max) & ~((np.abs(pts[:, 0]) < body[0]) & (np.abs(pts[:, 1]) < body[1]))
+    q = pts[m][:, :2]
+    d0 = np.hypot(q[:, 0] - near[0], q[:, 1] - near[1])
+    inner = q[d0 < radius]
+    if len(inner) < min_points:
+        return False
+    c = np.median(inner, axis=0)
+    dc = np.hypot(q[:, 0] - c[0], q[:, 1] - c[1])
+    core = int((dc < 0.35).sum())
+    ring = int(((dc >= 0.35) & (dc < 0.9)).sum())
+    return core >= min_points and ring <= core
+
+
 class PathWatcher:
     """Turns a stream of clearance readings into 'the path is blocked', without flicker.
 
@@ -180,6 +201,13 @@ def _selftest() -> int:
     checks["a 15 cm kerb is not a person"] = d(_box(2.0, -0.5, 0.5, 0.5, 0.15)) is None
     checks["the dog's own body is not a person"] = refine_range(
         to_dog_frame(np.vstack((floor, _box(0.0, 0.0, 0.3, 0.2, 0.5, n=120))), 0, 0, STAND_HEIGHT, 0.0), lens, 0.0, 0.3, window=0.6) is None
+    beside = to_dog_frame(np.vstack((floor, _box(0.3, -0.6, 0.4, 0.4, 1.6, n=120))), 0, 0, STAND_HEIGHT, 0.0)
+    checks["a person standing beside the dog (out of the camera's view) is noticed"] = person_near(beside, (0.4, -0.55))
+    checks["...and nobody is 'noticed' where nobody stands"] = not person_near(beside, (2.5, 1.5))
+    wall = np.stack((np.arange(-2, 6, 0.01), np.full(800, -0.7), np.random.default_rng(4).uniform(0.0, 1.8, 800)), axis=1)
+    checks["a wall is not a person"] = not person_near(to_dog_frame(np.vstack((floor, wall)), 0, 0, STAND_HEIGHT, 0.0), (0.4, -0.55))
+    checks["the dog's own body is not a person"] = not person_near(
+        to_dog_frame(np.vstack((floor, _box(0.0, 0.0, 0.3, 0.2, 0.5, n=120))), 0, 0, STAND_HEIGHT, 0.0), (0.1, 0.0))
     w = PathWatcher(stop_at=1.2, clear_for=1.5)
     seq = [(0.0, 3.0), (0.1, 1.1), (0.2, None), (1.0, None), (1.7, None), (1.8, 1.0), (2.0, None), (3.6, None)]
     got = [w.update(dist, t) for t, dist in seq]

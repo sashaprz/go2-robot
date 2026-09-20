@@ -83,6 +83,23 @@ def main() -> int:
     pick = lock3.choose([pa, pc], scene([(pa, YELLOW_GREY), (pc, GREEN_BLACK)]), pa, W, 0.1)
     checks["a bigger stranger appears next to them: still the original person"] = pick == pa
 
+    # the dog closes in: the person now shows only legs/hips, so their colours look different, but they are right where they were
+    lock5 = follow.PersonLock()
+    full = box(640, h=380)
+    lock5.choose([full], scene([(full, RED_BLUE)]), None, W, 0.1)
+    close = box(650, h=560, w=200, y=150)
+    stranger = box(1000, h=380)
+    blue = RED_BLUE[1]
+    before = follow.signature_distance(lock5.ref, follow.signature(scene([(close, (blue, blue))]), close))
+    pick = lock5.choose([close, stranger], scene([(close, (blue, blue)), (stranger, GREEN_BLACK)]), full, W, 0.1)
+    print(f"  close-up (trousers only): colour distance from the lock {before:.2f}, chosen: {'the person' if pick == close else 'the stranger' if pick == stranger else 'nobody'}")
+    checks["the dog closes in and sees only their trousers: still them (right where they were), never the stranger"] = pick == close
+    for _ in range(12):                                            # it keeps seeing them like that: the fingerprint adapts
+        lock5.choose([close], scene([(close, (blue, blue))]), close, W, 0.1)
+    after = follow.signature_distance(lock5.ref, follow.signature(scene([(close, (blue, blue))]), close))
+    print(f"  ...and after a moment of seeing them like that the distance is {after:.2f}")
+    checks["the fingerprint adapts to the new view"] = after < before
+
     # no picture: falls back to position only (never crashes)
     lock4 = follow.PersonLock()
     checks["without a picture it still works (position only)"] = lock4.choose([a, b], None, None, W, 0.1) == a
