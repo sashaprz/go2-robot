@@ -2118,6 +2118,9 @@ class App:
         if not _SELFTEST:
             threading.Thread(target=self._prepare_voice, daemon=True).start()
             self.start_phone()
+        # Auto-start gesture control
+        if _GESTURE_AVAILABLE:
+            self.toggle_gestures()
         clock = pygame.time.Clock()
         script = (self.selftest_script(follow=self.args.selftest_follow, voice=self.args.selftest_voice,
                                        objects=self.args.selftest_objects, voicemove=self.args.selftest_voicemove,
