@@ -2,18 +2,17 @@
 """Beginner hand-gesture controller for the Go2 robot.
 
 This is a webcam-only test:
-- detect a hand with MediaPipe
-- classify a few easy gestures
+- detect hand gestures with MediaPipe Hands + improved angle-based classifier
 - print the matching action without connecting to a robot
 
 Useful beginner mapping:
-- peace              -> walk forward
-- thumbs down        -> walk backward
-- horizontal hand    -> sit
-- flat hand up       -> stand up
+- peace (victory)    -> stand up
+- thumbs_down        -> lie down
+- open_palm          -> sit
+- thumbs_up          -> walk forward
 
 Run:
-    py gesture_test.py
+    python3 gesture_test.py
 """
 
 from __future__ import annotations
@@ -23,10 +22,10 @@ import math
 import time
 
 import cv2
+import numpy as np
 import mediapipe as mp
-
-mp_hands = mp.solutions.hands
-mp_draw = mp.solutions.drawing_utils
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 
 class FakeRobot:
@@ -49,84 +48,100 @@ class FakeRobot:
 
 
 def action_for_gesture(gesture: str) -> str:
+    """Map gesture names to robot actions."""
     return {
-        "peace": "WALK FORWARD",
-        "thumbs_down": "WALK BACKWARD",
-        "horizontal_hand": "SIT",
-        "flat_hand": "STAND UP",
+        "peace": "STAND UP",
+        "thumbs_down": "LIE DOWN",
+        "open_palm": "SIT",
+        "thumbs_up": "WALK FORWARD",
     }.get(gesture, "NO COMMAND")
 
 
-def gesture_from_landmarks(landmarks):
-    """Very simple gesture detector for a beginner setup."""
-    index_tip = landmarks[8]
-    index_pip = landmarks[6]
-    index_mcp = landmarks[5]
-    middle_tip = landmarks[12]
-    middle_pip = landmarks[10]
-    middle_mcp = landmarks[9]
-    ring_tip = landmarks[16]
-    ring_pip = landmarks[14]
-    ring_mcp = landmarks[13]
-    pinky_tip = landmarks[20]
-    pinky_pip = landmarks[18]
-    pinky_mcp = landmarks[17]
+def calculate_angle(a, b, c):
+    """Calculate angle at point b formed by points a-b-c."""
+    radians = math.atan2(c.y - b.y, c.x - b.x) - math.atan2(a.y - b.y, a.x - b.x)
+    angle = abs(math.degrees(radians))
+    return angle if angle <= 180 else 360 - angle
+
+
+def is_finger_extended(landmarks, tip_idx, pip_idx, mcp_idx, wrist_idx):
+    """Check if a finger is extended using angle-based detection."""
+    tip = landmarks[tip_idx]
+    pip = landmarks[pip_idx]
+    mcp = landmarks[mcp_idx]
+    wrist = landmarks[wrist_idx]
+
+    # Distance from tip to wrist vs pip to wrist
+    tip_dist = math.sqrt((tip.x - wrist.x)**2 + (tip.y - wrist.y)**2)
+    pip_dist = math.sqrt((pip.x - wrist.x)**2 + (pip.y - wrist.y)**2)
+
+    # Finger is extended if tip is significantly further from wrist than pip
+    return tip_dist > pip_dist * 1.2
+
+
+def is_thumb_up(landmarks):
+    """Detect thumbs up gesture."""
     thumb_tip = landmarks[4]
     thumb_ip = landmarks[3]
-    thumb_mcp = landmarks[2]
+    index_mcp = landmarks[5]
 
-    # More robust finger detection: check if finger is extended by comparing distances
-    # Extended finger: tip is far from MCP joint
-    # Curled finger: tip is close to MCP joint
-    def finger_extended(tip, mcp, pip):
-        tip_to_mcp = math.dist((tip.x, tip.y), (mcp.x, mcp.y))
-        pip_to_mcp = math.dist((pip.x, pip.y), (mcp.x, mcp.y))
-        # If tip is at least 1.5x further from MCP than PIP is, finger is extended
-        return tip_to_mcp > pip_to_mcp * 1.5
+    # Thumb pointing up (tip above ip)
+    thumb_pointing_up = thumb_tip.y < thumb_ip.y - 0.05
 
-    index_open = finger_extended(index_tip, index_mcp, index_pip)
-    middle_open = finger_extended(middle_tip, middle_mcp, middle_pip)
-    ring_open = finger_extended(ring_tip, ring_mcp, ring_pip)
-    pinky_open = finger_extended(pinky_tip, pinky_mcp, pinky_pip)
+    # Other fingers curled
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
 
-    fingers_closed = not index_open and not middle_open and not ring_open and not pinky_open
-    thumb_extended = math.dist((thumb_tip.x, thumb_tip.y), (thumb_mcp.x, thumb_mcp.y)) > (
-        math.dist((thumb_ip.x, thumb_ip.y), (thumb_mcp.x, thumb_mcp.y)) * 1.25
-    )
+    return thumb_pointing_up and not index_ext and not middle_ext and not ring_ext and not pinky_ext
 
-    if fingers_closed:
-        if thumb_extended and thumb_tip.y < thumb_ip.y - 0.03:
-            return "thumbs_up"
-        if thumb_extended and thumb_tip.y > thumb_ip.y + 0.03:
-            return "thumbs_down"
-        if not thumb_extended:
-            return "fist"
-        return "unknown"
 
-    if index_open and middle_open and not ring_open and not pinky_open:
+def is_thumb_down(landmarks):
+    """Detect thumbs down gesture."""
+    thumb_tip = landmarks[4]
+    thumb_ip = landmarks[3]
+
+    # Thumb pointing down (tip below ip)
+    thumb_pointing_down = thumb_tip.y > thumb_ip.y + 0.05
+
+    # Other fingers curled
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
+
+    return thumb_pointing_down and not index_ext and not middle_ext and not ring_ext and not pinky_ext
+
+
+def gesture_from_landmarks(landmarks):
+    """Improved gesture classifier using angles and distances."""
+    wrist = landmarks[0]
+
+    # Check finger states
+    index_ext = is_finger_extended(landmarks, 8, 6, 5, 0)
+    middle_ext = is_finger_extended(landmarks, 12, 10, 9, 0)
+    ring_ext = is_finger_extended(landmarks, 16, 14, 13, 0)
+    pinky_ext = is_finger_extended(landmarks, 20, 18, 17, 0)
+
+    # Check thumb gestures first (most distinctive)
+    if is_thumb_up(landmarks):
+        return "thumbs_up"
+
+    if is_thumb_down(landmarks):
+        return "thumbs_down"
+
+    # Peace sign: index and middle extended, ring and pinky curled
+    if index_ext and middle_ext and not ring_ext and not pinky_ext:
         return "peace"
 
-    # All fingers extended: check orientation
-    if index_open and middle_open and ring_open and pinky_open:
-        # Calculate average horizontal vs vertical spread of fingers
-        avg_x_dist = abs(index_tip.x - pinky_tip.x)
-        avg_y_dist = abs(index_tip.y - pinky_tip.y)
+    # Open palm: all fingers extended
+    if index_ext and middle_ext and ring_ext and pinky_ext:
+        return "open_palm"
 
-        # Horizontal hand (karate chop): fingers spread more horizontally than vertically
-        if avg_x_dist > avg_y_dist * 1.3:
-            return "horizontal_hand"
-
-        # Palm down: fingers pointing down (tips below PIPs in screen coordinates)
-        fingers_down = (index_tip.y > index_pip.y and
-                       middle_tip.y > middle_pip.y and
-                       ring_tip.y > ring_pip.y and
-                       pinky_tip.y > pinky_pip.y)
-
-        if fingers_down:
-            return "palm_down"
-        else:
-            # Flat hand / palm forward: fingers pointing up
-            return "flat_hand"
+    # Fist: all fingers curled
+    if not index_ext and not middle_ext and not ring_ext and not pinky_ext:
+        return "fist"
 
     return "unknown"
 
@@ -143,23 +158,26 @@ class GestureController:
 
     def _send_action(self, gesture: str) -> None:
         if gesture == "peace":
-            print("WALK FORWARD")
-            self.robot.move(self.forward_speed, 0.0, 0.0)
-        elif gesture == "thumbs_down":
-            print("WALK BACKWARD")
-            self.robot.move(-self.forward_speed, 0.0, 0.0)
-        elif gesture == "horizontal_hand":
-            print("SIT")
-            if hasattr(self.robot, "sport"):
-                self.robot.sport("Sit")
-            else:
-                self.robot.stop_move()
-        elif gesture == "flat_hand":
             print("STAND UP")
             if hasattr(self.robot, "sport"):
                 self.robot.sport("StandUp")
             else:
                 self.robot.stop_move()
+        elif gesture == "thumbs_down":
+            print("LIE DOWN")
+            if hasattr(self.robot, "sport"):
+                self.robot.sport("Damp")
+            else:
+                self.robot.stop_move()
+        elif gesture == "open_palm":
+            print("SIT")
+            if hasattr(self.robot, "sport"):
+                self.robot.sport("Sit")
+            else:
+                self.robot.stop_move()
+        elif gesture == "thumbs_up":
+            print("WALK FORWARD")
+            self.robot.move(self.forward_speed, 0.0, 0.0)
         else:
             return
 
@@ -197,7 +215,29 @@ def main() -> int:
     robot = FakeRobot()
     print("Test mode: no real robot connection")
     controller = GestureController(robot, forward_speed=args.forward_speed, turn_speed=args.turn_speed)
-    hands = mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.8, min_tracking_confidence=0.8)
+
+    # Use MediaPipe HandLandmarker
+    base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
+    options = vision.HandLandmarkerOptions(
+        base_options=base_options,
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
+        min_hand_presence_confidence=0.7,
+        min_tracking_confidence=0.7,
+        running_mode=vision.RunningMode.VIDEO
+    )
+
+    # Download model if needed
+    import os
+    if not os.path.exists('hand_landmarker.task'):
+        print("Downloading hand landmarker model...")
+        import urllib.request
+        url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+        urllib.request.urlretrieve(url, "hand_landmarker.task")
+        print("Model downloaded.")
+
+    landmarker = vision.HandLandmarker.create_from_options(options)
+
     cap = cv2.VideoCapture(args.camera_index)
 
     if not cap.isOpened():
@@ -205,41 +245,58 @@ def main() -> int:
         return 1
 
     print("Press ESC to quit.")
-    print("Commands: peace = walk forward, thumbs down = walk backward, horizontal hand = sit, flat hand up = stand up")
+    print("Commands: peace = stand up, thumbs_down = lie down, open_palm = sit, thumbs_up = walk forward")
 
+    frame_timestamp_ms = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb)
+        frame_timestamp_ms += 33  # Approximately 30 FPS
 
-        if results.multi_hand_landmarks:
-            for hand in results.multi_hand_landmarks:
-                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
-                gesture = gesture_from_landmarks(hand.landmark)
+        # Convert to RGB and create MediaPipe Image
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # Detect hand landmarks
+        results = landmarker.detect_for_video(mp_image, frame_timestamp_ms)
+
+        if results.hand_landmarks:
+            for hand_landmarks in results.hand_landmarks:
+                # Draw hand landmarks manually
+                h, w, _ = frame.shape
+                for landmark in hand_landmarks:
+                    x = int(landmark.x * w)
+                    y = int(landmark.y * h)
+                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+
+                # Draw connections
+                connections = [
+                    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+                    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+                    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+                    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+                    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+                    (5, 9), (9, 13), (13, 17)  # Palm
+                ]
+                for connection in connections:
+                    start_idx, end_idx = connection
+                    start = hand_landmarks[start_idx]
+                    end = hand_landmarks[end_idx]
+                    start_point = (int(start.x * w), int(start.y * h))
+                    end_point = (int(end.x * w), int(end.y * h))
+                    cv2.line(frame, start_point, end_point, (255, 255, 255), 2)
+
+                gesture = gesture_from_landmarks(hand_landmarks)
                 controller.decide(gesture)
                 action = action_for_gesture(gesture)
 
-                # Show detected gesture and finger states for debugging
-                def finger_ext_debug(tip_idx, mcp_idx, pip_idx):
-                    tip = hand.landmark[tip_idx]
-                    mcp = hand.landmark[mcp_idx]
-                    pip = hand.landmark[pip_idx]
-                    tip_to_mcp = math.dist((tip.x, tip.y), (mcp.x, mcp.y))
-                    pip_to_mcp = math.dist((pip.x, pip.y), (mcp.x, mcp.y))
-                    return tip_to_mcp > pip_to_mcp * 1.5
-
-                index_open = finger_ext_debug(8, 5, 6)
-                middle_open = finger_ext_debug(12, 9, 10)
-                ring_open = finger_ext_debug(16, 13, 14)
-                pinky_open = finger_ext_debug(20, 17, 18)
-                debug = f"I:{int(index_open)} M:{int(middle_open)} R:{int(ring_open)} P:{int(pinky_open)}"
-
+                # Display results
                 cv2.putText(frame, action, (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(frame, f"gesture: {gesture}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.putText(frame, debug, (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                cv2.putText(frame, f"Gesture: {gesture}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        else:
+            cv2.putText(frame, "No hand detected", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
         cv2.imshow("Go2 gesture control", frame)
 
@@ -248,6 +305,7 @@ def main() -> int:
 
     cap.release()
     cv2.destroyAllWindows()
+    landmarker.close()
     return 0
 
 
