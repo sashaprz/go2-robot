@@ -731,6 +731,80 @@ def plan_motion(intent: Intent, linear: float, angular: float) -> tuple[tuple[fl
     return vec, min(max(secs, 0.3), cap)
 
 
+def turn_target(intent: Intent) -> float | None:
+    """The angle a spoken turn asks for, in radians (+ = left / counter-clockwise), or None when it is not an angle (a turn given in seconds,
+    or not a turn). "turn left" = 90 degrees left, "turn right" = 90 right, "turn around" = 180, "turn right 45 degrees" = 45; "a little" halves it, "a lot" doubles it."""
+    import math
+
+    if intent.kind != "move" or not intent.arg.startswith("turn") or intent.unit not in ("", "deg"):
+        return None
+    default = 180.0 if intent.arg == "turn_around" else 90.0
+    deg = abs(intent.amount) if intent.amount is not None else default * intent.scale
+    deg = min(deg, math.degrees(MAX_TURN_SECONDS * 0.8))                  # never more than a bit over one full turn
+    return math.radians(deg) * (-1.0 if intent.arg == "turn_right" else 1.0)
+
+
+class TurnController:
+    """Closed-loop turning on the spot, by the dog's own gyro. Spins at max_rate, eases off as the angle nears (stopping a little early, by how fast it
+    is really turning, because the dog keeps coasting), waits for it to settle, and if it landed more than ~4 degrees off it creeps the last bit.
+    step(turned, elapsed) -> (yaw command rad/s, state), state 'run' | 'done' | 'wrong_way' | 'not_moving' | 'timeout'.
+    'wrong_way' / 'not_moving' mean the gyro disagrees with what the dog is doing (the caller then falls back to turning by time)."""
+
+    WINDOW = 0.2            # s over which the turning speed is measured
+    FIX_RATE = 0.30         # rad/s for the last creep
+
+    def __init__(self, target: float, max_rate: float, min_rate: float = 0.3, gain: float = 2.4, tol_deg: float = 3.0, lag: float = 0.3, max_fixes: int = 2, fix_deg: float = 6.0):
+        self.target, self.max_rate, self.min_rate, self.gain, self.lag, self.max_fixes = target, max_rate, min_rate, gain, lag, max_fixes
+        self.tol = tol_deg * 3.14159265 / 180.0
+        self.fix = fix_deg * 3.14159265 / 180.0                            # landing further off than this gets a creep to correct it
+        self.fixes, self.phase, self.settle_t0, self.calm_t0 = 0, "run", 0.0, None
+        self.hist: list = []
+        self.timeout = 1.6 * abs(target) / max(max_rate, 1e-3) + 4.0
+
+    def _speed(self, elapsed: float, turned: float) -> float:
+        self.hist.append((elapsed, turned))
+        self.hist = [h for h in self.hist if h[0] >= elapsed - 0.5]
+        old = [h for h in self.hist if h[0] <= elapsed - self.WINDOW * 0.75]
+        if not old:
+            return 0.0
+        t0, y0 = old[-1]
+        return (turned - y0) / max(elapsed - t0, 1e-3)
+
+    def step(self, turned: float, elapsed: float) -> tuple[float, str]:
+        sgn = 1.0 if self.target >= 0 else -1.0
+        speed = self._speed(elapsed, turned)                              # signed rad/s, measured
+        if self.fixes == 0 and self.phase == "run":
+            if elapsed > 1.0 and turned * sgn < -0.17:                    # 10 degrees the WRONG way
+                return 0.0, "wrong_way"
+            if elapsed > 1.5 and abs(turned) < 0.05:                      # 3 degrees in 1.5 s: it is not turning (or the gyro is dead)
+                return 0.0, "not_moving"
+        if elapsed > self.timeout:
+            return 0.0, "timeout"
+        err = self.target - turned                                        # signed radians still to go
+        if self.phase == "settle":
+            if abs(speed) < 0.08:
+                self.calm_t0 = elapsed if self.calm_t0 is None else self.calm_t0
+            else:
+                self.calm_t0 = None
+            calm = self.calm_t0 is not None and elapsed - self.calm_t0 >= 0.15
+            if calm or elapsed - self.settle_t0 > 1.0:
+                if abs(err) <= self.fix or self.fixes >= self.max_fixes:
+                    return 0.0, "done"
+                self.fixes, self.phase = self.fixes + 1, "fix"            # landed off: creep the rest
+            else:
+                return 0.0, "run"
+        pred = err - speed * (self.lag if self.phase == "run" else 0.15)  # where it will end up if we stop asking now
+        if self.phase == "run":
+            if pred * sgn <= self.tol:
+                self.phase, self.settle_t0, self.calm_t0 = "settle", elapsed, None
+                return 0.0, "run"
+            return sgn * min(max(self.gain * pred * sgn, self.min_rate), self.max_rate), "run"
+        if abs(pred) <= self.tol:                                         # creeping
+            self.phase, self.settle_t0, self.calm_t0 = "settle", elapsed, None
+            return 0.0, "run"
+        return (1.0 if pred > 0 else -1.0) * self.FIX_RATE, "run"
+
+
 MAX_WALK_SECONDS = 5.0    # a voice walk never lasts longer than this (~2 m at 0.4 m/s)
 MAX_TURN_SECONDS = 8.0    # ~ one full turn at 0.8 rad/s
 

@@ -75,6 +75,7 @@ Preview mode (no dog needed):
 | N / M, R, then **Y** | dance 1 / dance 2 / greeting routine (each needs a confirming Y within 4 s) |
 | T, then **Y** | follow the nearest person (T again / Space / any drive key stops it) |
 | H, then **Y** | **heel**: walk at your side (H again / Space / any drive key stops it) |
+| G, then **Y** | **lead**: walk to a spot (`--lead-goal`) round obstacles, stopping at drop-offs (G again / Space / any drive key stops it) |
 | J | **calibrate heel's distance**: stand at three different distances in front of the dog, pressing J at each; uses the lidar, no tape (see Heel) |
 | O | toggle object-detection overlay |
 | U, then **Y** | stand on the **back legs** (U again = come down) |
@@ -133,6 +134,7 @@ big unknown, and the level in the top bar will show it. It is off by default.
 | "say hello" / "wave", "stretch", "wiggle your hips", "make a heart", "good boy", "dance", "dance two", "greeting" | tricks |
 | "walk forward", "go back", "turn left/right", "turn around", "step left/right" | timed moves. Add an amount: "walk forward two seconds", "go forward one meter", "turn right 45 degrees", "a little" (half), "a lot" (double). Capped at 5 s walking / 8 s turning. |
 | "follow me", "stop following" | person-follow (starts straight away; keyboard `T` still asks for `Y`) |
+| "lead", "lead me", "lead me five metres", "lead me forward 4 metres and left 2", "stop leading" | walk to a spot round obstacles, **stopping at drop-offs** (see Lead; starts straight away; `G` still asks for `Y`) |
 | "heel", "heel right", "walk beside me", "stop heeling" | walk at your side (default: dog on your left; starts straight away; `H` still asks for `Y`) |
 | "stand on your back legs" -> "yes" | back-leg stand (asks for a spoken "yes" or Y). "come down" / "four legs" returns |
 | "box step" | **up on the back legs, then step in a square until you say "stop"** (see below). No "yes" needed: it can fall, so clear the space first |
@@ -154,6 +156,27 @@ older numbering, id **1050** (mislabelled "Standup"; DimOS's helper sends that o
 to **1050** if the dog refuses it (`--upright-api 1050` flips the order); the window prints the dog's reply to each attempt. It **asks for confirmation**, refuses tricks/follow while up (come down
 first), and **can fall**: use a soft floor, clear space, and a spotter. A steady two-legged balance isn't something the
 firmware exposes beyond this command. `Handstand` (front legs) is deliberately not included; neither are flips.
+
+## Lead (`G` or "ernest, lead")
+
+Says "lead" and the dog walks from where it stands (A) to a point B, round obstacles, **and stops at drop-offs** (stairs down, a ledge, a hole). It is the guide mode
+below (`guide.py`, `pathplan.py`, `dropoff.py`) running inside this app, on the dog's lidar, in a background thread so the window stays smooth.
+
+- **Say it:** "ernest, lead" / "lead me" walks to the usual spot (`--lead-goal AHEAD,LEFT`, default `4,0` = 4 m ahead). **"ernest, lead me five metres"**, "lead me forward 4 metres and left 2",
+  "guide me three metres to the right" and "lead me ten feet" choose the spot out loud (each number goes with the nearest direction word; a number with none is forward; capped at 15 m).
+  "Led" and "leed" (how Whisper often hears it) work. **"stop"**, **"stop leading"**, Space, `G` again, any drive key, or the window losing focus ends it. No confirmation for the voice command
+  (like "follow me"); `G` asks for `Y`.
+- **B is measured from where the dog is standing and facing when you say it**, so saying "lead me 4 metres" a second time walks 4 m further along whatever way it is now facing.
+- **What it does:** balances, waits for the dog's lidar, plans a path (A*) that keeps the dog's width off obstacles and a person's width off anything up to ~1.2 m high, and walks it at `--lead-speed` (0.3 m/s),
+  re-planning twice a second. A drop-off is seen from about 2 m and is a no-go with a 0.75 m margin: **the dog stops about 1 m before it, says `DROP-OFF ahead` on screen, waits, and gives up after `--lead-patience`
+  seconds (90) saying a drop-off is in the way.** With no way through it waits; if something is inside the lidar's ~1 m blind zone it backs away a little to look again (`--no-lead-recover` turns that off). It also stops
+  if the lidar goes quiet or the dog is told to walk and isn't moving.
+- **On screen:** the banner (`LEADING to 4.0 m ahead, +0.0 m left: going [2.3 m to go]`, or `waiting - drop-off 1.4 m ahead`), the messages, and a **top-down map** at the top right: red obstacle, orange something at
+  person height, **magenta drop-off**, green path, yellow goal, cyan dog. Look at the magenta before trusting it.
+- **Not people-aware, and it has never run on the real dog.** It does not check that you are following, and nothing shown on screen is spoken. The lidar returns nothing above ~1.2 m (a hanging sign, a low beam or ceiling is
+  **not seen**), and the drop-off detector has only been tried on simulated ledges and your flat-floor recording. Test it on a real staircase from the top with someone at the bottom and a hand on Space. Wearing the phone/AirPods
+  makes no difference to it. Tested headless (`run_go2.sh --selftest-lead` and `--selftest-lead-stairs`): a simulated room, the real lidar's quirks, "ernest, lead me" -> a box walked round and B reached; "stop" mid-walk holds the dog still;
+  a staircase down across the room -> it stops ~1 m short, warns, gives up, and never goes near the edge.
 
 ## Follow mode (`T` or "follow me")
 
@@ -409,5 +432,5 @@ in mind: they are the emergency stop.
 ## Developer tests
 
 `run_go2.sh --selftest`, `--selftest-follow`, `--selftest-voice`, `--selftest-voicemove`, `--selftest-objects`,
-`--selftest-listen`, `--selftest-heel`, `--selftest-calib` run headless scripted checks (`python lock_test.py` checks the clothing lock, run inside WSL) against the fake robot (inside WSL:
+`--selftest-listen`, `--selftest-heel`, `--selftest-calib`, `--selftest-lead`, `--selftest-lead-stairs` run headless scripted checks (`python lock_test.py` checks the clothing lock, run inside WSL) against the fake robot (inside WSL:
 `wsl -d Ubuntu-24.04 -- bash /mnt/c/Users/Sasha/go2-robot/run_go2.sh --selftest-listen`).
