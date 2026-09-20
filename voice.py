@@ -751,9 +751,9 @@ class TurnController:
     'wrong_way' / 'not_moving' mean the gyro disagrees with what the dog is doing (the caller then falls back to turning by time)."""
 
     WINDOW = 0.2            # s over which the turning speed is measured
-    FIX_RATE = 0.30         # rad/s for the last creep
+    FIX_RATE = 0.25         # rad/s for the last creep
 
-    def __init__(self, target: float, max_rate: float, min_rate: float = 0.3, gain: float = 2.4, tol_deg: float = 3.0, lag: float = 0.3, max_fixes: int = 2, fix_deg: float = 6.0):
+    def __init__(self, target: float, max_rate: float, min_rate: float = 0.3, gain: float = 2.4, tol_deg: float = 3.0, lag: float = 0.4, max_fixes: int = 2, fix_deg: float = 7.0):
         self.target, self.max_rate, self.min_rate, self.gain, self.lag, self.max_fixes = target, max_rate, min_rate, gain, lag, max_fixes
         self.tol = tol_deg * 3.14159265 / 180.0
         self.fix = fix_deg * 3.14159265 / 180.0                            # landing further off than this gets a creep to correct it
