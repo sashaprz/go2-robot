@@ -381,7 +381,7 @@ class LeadSimRobot(FakeRobot):
         if stairs:
             self.sim = PersistentSim(walls, pits=[(2.5, -4, 6, 4, 0.17), (3.2, -4, 6, 4, 0.34)], start=(-1.0, 0.0))
         else:
-            self.sim = PersistentSim(walls + [(3.2, -0.3, 3.8, 0.3, 0.6)], start=(-1.0, 0.0), ghost_s=3.0)      # a box 4.2 m ahead
+            self.sim = PersistentSim(walls + [(1.6, -0.3, 2.2, 0.3, 0.6)], start=(-1.0, 0.0))      # a box 2.6 m ahead
         self.cmd, self.cmd_at = (0.0, 0.0, 0.0), 0.0
 
     def move(self, vx: float, vy: float, yaw: float) -> None:
@@ -985,7 +985,7 @@ class App:
         self.lead_events.append(("start", (ahead, left)))
         self.ensure_lidar()
         side = "" if abs(left) < 0.05 else f", {abs(left):.1f} m to the {'left' if left > 0 else 'right'}"
-        self.say(f"> leading: {ahead:.1f} m ahead{side}. It STOPS if something is in the way or at a drop-off; Space / B / 'stop' / any drive key ends it. "
+        self.say(f"> leading: {ahead:.1f} m ahead{side}. It walks round obstacles and STOPS at drop-offs; Space / B / 'stop' / any drive key ends it. "
                  "It does not watch for people and cannot see above ~1.2 m", GOOD)
 
     def stop_lead(self, reason: str, quiet: bool = False) -> None:
@@ -1000,15 +1000,12 @@ class App:
     def _lead_announce(self, ld, g) -> None:
         """Say (on screen) when the guide's situation changes: a drop-off, waiting, backing away, the way clearing."""
         drop = g.state == "waiting" and "drop-off" in g.reason
-        inway = g.state == "waiting" and "in the way" in g.reason
-        key = (g.state, drop, inway)
+        key = (g.state, drop)
         if key == ld["key"]:
             return
         before, ld["key"] = ld["key"], key
         if drop:
             self.say(f"lead: DROP-OFF ahead ({g.reason}). Standing still: it will not go near it", BAD)
-        elif inway:
-            self.say(f"lead: STOPPED: {g.reason}. Waiting for it to clear, then it carries on", WARN)
         elif g.state == "waiting":
             self.say("lead: no way through right now: waiting for it to clear", WARN)
         elif g.state == "recovering":
@@ -1030,7 +1027,7 @@ class App:
                 if ld["guide"] is None:                  # "here" is wherever the dog is when the first fresh lidar message arrives
                     if lid is not None and now - lid[0] < 0.5:
                         ld["guide"] = guide_mod.Guide(lid[2], [ld["goal"]], vmax=self.args.lead_speed, patience=self.args.lead_patience,
-                                                      recover=not self.args.no_lead_recover, obstacle_stop=self.args.lead_stop_dist)
+                                                      recover=not self.args.no_lead_recover)
                         ld["pose"] = lid[2]
                         self.lead_events.append(("goal_world", ld["guide"].goals[0]))
                     elif now - ld["t0"] > 8.0:
@@ -2265,10 +2262,6 @@ class App:
                     if t >= 11.5 and "p11" not in state:
                         state["p11"] = (sim.x, sim.y)
                         self.lead_events.append(("still", state["p9"], state["p11"]))
-                    if t >= 20.0 and "box_gone" not in state:      # the box is taken away: the dog, which stopped in front of it, should carry on
-                        state["box_gone"] = True
-                        self.lead_events.append(("box_removed", (sim.x, sim.y)))
-                        sim.remove_last()
                 if self.lead_result is not None and "esc" not in state:
                     state["esc"] = t + 2.0
                 if ("esc" in state and t >= state["esc"] and "esc_sent" not in state) or (t > 90 and "esc_sent" not in state):
@@ -2394,8 +2387,7 @@ LEAD_STAIRS_TEST = [(1.0, "Ernest, lead me six metres")]
 
 
 def _selftest_lead_verdict(app: "App") -> int:
-    """'Ernest, lead me' in a simulated room with a box in the way: it STOPS in front of it; 'stop' halts it mid-walk; a second 'lead me' walks up to the box and stops;
-    once the box is taken away it carries on to B."""
+    """'Ernest, lead me' in a simulated room with a box in the way: it walks round it to B; 'stop' halts it mid-walk; a second 'lead me' finishes the job."""
     r = app.robot
     log, sim = r.log, r.sim
     sports = [e[1] for e in log if e[0] == "sport"]
@@ -2403,7 +2395,6 @@ def _selftest_lead_verdict(app: "App") -> int:
     goal = next((e[1] for e in reversed(app.lead_events) if e[0] == "goal_world"), (0.0, 0.0))
     dist = math.hypot(sim.x - goal[0], sim.y - goal[1])
     still = next((e for e in app.lead_events if e[0] == "still"), None)
-    gone = next((e for e in app.lead_events if e[0] == "box_removed"), None)
     phrases = {"lead me five metres": ("lead", "5.00,0.00"), "lead me forward 4 metres and left 2": ("lead", "4.00,2.00"), "stop leading": ("stop_follow", ""),
                "follow me": ("follow", ""), "walk forward": ("move", "forward")}
     parsed = {t: (lambda i: (i.kind, i.arg) if i else None)(voice_mod.parse_command(t)) for t in phrases}
@@ -2416,10 +2407,7 @@ def _selftest_lead_verdict(app: "App") -> int:
             bool(still) and math.hypot(still[1][0] - still[2][0], still[1][1] - still[2][1]) < 0.1,
         f"the second lead arrived: {app.lead_result}": bool(app.lead_result) and app.lead_result[0] == "arrived",
         f"the simulated dog is {dist:.2f} m from B (world {goal[0]:.1f}, {goal[1]:.1f})": dist < 0.5,
-        f"it stopped in front of the box and did not go round it (it was at x={gone[1][0]:.1f} when the box was taken away; the box starts at 3.2)" if gone else "the box was removed":
-            bool(gone) and 0.5 < gone[1][0] < 1.9 and abs(gone[1][1]) < 0.4,
-        "it said it had stopped because something is in the way": "something in the way" in " | ".join(app.messages_text()).lower(),
-        f"it never touched the box ({sim.gap():.2f} m clear)": sim.gap() > 0.18,
+        f"it went round the box without touching it ({sim.gap():.2f} m clear)": sim.gap() > 0.18,
         "it never went faster than --lead-speed": bool(moves) and all(m[1] <= app.args.lead_speed + 1e-6 for m in moves),
         "the lead ended when it arrived: not leading, and the last thing sent was stop_move": not app.leading and log[-1] == ("stop_move",),
         "the phrase table: 'lead me five metres', 'forward 4 and left 2', 'stop leading', and follow / walk unchanged":
@@ -2646,8 +2634,6 @@ def main() -> int:
     p.add_argument("--lead-goal", default=os.environ.get("GO2_LEAD_GOAL", "6,0"), metavar="AHEAD,LEFT",
                    help="lead ('ernest, lead me' / B): where to walk, metres ahead and to the left of where the dog stands (default 6,0). "
                         "Say 'lead me five metres' / 'lead me forward 4 metres and left 2' to choose one out loud")
-    p.add_argument("--lead-stop-dist", type=float, default=2.0,
-                   help="lead: STOP when something stands on the straight line to the goal within this many metres, and carry on once it has been clear for 1.5 s (default 2). 0 = walk round obstacles instead")
     p.add_argument("--lead-speed", type=float, default=0.3, help="lead: top forward speed, m/s (default 0.3; the drop-off check needs time to see a ledge, ~2 m ahead)")
     p.add_argument("--lead-patience", type=float, default=90.0,
                    help="lead: seconds to stand and wait with no way through before giving up (default 90: the dog's lidar map keeps a ghost ~40 s after something leaves)")

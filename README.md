@@ -163,7 +163,7 @@ firmware exposes beyond this command. `Handstand` (front legs) is deliberately n
 Says "lead" and the dog walks from where it stands (A) to a point B, round obstacles, **and stops at drop-offs** (stairs down, a ledge, a hole). It is the guide mode
 below (`guide.py`, `pathplan.py`, `dropoff.py`) running inside this app, on the dog's lidar, in a background thread so the window stays smooth.
 
-- **Say it:** "ernest, lead" / "lead me" walks to the usual spot (`--lead-goal AHEAD,LEFT`, default `4,0` = 4 m ahead). **"ernest, lead me five metres"**, "lead me forward 4 metres and left 2",
+- **Say it:** "ernest, lead" / "lead me" walks to the usual spot (`--lead-goal AHEAD,LEFT`, default `6,0` = 6 m ahead). **"ernest, lead me five metres"**, "lead me forward 4 metres and left 2",
   "guide me three metres to the right" and "lead me ten feet" choose the spot out loud (each number goes with the nearest direction word; a number with none is forward; capped at 15 m).
   "Led" and "leed" (how Whisper often hears it) work. **"stop"**, **"stop leading"**, Space, `B` again, any drive key, or the window losing focus ends it. No confirmation for the voice command
   (like "follow me"); `B` asks for `Y`. (It was `G`, but the hand-gesture toggle took that key.)

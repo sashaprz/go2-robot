@@ -16,7 +16,7 @@ REM     --heel-range 0     : ignore the lidar; the camera alone holds ~1.5 m (--
 REM   --no-heel-lidar    : add this to switch the lidar off entirely (the camera alone then holds the distance).
 REM   --heel-style geometric : the older heel (camera geometry; needs calibrating with J). Not the default.
 REM   "ernest, lead" (or G, then Y): walk from where the dog stands to a spot, round obstacles, and STOP at drop-offs (stairs down, ledges) using the lidar.
-REM     "lead me five metres" / "lead me forward 4 metres and left 2" choose the spot out loud; --lead-goal 4,0 is the usual spot (metres ahead, metres left).
+REM     "lead me five metres" / "lead me forward 4 metres and left 2" choose the spot out loud; --lead-goal 6,0 (6 m ahead) is the usual spot (metres ahead, metres left).
 REM     --lead-speed 0.3 (m/s)   --lead-patience 90 (s it waits with no way through before giving up)   --no-lead-recover (never back away to look again).
 REM     Not people-aware, nothing above ~1.2 m is seen, and it has not run on the real dog yet: try it at the top of a staircase with a hand on Space.
 REM   --mic dog : listen through the DOG's own microphone instead of the computer's (run dogmic-probe.bat first to see if it works).
